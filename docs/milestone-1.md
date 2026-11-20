@@ -139,3 +139,20 @@ Undo for attachment operations (trash restore covers delete), configurable core 
 - Uploads (`POST .../files`) and folder-import copies do not require the owner's revision. Adding an attachment commutes
   with field edits, the folder import already verifies the target's identity, and the upload bumps the revision so other
   windows refresh. Requiring it would make concurrent edits fail uploads for no data-integrity gain.
+
+### 4.4 Re-review amendments
+
+- **Backup vs. reconciliation**: a folder backup holds the destination `data/` lock (the same `DataDirLock`) from start to
+  database publication. "Is this a live catalog?" checks test whether the lock is **held**, not whether `.catalog.lock`
+  exists. A catalog cannot be opened on a backup that is being written, and reconciliation never runs there meanwhile.
+- **Reconciliation scope**: only files whose names are exactly a 32-character lowercase-hex attachment ID (compared
+  case-insensitively against DB IDs, so case variants on Windows count as referenced) and `.part-*` files are candidates;
+  any other file in `data/files/` is left untouched. Moving still goes to `data/orphaned/`, never deletes.
+- **Upload identity**: `POST /api/experiments/{id}/files` accepts optional `project_id` and `sample_id` query parameters.
+  When given, the record must still have that project and sample ID at commit, else 409 `目标样品已变化，请刷新后再上传。`.
+  The front end always sends them. Revisions are still not required (§4.3).
+- **Undo vs. purged evidence**: evidence IDs that no longer exist in `files` at all are ignored when undo compares or
+  restores `result_summary`; links to files that still exist (active or trashed) are preserved.
+- **Instance ID**: `secrets.token_hex(16)`, treated like the token (never logged). Known residual risk: a different local
+  service learns the token only if it learns the instance path *and* the user's browser visits that path on its port.
+  Origin-bound credentials would require script-driven downloads, which large attachments and backups cannot use.
