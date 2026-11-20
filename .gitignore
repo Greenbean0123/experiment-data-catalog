@@ -1,0 +1,13 @@
+# Lab data never belongs in this repository.
+data/
+*.sqlite3
+local-catalog.json
+research/
+
+# Local tooling and outputs
+__pycache__/
+*.log
+*.zip
+*.lnk
+.test-tools/
+dist/

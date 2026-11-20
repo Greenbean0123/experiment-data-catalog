@@ -1,0 +1,98 @@
+{
+  "about": "Synthetic local-catalog.json for tests: same shape as a lab's data/local-catalog.json.",
+  "notebook_prefixes": [
+    "XY"
+  ],
+  "precursor_aliases": [
+    {
+      "label": "Compound A6 (CA6)",
+      "aliases": [
+        "CA6",
+        "a6",
+        "compounda6"
+      ]
+    },
+    {
+      "label": "Compound A8 (CA8)",
+      "aliases": [
+        "CA8",
+        "compounda8"
+      ]
+    },
+    {
+      "label": "Compound A12 (CA12)",
+      "aliases": [
+        "CA12",
+        "PA12",
+        "compounda12"
+      ]
+    },
+    {
+      "label": "Compound A16 (CA16)",
+      "aliases": [
+        "CA16",
+        "compounda16"
+      ]
+    },
+    {
+      "label": "Compound A18 (CA18)",
+      "aliases": [
+        "CA18",
+        "compounda18"
+      ]
+    }
+  ],
+  "phase_presets": {
+    "default": [
+      "Phase-C",
+      "Phase-B",
+      "Phase-A2",
+      "Phase-A2p",
+      "Phase-A2m"
+    ]
+  },
+  "translations": {
+    "en": {
+      "温度待核对": "Temperature needs review"
+    },
+    "categories": {
+      "示例系列": "Example series",
+      "时间系列": "Time course",
+      "资料分类": "Reference materials"
+    },
+    "datasetTitles": {
+      "示例图谱": "Example plots"
+    },
+    "noteLines": {
+      "示例说明：": "Example note:",
+      "未知条件保留为空，需后续核对。": "Unknown conditions were left blank and require verification."
+    },
+    "noteRules": [
+      {
+        "pattern": "^批量导入：(.+)。$",
+        "flags": "",
+        "replacement": "Bulk import: $1."
+      },
+      {
+        "pattern": "^导入来源：(.+)。$",
+        "flags": "",
+        "replacement": "Import source: $1."
+      },
+      {
+        "pattern": "^Name / 名称: ",
+        "flags": "",
+        "replacement": "Name: "
+      },
+      {
+        "pattern": "^([\\d.]+) min 为示例时刻，据 (.+)。$",
+        "flags": "",
+        "replacement": "$1 min is an example time from $2."
+      },
+      {
+        "pattern": "([",
+        "flags": "",
+        "replacement": "invalid patterns are ignored"
+      }
+    ]
+  }
+}

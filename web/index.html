@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <title>实验数据目录 · 实验管理</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%232f8ee5'/%3E%3Cpath d='M10 15h11l4 4h13v18H10z' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/newapi-theme.css">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/i18n.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3h6M10 3v7l-6 9a1 1 0 0 0 1 2h14a1 1 0 0 0 1-2l-6-9V3M8 15h8"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="4" rx="1"/><path d="M5 7v13h14V7M10 11h4"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 3v18h18M6 17l3-5 3 3 3-9 3 7 3-3"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M2 12h4l2-7 3 14 3-16 3 13 2-4h3"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="i-language" viewBox="0 0 24 24"><path d="M3 5h12M9 3v2M5 8c1 4 4 6 8 8M12 5c0 5-3 8-8 11M14 21l4-10 4 10M16 17h4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.8 13a9 9 0 0 1-9.8-9.8A9 9 0 1 0 20.8 13Z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18M6 12h12M9 19h6"/><circle cx="8" cy="5" r="2"/><circle cx="16" cy="12" r="2"/></symbol>
+    <symbol id="i-peaks" viewBox="0 0 24 24"><path d="M3 20h18M4 19c3 0 3-4 4-4s1 4 2 4 1-14 2-14 1 14 2 14 1-7 2-7 1 7 4 7"/></symbol>
+    <symbol id="i-scope" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></symbol>
+    <symbol id="i-cube" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+  </svg>
+  <a class="skip-link" href="#main-content" data-i18n="跳到实验列表">跳到实验列表</a>
+  <header class="app-header">
+    <button id="toggle-sidebar" class="icon-button" aria-controls="sidebar" aria-expanded="true" data-i18n-aria-label="折叠或展开侧栏" title="折叠或展开侧栏" data-i18n-title="折叠或展开侧栏"><svg class="icon"><use href="#i-panel"/></svg></button>
+    <a class="brand" href="/" data-i18n-aria-label="实验数据目录" data-i18n-title="实验数据目录"><svg class="brand-icon"><use href="#i-flask"/></svg><strong data-i18n="实验数据目录">实验数据目录</strong><span class="version">v0.4</span></a>
+    <div class="global-search" role="search"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input id="global-search" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="global-results" aria-keyshortcuts="Control+k Meta+k" placeholder="搜索实验或样品…" data-i18n-placeholder="搜索实验或样品…" aria-label="跳转到实验" data-i18n-aria-label="跳转到实验"><kbd aria-hidden="true">Ctrl + K</kbd><div id="global-results" class="global-results" role="listbox" hidden></div></div>
+    <div class="header-tools">
+      <span class="local-chip"><span class="local-dot"></span><span data-i18n="本地存储">本地存储</span></span>
+      <button class="theme-switch" id="theme-switch"><svg class="icon" aria-hidden="true"><use id="theme-icon" href="#i-moon"/></svg><span id="theme-label">深色</span></button>
+      <button class="language-switch" id="language-switch"><svg class="icon" aria-hidden="true"><use href="#i-language"/></svg><span id="language-label">English</span></button>
+    </div>
+  </header>
+  <aside id="sidebar" class="sidebar">
+    <div class="workspace"><div class="workspace-heading"><label for="project-select" data-i18n="实验项目">实验项目</label><button id="add-project" class="icon-button" data-i18n-aria-label="新建项目" data-i18n-title="新建项目"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button></div><select id="project-select" aria-describedby="project-help"></select><small id="project-help" data-i18n="项目 → 实验 → 样品与数据">项目 → 实验 → 样品与数据</small></div>
+    <nav data-i18n-aria-label="工作区导航" aria-label="工作区导航">
+      <p class="nav-label" data-i18n="工作空间">工作空间</p>
+      <button class="nav-item active" id="active-view" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="实验管理">实验管理</span><b id="nav-count">0</b></button>
+      <button class="nav-item" id="experiment-view" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-panel"/></svg><span data-i18n="实验工作台">实验工作台</span></button>
+      <button class="nav-item" id="review-view"><svg class="icon" aria-hidden="true"><use href="#i-filter"/></svg><span data-i18n="待核对清单">待核对清单</span></button>
+      <button class="nav-item" id="history-view"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg><span data-i18n="修改历史">修改历史</span></button>
+      <button class="nav-item" id="archived-view" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-archive"/></svg><span data-i18n="已归档">已归档</span><b id="archive-count">0</b></button>
+      <p class="nav-label" data-i18n="数据筛选">数据筛选</p>
+      <div id="category-nav"></div>
+      <p class="nav-label" data-i18n="数据管理">数据管理</p>
+      <button class="nav-item" id="manage-template"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="实验模板">实验模板</span></button>
+      <button class="nav-item" id="folder-import"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="导入文件夹">导入文件夹</span></button>
+      <button class="nav-item" id="manage-categories"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="数据类别">数据类别</span></button>
+      <button class="nav-item" id="backup-view"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span data-i18n="完整备份">完整备份</span><b id="backup-badge" class="backup-badge" hidden>!</b></button>
+    </nav>
+    <div class="sidebar-bottom"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg><div><strong data-i18n="本地工作区">本地工作区</strong><small data-i18n="数据由你自己保管">数据由你自己保管</small></div></div>
+  </aside>
+  <main id="main-content" tabindex="-1">
+    <div class="page">
+      <div class="breadcrumb"><span data-i18n="控制台">控制台</span><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg><span id="breadcrumb-project"></span><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg><span id="breadcrumb-current" data-i18n="实验管理">实验管理</span></div>
+      <div class="page-heading"><div><h1 id="page-title" data-i18n="实验管理">实验管理</h1><p class="subtitle" data-i18n="按项目和实验编号管理样品、条件和数据。">按项目和实验编号管理样品、条件和数据。</p></div><button class="primary" id="new-record"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="新建实验">新建实验</span></button></div>
+      <div id="overview-view">
+      <div class="dashboard-view-tabs" role="group" data-i18n-aria-label="实验管理视图"><button id="dashboard-overview-tab" aria-pressed="true" data-i18n="总览">总览</button><button id="dashboard-records-tab" aria-pressed="false" data-i18n="实验列表">实验列表</button></div>
+      <div id="dashboard-layout" class="dashboard-layout"><div class="dashboard-main">
+      <section class="stats" data-i18n-aria-label="实验概览" aria-label="实验概览">
+        <div><span class="stat-icon blue"><svg class="icon"><use href="#i-flask"/></svg></span><span data-i18n="实验记录">实验记录</span><strong id="stat-total">—</strong><small data-i18n="当前项目 · 未归档">当前项目 · 未归档</small><button class="stat-link" data-stat-action="workspace" data-i18n-aria-label="打开实验工作台" aria-label="打开实验工作台"></button></div>
+        <div><span class="stat-icon indigo"><svg class="icon"><use href="#i-grid"/></svg></span><span data-i18n="样品记录">样品记录</span><strong id="stat-samples">—</strong><small data-i18n="独立样品与取样点">独立样品与取样点</small><button class="stat-link" data-stat-action="records" data-i18n-aria-label="查看实验列表" aria-label="查看实验列表"></button></div>
+        <div><span class="stat-icon teal"><svg class="icon"><use href="#i-chart"/></svg></span><span data-i18n="数据附件">数据附件</span><strong id="stat-files">—</strong><small data-i18n="样品和资料集中的全部文件">样品和资料集中的全部文件</small></div>
+        <div><span class="stat-icon amber"><svg class="icon"><use href="#i-clock"/></svg></span><span data-i18n="缺少条件">缺少条件</span><strong id="stat-pending">—</strong><small data-i18n="个实验缺少核心条件">个实验缺少核心条件</small><button class="stat-link" data-stat-action="missing" data-i18n-aria-label="查看缺少条件的样品" aria-label="查看缺少条件的样品"></button></div>
+      </section>
+      <div id="dashboard-panels" class="dashboard-panels">
+        <section class="dashboard-card dashboard-distribution" aria-labelledby="condition-distribution-title">
+          <div class="dashboard-card-heading"><div><h2 id="condition-distribution-title" data-i18n="条件分布">条件分布</h2><p class="field-help" data-i18n="按条件查找实验，点击编号查看样品与数据。">按条件查找实验，点击编号查看样品与数据。</p></div><label class="condition-grouping"><span data-i18n="按条件分组">按条件分组</span><select id="dashboard-condition-field"><option value="precursor" data-i18n="前驱体">前驱体</option><option value="temperature" data-i18n="温度 / °C">温度 / °C</option><option value="duration" data-i18n="反应 / 取样时间 · min">反应 / 取样时间 · min</option><option value="solvent" data-i18n="溶剂 / 配体">溶剂 / 配体</option></select></label></div>
+          <div class="condition-table-wrap">
+            <table id="dashboard-condition-table" class="condition-table"><caption class="sr-only" data-i18n="条件分布">条件分布</caption><thead><tr><th id="dashboard-condition-column" scope="col"></th><th scope="col" class="condition-count" data-i18n="实验数">实验数</th><th scope="col" data-i18n="对应实验">对应实验</th></tr></thead><tbody id="dashboard-condition-rows"></tbody></table>
+          </div>
+          <p class="condition-table-note" data-i18n="仅显示未归档实验；同一实验可出现在多个条件组中。未记录的条件单列。">仅显示未归档实验；同一实验可出现在多个条件组中。未记录的条件单列。</p>
+        </section>
+      </div>
+      <section id="records-panel" class="records-panel" data-i18n-aria-label="实验列表" aria-label="实验列表">
+        <div class="panel-heading"><h2><svg class="icon" aria-hidden="true"><use href="#i-filter"/></svg><span data-i18n="条件检索">条件检索</span></h2><div class="panel-actions"><button id="export-csv"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span data-i18n="导出筛选结果">导出筛选结果</span></button><button id="open-backup"><span data-i18n="完整备份">完整备份</span></button></div></div>
+        <div class="search-row"><label class="search-box"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input id="search" type="search" placeholder="搜索样品、条件、备注或附件…" data-i18n-placeholder="搜索样品、条件、备注或附件…" aria-label="搜索实验" data-i18n-aria-label="搜索实验"></label><label class="compact"><span data-i18n="记录状态">记录状态</span><select id="filter-status"><option value="" data-i18n="全部状态">全部状态</option><option value="待补全" data-i18n="待补全">待补全</option><option value="已记录" data-i18n="已记录">已记录</option><option value="待表征" data-i18n="待表征">待表征</option><option value="已完成" data-i18n="已完成">已完成</option></select></label><label class="compact"><span data-i18n="数据类型">数据类型</span><select id="filter-kind"><option value="" data-i18n="全部类型">全部类型</option></select></label></div>
+        <div class="filters">
+          <label><span data-i18n="前驱体">前驱体</span><select id="filter-precursor"><option value="" data-i18n="全部前驱体">全部前驱体</option></select></label>
+          <label><span data-i18n="溶剂 / 配体">溶剂 / 配体</span><select id="filter-solvent"><option value="" data-i18n="全部溶剂 / 配体">全部溶剂 / 配体</option></select></label>
+          <fieldset><legend data-i18n="温度 / °C">温度 / °C</legend><div class="range"><input id="temp-min" type="number" step="any" placeholder="最低 °C" data-i18n-placeholder="最低 °C" aria-label="最低温度" data-i18n-aria-label="最低温度"><span>–</span><input id="temp-max" type="number" step="any" placeholder="最高 °C" data-i18n-placeholder="最高 °C" aria-label="最高温度" data-i18n-aria-label="最高温度"></div></fieldset>
+          <fieldset><legend data-i18n="反应 / 取样时间 · min">反应 / 取样时间 · min</legend><div class="range"><input id="time-min" type="number" min="0" step="any" placeholder="最短 min" data-i18n-placeholder="最短 min" aria-label="最短时间" data-i18n-aria-label="最短时间"><span>–</span><input id="time-max" type="number" min="0" step="any" placeholder="最长 min" data-i18n-placeholder="最长 min" aria-label="最长时间" data-i18n-aria-label="最长时间"></div></fieldset>
+          <button id="clear-filters" class="quiet reset" data-i18n="重置">重置</button>
+        </div>
+        <p id="filter-error" class="inline-error" role="alert" hidden></p>
+        <div class="result-filters" role="group" aria-label="结果筛选" data-i18n-aria-label="结果筛选">
+          <span class="result-filter-label" data-i18n="实验结果">实验结果</span>
+          <label><span class="sr-only" data-i18n="物相">物相</span><select id="filter-phase"><option value="" data-i18n="全部物相">全部物相</option></select></label>
+          <label><span class="sr-only" data-i18n="形貌">形貌</span><select id="filter-morphology"><option value="" data-i18n="全部形貌">全部形貌</option></select></label>
+          <label><span class="sr-only" data-i18n="表征结果状态">表征结果状态</span><select id="filter-outcome"><option value="" data-i18n="全部表征结果">全部表征结果</option><option value="not_measured" data-i18n="未测量">未测量</option><option value="measurement_failed" data-i18n="测量失败">测量失败</option><option value="no_target" data-i18n="未获得目标结果">未获得目标结果</option><option value="measured" data-i18n="已测量">已测量</option></select></label><label><span class="sr-only" data-i18n="结果确认">结果确认</span><select id="filter-result-confirmation"><option value="" data-i18n="全部确认状态">全部确认状态</option><option value="unrecorded" data-i18n="尚未记录结果">尚未记录结果</option><option value="pending" data-i18n="待确认">待确认</option><option value="confirmed" data-i18n="已确认">已确认</option></select></label>
+        </div>
+        <div id="chart-filter" class="chart-filter" hidden><span id="chart-filter-label"></span><button id="clear-chart-filter" class="quiet" data-i18n="清除此条件">清除此条件</button></div>
+        <div class="list-bar"><span id="result-count" aria-live="polite" data-i18n="正在读取实验记录…">正在读取实验记录…</span><div><span id="selection-count"></span><button id="select-visible" class="quiet" data-i18n="全选筛选样品">全选筛选样品</button><button id="clear-selection" class="quiet" hidden data-i18n="清空选择">清空选择</button><button id="bulk-edit" disabled data-i18n="批量编辑">批量编辑</button><a id="share-selected" class="button" hidden target="_blank" rel="noopener" data-i18n="导出所选实验包">导出所选实验包</a><button id="compare" disabled data-i18n="对比条件">对比条件</button></div></div>
+        <div class="table-scroll catalog-table-scroll"><table class="records-table"><thead><tr><th class="check-cell"><span class="sr-only" data-i18n="选择实验">选择实验</span></th><th data-i18n="实验编号 / 样品">实验编号 / 样品</th><th data-i18n="前驱体">前驱体</th><th><span data-i18n="温度">温度</span> <small>°C</small></th><th><span data-i18n="时间">时间</span> <small>min</small></th><th data-i18n="溶剂 / 配体">溶剂 / 配体</th><th data-i18n="数据附件">数据附件</th><th data-i18n="记录状态">记录状态</th><th><span class="sr-only" data-i18n="打开详情">打开详情</span></th></tr></thead><tbody id="records"></tbody></table></div>
+        <div id="empty-state" class="empty" hidden><svg class="empty-icon"><use href="#i-flask"/></svg><h3 id="empty-title"></h3><p id="empty-message"></p><button id="empty-new" class="primary" data-i18n="新建第一条实验">新建第一条实验</button></div>
+        <p class="filter-note" data-i18n="筛选时仅显示匹配的样品；导出包含折叠组内的匹配记录。">筛选时仅显示匹配的样品；导出包含折叠组内的匹配记录。</p><div class="table-footer"><span data-i18n="— 表示尚未记录；0 是有效实验数值。">— 表示尚未记录；0 是有效实验数值。</span><span data-i18n="展开实验后勾选 2–6 条样品，可并排比较条件。">展开实验后勾选 2–6 条样品，可并排比较条件。</span></div>
+      </section>
+      </div><aside id="dashboard-aside" class="dashboard-aside"><section class="dashboard-status-card"><h2 data-i18n="样品状态">样品状态</h2><div id="dashboard-status" class="status-overview"></div></section><section><h2 data-i18n="最近更新">最近更新</h2><div id="dashboard-recent"></div></section><section><h2 data-i18n="缺少条件">缺少条件</h2><p id="dashboard-pending" class="field-help"></p><div id="dashboard-missing" class="missing-fields"></div><button id="dashboard-show-pending" class="quiet" data-i18n="查看缺少条件的样品">查看缺少条件的样品</button></section><section class="dashboard-local"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg><h2 data-i18n="本地工作区">本地工作区</h2><p class="field-help" data-i18n="数据由你自己保管">数据由你自己保管</p></section></aside></div>
+      </div>
+      <section id="experiment-workspace" class="experiment-workspace" data-i18n-aria-label="实验工作台" hidden>
+        <div class="workspace-toolbar"><button id="toggle-experiment-list" aria-expanded="true" aria-controls="experiment-index"><svg class="icon" aria-hidden="true"><use href="#i-panel"/></svg><span id="experiment-list-toggle-label" data-i18n="收起编号列表">收起编号列表</span></button><span id="workspace-count" aria-live="polite"></span></div>
+        <div id="workspace-layout" class="workspace-layout">
+          <aside id="experiment-index" class="experiment-index">
+            <div class="index-heading"><h2><span data-i18n="实验编号">实验编号</span><span class="index-count-caption" data-i18n="样品数">样品数</span></h2><label class="search-box"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input id="experiment-search" type="search" data-i18n-placeholder="搜索编号或样品…" data-i18n-aria-label="搜索编号或样品"></label><div class="index-controls"><label class="index-sort"><span data-i18n="排序">排序</span><select id="experiment-order"><option value="asc" data-i18n="名称正序 A → Z">名称正序 A → Z</option><option value="desc" data-i18n="名称倒序 Z → A">名称倒序 Z → A</option></select></label><label class="index-sort"><span data-i18n="记录状态">记录状态</span><select id="workspace-status-filter"><option value="" data-i18n="全部状态">全部状态</option><option value="待补全" data-i18n="待补全">待补全</option><option value="已记录" data-i18n="已记录">已记录</option><option value="待表征" data-i18n="待表征">待表征</option><option value="已完成" data-i18n="已完成">已完成</option></select></label></div></div>
+            <nav id="experiment-list" data-i18n-aria-label="实验编号列表"></nav>
+          </aside>
+          <div id="experiment-resizer" class="experiment-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="experiment-index" aria-valuemin="190" aria-valuemax="420" aria-valuenow="250" data-i18n-aria-label="调整编号列表宽度" data-i18n-title="拖动或用左右方向键调整宽度"></div>
+          <div class="experiment-content">
+            <div id="workspace-empty" class="empty"><svg class="empty-icon"><use href="#i-flask"/></svg><h3 id="workspace-empty-title"></h3><p id="workspace-empty-message"></p></div>
+            <div id="workspace-detail" hidden>
+              <section class="workspace-conditions">
+                <div class="workspace-section-heading"><div><p class="eyebrow" data-i18n="实验条件">实验条件</p><h2 id="workspace-experiment-title" tabindex="-1"></h2><p id="workspace-experiment-meta" class="field-help"></p></div><div class="lab-actions"><a id="share-workspace" class="button" target="_blank" rel="noopener" data-i18n="导出实验包">导出实验包</a><button id="workspace-add-sample" class="quiet"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="添加样品">添加样品</span></button></div></div>
+                <div class="workspace-sample-bar"><label><span data-i18n="样品 / 取样点">样品 / 取样点</span><select id="workspace-sample"></select></label><div class="workspace-sample-actions"><button id="workspace-edit-record" class="primary" aria-describedby="workspace-edit-help" data-i18n="编辑样品">编辑样品</button><button id="workspace-open-record" data-i18n="打开详情">打开详情</button></div></div>
+                <p id="workspace-edit-help" class="field-help" data-i18n="请选择一个样品后编辑。" hidden>请选择一个样品后编辑。</p>
+                <div class="workspace-sample-bar workspace-status-bar"><label><span data-i18n="记录状态">记录状态</span><select id="workspace-status"><option value="" data-i18n="多种状态">多种状态</option><option value="待补全" data-i18n="待补全">待补全</option><option value="已记录" data-i18n="已记录">已记录</option><option value="待表征" data-i18n="待表征">待表征</option><option value="已完成" data-i18n="已完成">已完成</option></select></label><button id="workspace-save-status"></button></div>
+                <p id="workspace-status-help" class="field-help" data-i18n="选择全部样品时统一更新；选择单个样品时仅更新该样品。">选择全部样品时统一更新；选择单个样品时仅更新该样品。</p><p id="workspace-status-error" class="inline-error" role="alert" hidden></p>
+                <dl id="workspace-conditions" class="detail-grid"></dl><div id="workspace-lineage"></div>
+                <p class="field-help" data-i18n="不同条件会分别列出；选择单个样品可查看完整条件。">不同条件会分别列出；选择单个样品可查看完整条件。</p>
+              </section>
+              <section class="workspace-data">
+                <div class="workspace-section-heading"><h2 data-i18n="数据与备注">数据与备注</h2><span id="workspace-file-count" class="muted"></span></div>
+                <div id="workspace-kinds" class="workspace-tabs" role="group" data-i18n-aria-label="数据类型"></div>
+                <div class="workspace-data-body">
+                  <section class="workspace-results"><div class="workspace-section-heading"><h3 data-i18n="结果摘要">结果摘要</h3><button type="button" id="workspace-edit-results" class="quiet" data-i18n="编辑结果">编辑结果</button></div><div id="workspace-result-content"></div></section>
+                  <div class="workspace-file-bar"><label><span data-i18n="数据附件">数据附件</span><select id="workspace-file"></select></label><a id="workspace-download" class="button" download><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span data-i18n="下载">下载</span></a></div>
+                  <h3 id="workspace-preview-heading" class="workspace-preview-heading" data-i18n="数据预览">数据预览</h3>
+                  <div id="preview-phase-picker" hidden>
+                    <div class="preview-phase-heading"><h4 id="preview-phase-label"></h4><button type="button" id="preview-edit-result" class="quiet" data-i18n="编辑结果">编辑结果</button></div>
+                    <div id="preview-phases" class="result-tags" role="group" aria-labelledby="preview-phase-label" aria-describedby="preview-phase-help"></div>
+                    <p id="preview-phase-help" class="field-help" data-i18n="点击物相以选择或取消，并立即保存。">点击物相以选择或取消，并立即保存。</p>
+                    <p id="preview-phase-error" class="inline-error" role="alert" hidden></p>
+                  </div>
+                  <div id="workspace-preview" class="workspace-preview" aria-labelledby="workspace-preview-heading" aria-live="polite"></div>
+                  <p id="workspace-file-meta" class="field-help"></p>
+                  <section class="workspace-notes"><h3 data-i18n="实验观察与备注">实验观察与备注</h3><div id="workspace-notes"></div></section>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </section>
+      <footer class="page-footer"><span><span data-i18n="实验数据目录">实验数据目录</span> <span class="footer-separator">·</span><span data-i18n="界面基于">界面基于</span> <a href="https://github.com/QuantumNous/new-api" target="_blank" rel="noreferrer">New API</a> <span class="footer-separator">·</span><a href="/notices.txt" target="_blank" rel="noreferrer">AGPL-3.0</a> <span class="footer-separator">·</span><a href="/api/source.zip" data-i18n="下载源码">下载源码</a></span><span id="sync-state" role="status" data-i18n="读取中">读取中</span></footer>
+    </div>
+  </main>
+  <dialog id="editor" class="editor-dialog" aria-labelledby="editor-title">
+    <form id="record-form">
+      <div class="dialog-header"><div><h2 id="editor-title" data-i18n="新建实验">新建实验</h2><p class="dialog-subtitle" data-i18n="保存条件，关联实验数据。">保存条件，关联实验数据。</p></div><button type="button" class="icon-button" id="close-editor" aria-label="关闭编辑" data-i18n-aria-label="关闭编辑">×</button></div>
+      <div class="dialog-body">
+        <p class="form-hint" data-i18n="样品编号必填。未知条件请留空，后续可随时补全。">样品编号必填。未知条件请留空，后续可随时补全。</p>
+        <section class="form-section"><h3><span class="section-number">01</span><span data-i18n="基本信息">基本信息</span></h3><div class="form-grid">
+          <div class="span-two"><label for="editor-project" data-i18n="所属项目">所属项目</label><div class="select-with-action"><select id="editor-project" name="project_id" required></select><button type="button" id="editor-add-project" data-i18n="新建项目">新建项目</button></div></div>
+          <label><span data-i18n="样品编号">样品编号</span> <b class="required">*</b><input name="sample_id" required maxlength="120" placeholder="例如 XY-III-363-05" data-i18n-placeholder="例如 XY-III-363-05" autocomplete="off"></label>
+          <label><span data-i18n="实验编号">实验编号</span><input name="experiment_no" maxlength="120" placeholder="留空时按样品编号识别" data-i18n-placeholder="留空时按样品编号识别" aria-describedby="experiment-number-help"></label>
+          <label><span data-i18n="实验系列">实验系列</span><input name="series" maxlength="120" placeholder="例如 温度系列 / 重复实验" data-i18n-placeholder="例如 温度系列 / 重复实验" list="series-options"></label>
+          <label><span data-i18n="实验日期">实验日期</span><input name="experiment_date" type="text" maxlength="10" placeholder="年-月-日" data-i18n-placeholder="年-月-日" autocomplete="off"></label>
+          <label><span data-i18n="记录状态">记录状态</span><select name="status"><option value="待补全" data-i18n="待补全">待补全</option><option value="已记录" data-i18n="已记录">已记录</option><option value="待表征" data-i18n="待表征">待表征</option><option value="已完成" data-i18n="已完成">已完成</option></select></label>
+        </div><p id="experiment-number-help" class="field-help" data-i18n="同一实验使用相同编号，如 XY-III-352。可手动修改归属；样品编号和附件保持原样。">同一实验使用相同编号，如 XY-III-352。可手动修改归属；样品编号和附件保持原样。</p></section>
+        <section class="form-section"><h3><span class="section-number">02</span><span data-i18n="实验条件">实验条件</span></h3><p id="editor-inherited-conditions" class="field-help" role="status" hidden></p><div class="form-grid">
+          <fieldset class="solvent-field span-two">
+            <legend data-i18n="前驱体（可多选）">前驱体（可多选）</legend>
+            <input id="editor-precursor" name="precursor" type="hidden">
+            <div id="editor-precursors" class="solvent-choices"></div>
+            <button type="button" id="add-precursor" aria-controls="new-precursor-panel" aria-expanded="false" data-i18n="新增前驱体">新增前驱体</button>
+            <div id="new-precursor-panel" class="new-solvent-panel" hidden><label for="new-precursor-name" data-i18n="前驱体名称">前驱体名称</label><div class="select-with-action"><input id="new-precursor-name" maxlength="250" autocomplete="off" placeholder="例如 金属盐" data-i18n-placeholder="例如 金属盐"><button type="button" id="save-precursor" class="primary" data-i18n="添加并选择">添加并选择</button><button type="button" id="cancel-precursor" class="quiet" data-i18n="取消">取消</button></div></div>
+            <p id="precursor-error" class="inline-error" role="alert" hidden></p>
+          </fieldset>
+          <div><label for="editor-temperature" data-i18n="温度 / °C">温度 / °C</label><div class="numeric-condition"><input id="editor-temperature" name="temperature" type="number" min="-273.15" max="2500" step="any" placeholder="尚未记录" data-i18n-placeholder="尚未记录"><select id="temperature-presets" data-i18n-aria-label="选择常用温度"></select><button type="button" id="save-temperature-option" data-i18n-aria-label="添加当前温度为常用" data-i18n-title="添加当前温度为常用"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button><button type="button" id="delete-temperature-option" class="remove-preset" data-i18n-aria-label="删除所选常用温度" data-i18n-title="删除所选常用温度" disabled>×</button></div><p id="temperature-error" class="inline-error" role="alert" hidden></p></div>
+          <div><label for="editor-duration" data-i18n="反应 / 取样时间 · min">反应 / 取样时间 · min</label><div class="numeric-condition"><input id="editor-duration" name="duration" type="number" min="0" max="100000" step="any" placeholder="尚未记录" data-i18n-placeholder="尚未记录"><select id="duration-presets" data-i18n-aria-label="选择常用时间"></select><button type="button" id="save-duration-option" data-i18n-aria-label="添加当前时间为常用" data-i18n-title="添加当前时间为常用"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button><button type="button" id="delete-duration-option" class="remove-preset" data-i18n-aria-label="删除所选常用时间" data-i18n-title="删除所选常用时间" disabled>×</button></div><p id="duration-error" class="inline-error" role="alert" hidden></p></div>
+          <fieldset class="solvent-field span-two"><legend data-i18n="溶剂 / 配体（可多选）">溶剂 / 配体（可多选）</legend><input id="editor-solvent" name="solvent" type="hidden"><div id="editor-solvents" class="solvent-choices"></div><p class="field-help" data-i18n="勾选后可填写添加量，单位为 mL、mmol 或 g。未知时留空。">勾选后可填写添加量，单位为 mL、mmol 或 g。未知时留空。</p><button type="button" id="add-solvent" aria-controls="new-solvent-panel" aria-expanded="false" data-i18n="新增溶剂 / 配体">新增溶剂 / 配体</button><div id="new-solvent-panel" class="new-solvent-panel" hidden><label for="new-solvent-name" data-i18n="溶剂 / 配体名称">溶剂 / 配体名称</label><div class="select-with-action"><input id="new-solvent-name" maxlength="250" autocomplete="off" data-i18n-placeholder="例如 ODE"><button type="button" id="save-solvent" class="primary" data-i18n="添加并选择">添加并选择</button><button type="button" id="cancel-solvent" class="quiet" data-i18n="取消">取消</button></div></div><p id="solvent-error" class="inline-error" role="alert" hidden></p></fieldset>
+        </div><p class="field-help" data-i18n="常用条件保存在本机，供所有项目复用；× 仅从常用列表删除，不修改已有实验。">常用条件保存在本机，供所有项目复用；× 仅从常用列表删除，不修改已有实验。</p><p class="field-help" data-i18n="取样时间以反应开始为零点；加料时刻可另加自定义条件。">取样时间以反应开始为零点；加料时刻可另加自定义条件。</p>
+          <div id="editor-shared-conditions" hidden>
+            <label class="lab-check"><input id="editor-share-conditions" type="checkbox" aria-describedby="shared-conditions-help"><span data-i18n="设为本实验的共用条件">设为本实验的共用条件</span></label>
+            <p id="shared-conditions-help" class="field-help" data-i18n="将当前前驱体、温度、溶剂 / 配体及添加量同步到沿用共用条件的样品，留空会清除对应共用值。取样时间按样品填写。">将当前前驱体、温度、溶剂 / 配体及添加量同步到沿用共用条件的样品，留空会清除对应共用值。取样时间按样品填写。</p>
+          </div>
+        </section>
+        <div id="editor-use-template-row" class="form-section" hidden><label class="lab-check"><input id="editor-use-template" type="checkbox"><span data-i18n="将此样品加入当前模板">将此样品加入当前模板</span></label></div>
+        <section class="form-section" id="editor-template-section" hidden><h3 data-i18n="模板条件">模板条件</h3><p id="editor-template-info" class="field-help"></p><div id="editor-template-conditions" class="form-grid lab-inputs"></div></section>
+        <section class="form-section" id="editor-lineage"><h3 data-i18n="样品来源与处理">样品来源与处理</h3><div class="form-grid lab-inputs">
+          <label><span data-i18n="来源样品">来源样品</span><select id="editor-parent"></select></label>
+          <label><span data-i18n="处理步骤">处理步骤</span><input id="editor-treatment" maxlength="250" data-i18n-placeholder="例如 分样后退火"></label>
+        </div></section>
+        <section class="form-section"><div class="section-heading"><h3><span class="section-number">03</span><span data-i18n="自定义条件">自定义条件</span></h3><button type="button" class="quiet" id="add-condition"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="添加条件">添加条件</span></button></div><div id="extra-conditions"></div><p class="field-help" data-i18n="可记录用量、摩尔比、加料顺序、气氛或升温速率。">可记录用量、摩尔比、加料顺序、气氛或升温速率。</p></section>
+        <section class="form-section" id="editor-results"><h3><span class="section-number">04</span><span data-i18n="结果摘要">结果摘要</span></h3>
+          <p class="field-help" data-i18n="按样品记录结果；多个物相可分别添加。结论由你确认，与实验进度分开。">按样品记录结果；多个物相可分别添加。结论由你确认，与实验进度分开。</p>
+          <div class="form-grid">
+            <div><label for="result-phase-input" data-i18n="物相（可多选）">物相（可多选）</label><div id="result-phases" class="result-tags" role="group" data-i18n-aria-label="快捷选择物相"></div><div class="select-with-action"><input id="result-phase-input" maxlength="80" list="result-phase-options" autocomplete="off" placeholder="例如 立方相" data-i18n-placeholder="例如 立方相"><button type="button" data-add-result="phases" data-i18n="添加">添加</button></div><datalist id="result-phase-options"></datalist></div>
+            <div><label for="result-morphology-input" data-i18n="形貌（可多选）">形貌（可多选）</label><div id="result-morphologies" class="result-tags" role="group" data-i18n-aria-label="已选形貌"></div><div class="select-with-action"><input id="result-morphology-input" maxlength="80" list="result-morphology-options" autocomplete="off" placeholder="例如 nanoparticles" data-i18n-placeholder="例如 nanoparticles"><button type="button" data-add-result="morphologies" data-i18n="添加">添加</button></div><datalist id="result-morphology-options"></datalist></div>
+            <label><span data-i18n="结果确认">结果确认</span><select id="result-confirmation"><option value="" data-i18n="尚未记录结果">尚未记录结果</option><option value="pending" data-i18n="待确认">待确认</option><option value="confirmed" data-i18n="已确认">已确认</option></select></label>
+            <label class="span-two"><span data-i18n="结果结论">结果结论</span><textarea id="result-conclusion" rows="2" maxlength="2000" placeholder="简要记录结果、混相或未形成颗粒的情况…" data-i18n-placeholder="简要记录结果、混相或未形成颗粒的情况…"></textarea></label>
+          </div>
+          <div class="form-grid lab-inputs"><label><span data-i18n="表征结果状态">表征结果状态</span><select id="editor-outcome"><option value="" data-i18n="尚未记录">尚未记录</option><option value="not_measured" data-i18n="未测量">未测量</option><option value="measurement_failed" data-i18n="测量失败">测量失败</option><option value="no_target" data-i18n="未获得目标结果">未获得目标结果</option><option value="measured" data-i18n="已测量">已测量</option></select></label></div>
+          <div id="editor-template-results" class="form-grid lab-inputs"></div>
+          <fieldset class="result-evidence"><legend data-i18n="关联表征证据">关联表征证据</legend><div id="result-evidence-options"></div></fieldset>
+          <p class="field-help" data-i18n="点击物相标签可选择或取消，也可输入自定义标签。新样品保存并上传附件后，可在这里关联证据。">点击物相标签可选择或取消，也可输入自定义标签。新样品保存并上传附件后，可在这里关联证据。</p>
+          <p id="result-error" class="inline-error" role="alert" hidden></p>
+        </section>
+        <section class="form-section"><h3><span class="section-number">05</span><span data-i18n="实验观察与备注">实验观察与备注</span></h3><div id="editor-notes-preview" class="notes" hidden></div><p id="editor-notes-help" class="field-help" data-i18n="英文预览；展开下方原文可编辑。" hidden>英文预览；展开下方原文可编辑。</p><details id="editor-notes-original" class="notes-original" open><summary data-i18n="编辑原文" hidden>编辑原文</summary><label><span class="sr-only" data-i18n="备注">备注</span><textarea name="notes" rows="4" maxlength="20000" placeholder="记录现象、操作偏差、结果或原始记录来源…" data-i18n-placeholder="记录现象、操作偏差、结果或原始记录来源…"></textarea></label></details></section>
+        <p class="form-hint" data-i18n="保存后，在实验详情中添加 XRD、NMR 或其他数据文件。">保存后，在实验详情中添加 XRD、NMR 或其他数据文件。</p>
+        <p id="form-error" class="inline-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer"><button type="button" id="cancel-editor" data-i18n="取消">取消</button><button type="submit" class="primary" id="save-record" data-i18n="保存实验">保存实验</button></div>
+    </form>
+  </dialog>
+  <dialog id="detail" class="detail-dialog" aria-labelledby="detail-title"><div class="dialog-header"><div><h2 id="detail-title"></h2><p class="dialog-subtitle" data-i18n="实验详情">实验详情</p></div><button class="icon-button" id="close-detail" aria-label="关闭详情" data-i18n-aria-label="关闭详情">×</button></div><div class="dialog-body" id="detail-content"></div><div class="dialog-footer detail-actions"><button id="archive-record" class="quiet" data-i18n="归档记录">归档记录</button><div><button id="record-history" data-i18n="修改历史">修改历史</button><button id="record-review" data-i18n="标记待核对">标记待核对</button><button id="duplicate-record" data-i18n="复制条件新建">复制条件新建</button><button id="edit-record" class="primary" data-i18n="编辑记录">编辑记录</button></div></div></dialog>
+  <dialog id="comparison" class="compare-dialog" aria-labelledby="comparison-title"><div class="dialog-header"><div><h2 id="comparison-title" data-i18n="实验条件对比">实验条件对比</h2><p class="dialog-subtitle" data-i18n="并排查看，快速找到条件差异。">并排查看，快速找到条件差异。</p></div><button class="icon-button" id="close-comparison" aria-label="关闭对比" data-i18n-aria-label="关闭对比">×</button></div><div class="dialog-body"><p class="form-hint" data-i18n="有差异的条件以浅蓝色标出。空白表示未知，不代表相同。">有差异的条件以浅蓝色标出。空白表示未知，不代表相同。</p><div class="table-scroll"><table class="comparison-table" id="comparison-table"></table></div>
+    <section id="numeric-comparison" class="lab-compare" hidden><h3 data-i18n="条件与数值结果">条件与数值结果</h3>
+      <div class="workflow-filters"><label><span data-i18n="横轴条件">横轴条件</span><select id="comparison-x"></select></label><label><span data-i18n="纵轴结果">纵轴结果</span><select id="comparison-y"></select></label></div>
+      <div id="comparison-scatter"></div></section>
+    <section id="xrd-comparison" class="lab-compare" hidden><h3 data-i18n="跨样品 XRD 叠图">跨样品 XRD 叠图</h3>
+      <div id="comparison-xrd-files" class="form-grid lab-inputs"></div>
+      <div class="lab-actions"><label class="lab-check"><input type="checkbox" id="comparison-xrd-normalize"><span data-i18n="归一化">归一化</span></label><button id="draw-comparison-xrd" data-i18n="绘制叠图">绘制叠图</button></div>
+      <p class="field-help" data-i18n="XRD CSV 第一列为角度 2θ (°)，第二列为强度。">XRD CSV 第一列为角度 2θ (°)，第二列为强度。</p>
+      <div id="comparison-xrd-plot" role="status"></div></section>
+    </div></dialog>
+  <dialog id="catalog-dialog" class="catalog-dialog" aria-labelledby="catalog-title">
+    <form id="catalog-form">
+      <div class="dialog-header"><div><h2 id="catalog-title"></h2><p id="catalog-help" class="dialog-subtitle"></p></div><button type="button" id="close-catalog" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+      <div class="dialog-body"><p class="catalog-label" data-i18n="已添加">已添加</p><div id="catalog-items" class="catalog-items"></div>
+        <section id="category-delete-panel" class="category-delete-panel" hidden><h3 id="category-delete-title"></h3><p id="category-delete-help" class="field-help"></p><label id="category-replacement-label"><span data-i18n="附件移至">附件移至</span><select id="category-replacement"></select></label><div class="category-delete-actions"><button type="button" id="cancel-delete-category" data-i18n="取消">取消</button><button type="button" id="confirm-delete-category" class="danger" data-i18n="确认删除类别">确认删除类别</button></div></section>
+        <label><span id="catalog-name-label"></span><input id="catalog-name" name="name" required maxlength="80" autocomplete="off"></label><p id="catalog-error" class="inline-error" role="alert" hidden></p></div>
+      <div class="dialog-footer"><button type="button" id="cancel-catalog" data-i18n="取消">取消</button><button type="submit" id="save-catalog" class="primary" data-i18n="添加并选择">添加并选择</button></div>
+    </form>
+  </dialog>
+  <dialog id="bulk-editor" class="bulk-dialog" aria-labelledby="bulk-title">
+    <form id="bulk-form">
+      <div class="dialog-header"><div><h2 id="bulk-title" data-i18n="批量编辑样品">批量编辑样品</h2><p id="bulk-subtitle" class="dialog-subtitle"></p></div><button type="button" id="close-bulk" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+      <div class="dialog-body">
+        <div id="bulk-edit-step"><p class="form-hint" data-i18n="默认不修改任何字段。选择操作后填写新值，预览并确认后统一保存。">默认不修改任何字段。选择操作后填写新值，预览并确认后统一保存。</p><div id="bulk-fields"></div><p class="field-help" data-i18n="未选择的字段、备注和证据保持原样。替换材料会移除被取消材料的添加量，预览中会显示。">未选择的字段、备注和证据保持原样。替换材料会移除被取消材料的添加量，预览中会显示。</p></div>
+        <div id="bulk-review-step" hidden><p id="bulk-review-summary" role="status"></p><p class="field-help" data-i18n="逐条核对后再确认；任一样品有版本冲突，整批都不修改。">逐条核对后再确认；任一样品有版本冲突，整批都不修改。</p><div id="bulk-review"></div></div>
+        <p id="bulk-error" class="inline-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer"><button type="button" id="cancel-bulk" data-i18n="取消">取消</button><button type="button" id="back-bulk" hidden data-i18n="返回修改">返回修改</button><button type="submit" id="preview-bulk" class="primary" data-i18n="预览变更">预览变更</button><button type="button" id="confirm-bulk" class="primary" hidden data-i18n="确认批量保存">确认批量保存</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="history-dialog" class="workflow-dialog" aria-labelledby="history-title">
+    <div class="dialog-header"><div><h2 id="history-title" data-i18n="修改历史">修改历史</h2><p id="history-subtitle" class="dialog-subtitle"></p></div><button id="close-history" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+    <div class="dialog-body"><p id="history-error" class="inline-error" role="alert" hidden></p><div id="history-content"></div></div>
+    <div class="dialog-footer workflow-actions"><button id="history-back" data-i18n="返回历史">返回历史</button><button id="history-more" hidden data-i18n="加载更早记录">加载更早记录</button><label id="undo-scope-label" hidden><span data-i18n="撤销范围">撤销范围</span><select id="undo-scope"><option value="record" data-i18n="当前样品">当前样品</option><option value="batch" data-i18n="整次操作">整次操作</option></select></label><button id="preview-undo" class="primary" hidden data-i18n="预览撤销">预览撤销</button><button id="confirm-undo" class="primary" hidden data-i18n="确认撤销">确认撤销</button></div>
+  </dialog>
+  <dialog id="review-dialog" class="workflow-dialog" aria-labelledby="review-title">
+    <div class="dialog-header"><div><h2 id="review-title" data-i18n="待核对清单">待核对清单</h2><p id="review-subtitle" class="dialog-subtitle"></p></div><button id="close-review" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+    <div class="dialog-body"><div id="review-filters" class="workflow-filters"><label><span data-i18n="核对类型">核对类型</span><select id="review-kind"><option value="" data-i18n="全部类型">全部类型</option><option value="conflict" data-i18n="来源冲突">来源冲突</option><option value="missing_conditions" data-i18n="缺少实验条件">缺少实验条件</option><option value="missing_data" data-i18n="数据附件待补充">数据附件待补充</option><option value="manual" data-i18n="人工标记">人工标记</option><option value="folder_import" data-i18n="文件导入待核对">文件导入待核对</option></select></label><label><span data-i18n="处理状态">处理状态</span><select id="review-status"><option value="pending" data-i18n="待处理">待处理</option><option value="resolved" data-i18n="已处理">已处理</option><option value="dismissed" data-i18n="暂不采用">暂不采用</option></select></label><label class="workflow-search"><span data-i18n="搜索">搜索</span><input id="review-search" type="search" data-i18n-placeholder="搜索编号或核对内容"></label></div><p id="review-error" class="inline-error" role="alert" hidden></p><div id="review-content"></div>
+      <form id="review-add-form" hidden><label><span data-i18n="核对内容">核对内容</span><input id="review-add-title" required maxlength="250"></label><label><span data-i18n="字段">字段</span><select id="review-add-field"><option value="" data-i18n="其他条件或数据">其他条件或数据</option><option value="temperature" data-i18n="温度 / °C">温度 / °C</option><option value="duration" data-i18n="反应 / 取样时间 · min">反应 / 取样时间 · min</option><option value="precursor" data-i18n="前驱体">前驱体</option><option value="solvents" data-i18n="溶剂 / 配体">溶剂 / 配体</option></select></label><label><span data-i18n="来源说明">来源说明</span><textarea id="review-add-note" rows="3" maxlength="2000"></textarea></label><button id="review-add-save" type="submit" class="primary" data-i18n="添加待核对项">添加待核对项</button></form>
+      <div id="review-decision" hidden>
+        <label><span data-i18n="处理状态">处理状态</span><select id="review-outcome"><option value="resolved" data-i18n="已处理">已处理</option><option value="dismissed" data-i18n="暂不采用">暂不采用</option><option value="pending" data-i18n="重新打开">重新打开</option></select></label>
+        <label class="review-apply-label"><input type="checkbox" id="review-apply"><span data-i18n="将确认值回填到样品">将确认值回填到样品</span></label>
+        <label id="review-value-label"><span id="review-value-title">确认值</span><textarea id="review-value" rows="2" maxlength="5100"></textarea></label>
+        <label><span id="review-note-label">处理说明（可选）</span><textarea id="review-note" rows="3" maxlength="2000"></textarea></label>
+        <div id="review-change-preview" hidden></div>
+      </div>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="review-back" data-i18n="返回清单">返回清单</button><button id="review-edit-record" hidden data-i18n="编辑样品">编辑样品</button><button id="preview-review" class="primary" hidden data-i18n="预览回填">预览回填</button><button id="confirm-review" class="primary" hidden>确认已核对</button></div>
+  </dialog>
+  <dialog id="template-dialog" class="workflow-dialog lab-dialog" aria-labelledby="template-title">
+    <form id="template-form">
+      <div class="dialog-header"><div><h2 id="template-title" data-i18n="实验模板">实验模板</h2><p id="template-project" class="dialog-subtitle"></p></div><button type="button" id="close-template" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+      <div class="dialog-body">
+        <div class="workflow-filters"><label><span data-i18n="模板名称">模板名称</span><input id="template-name" maxlength="80" required></label></div>
+        <div class="lab-actions"><button type="button" data-template-example="powder" data-i18n="粉体合成示例">粉体合成示例</button><button type="button" data-template-example="film" data-i18n="薄膜沉积示例">薄膜沉积示例</button></div>
+        <p class="field-help" data-i18n="字段可用于条件或结果。标记已完成时检查必填项；已使用模板的样品保留原版本。">字段可用于条件或结果。标记已完成时检查必填项；已使用模板的样品保留原版本。</p>
+        <div id="template-fields"></div>
+        <button type="button" id="add-template-field" class="quiet" data-i18n="添加模板字段">添加模板字段</button>
+        <p id="template-error" class="inline-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer workflow-actions"><input id="template-file" type="file" accept=".json,application/json" hidden><button type="button" id="read-template" data-i18n="导入模板文件">导入模板文件</button><button type="button" id="export-template" data-i18n="导出已保存模板">导出已保存模板</button><button type="submit" class="primary" id="save-template" data-i18n="保存模板">保存模板</button></div>
+    </form>
+  </dialog>
+  <dialog id="import-dialog" class="workflow-dialog" aria-labelledby="import-title">
+    <div class="dialog-header"><div><h2 id="import-title" data-i18n="导入文件夹">导入文件夹</h2><p id="import-project" class="dialog-subtitle"></p></div><button id="close-import" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <div class="lab-actions"><input id="folder-files" type="file" webkitdirectory multiple hidden><input id="individual-files" type="file" multiple hidden><button id="choose-folder" data-i18n="选择文件夹">选择文件夹</button><button id="choose-import-files" data-i18n="选择单个或多个文件">选择单个或多个文件</button><span id="import-file-count" class="field-help" role="status"></span></div>
+      <div id="import-options" class="form-grid lab-inputs">
+        <label><span data-i18n="编号取自">编号取自</span><select id="import-rule"><option value="name" data-i18n="文件名">文件名</option><option value="directory" data-i18n="一级子文件夹">一级子文件夹</option></select></label>
+        <label id="import-separator-label"><span data-i18n="文件名分隔符">文件名分隔符</span><select id="import-separator"><option value=" " data-i18n="空格">空格</option><option value="_">_</option><option value="__">__</option><option value="" data-i18n="完整文件名（去掉扩展名）">完整文件名（去掉扩展名）</option></select></label>
+        <label><span data-i18n="默认数据类别">默认数据类别</span><select id="import-kind"></select></label>
+        <label><span data-i18n="新样品的实验编号（可选）">新样品的实验编号（可选）</span><input id="import-experiment" maxlength="120"></label>
+        <label class="lab-check"><input id="import-create" type="checkbox"><span data-i18n="允许新建未找到的样品">允许新建未找到的样品</span></label>
+      </div>
+      <p class="field-help" data-i18n="每次最多 300 个文件。先预览并检查编号和类别，确认后复制可导入文件，其他条目进入待核对清单。">每次最多 300 个文件。先预览并检查编号和类别，确认后复制可导入文件，其他条目进入待核对清单。</p>
+      <p id="import-error" class="inline-error" role="alert" hidden></p>
+      <p id="import-progress" class="field-help" role="status"></p>
+      <div id="import-rows" class="table-scroll"></div>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="preview-import" data-i18n="预览归属">预览归属</button><button id="confirm-import" class="primary" disabled data-i18n="确认导入">确认导入</button></div>
+  </dialog>
+  <dialog id="backup-dialog" class="workflow-dialog backup-dialog" aria-labelledby="backup-title">
+    <div class="dialog-header"><div><h2 id="backup-title" data-i18n="完整备份">完整备份</h2><p id="backup-last" class="dialog-subtitle"></p></div><button id="close-backup" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p id="backup-error" class="inline-error" role="alert" hidden></p>
+      <section class="backup-option">
+        <h3 data-i18n="备份到文件夹（推荐）">备份到文件夹（推荐）</h3>
+        <p class="field-help" data-i18n="首次复制全部数据；之后只复制新增附件并逐个校验 SHA-256。数据库最后写入，中途中断时上一次备份仍然完整。建议选择另一块磁盘或移动硬盘。">首次复制全部数据；之后只复制新增附件并逐个校验 SHA-256。数据库最后写入，中途中断时上一次备份仍然完整。建议选择另一块磁盘或移动硬盘。</p>
+        <label class="backup-path"><span data-i18n="备份文件夹（完整路径）">备份文件夹（完整路径）</span><input id="backup-path" maxlength="1000" autocomplete="off" spellcheck="false" data-i18n-placeholder="例如 E:\实验数据备份" placeholder="例如 E:\实验数据备份"></label>
+        <label class="lab-check"><input id="backup-verify" type="checkbox"><span data-i18n="同时重新校验备份中已有的文件（较慢）">同时重新校验备份中已有的文件（较慢）</span></label>
+        <div id="backup-progress" class="backup-progress" hidden><progress id="backup-bar" max="1" value="0"></progress><p id="backup-progress-text" class="field-help" role="status" aria-live="polite"></p></div>
+      </section>
+      <section class="backup-option">
+        <h3 data-i18n="下载完整 ZIP">下载完整 ZIP</h3>
+        <p class="field-help" data-i18n="生成单个 ZIP 文件后才开始下载，数据量大时需要等待数分钟，并占用约两倍数据量的临时空间。">生成单个 ZIP 文件后才开始下载，数据量大时需要等待数分钟，并占用约两倍数据量的临时空间。</p>
+        <a id="backup-zip" class="button" href="/api/backup.zip" download data-i18n="下载完整 ZIP">下载完整 ZIP</a>
+      </section>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="backup-done" data-i18n="关闭">关闭</button><button id="start-backup" class="primary" data-i18n="开始备份">开始备份</button></div>
+  </dialog>
+  <datalist id="series-options"></datalist>
+</body>
+</html>

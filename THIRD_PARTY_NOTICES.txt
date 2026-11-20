@@ -1,0 +1,58 @@
+Experiment Data Catalog 0.4 · Open-source notices
+Updated: 2026-11-14
+
+This distribution is provided under GNU AGPL version 3 or later because it
+includes theme code adapted from New API. See LICENSE for the full terms.
+
+New API
+Copyright (C) 2023-2026 QuantumNous
+Repository: https://github.com/QuantumNous/new-api
+Reference commit: b388140acfd80369ec6243b16869daff1b4051f4
+Original file: web/src/styles/theme.css
+Local file: web/newapi-theme.css
+License: GNU Affero General Public License v3 or later.
+
+Modifications by Experiment Data Catalog contributors, 2026-11-14:
+Retained the light- and dark-theme CSS variables for a standalone local console;
+removed Tailwind directives and the build revision. Added a persistent theme toggle
+and dark styles for experiment badges, errors, and forms.
+Preserved the upstream copyright and license notice in the adapted file.
+Our surrounding HTML, CSS layout, icons, storage, and interaction logic
+are implemented for the experiment data workflow. New API's layout,
+sidebar, table, and dialog sources were consulted to align the appearance.
+No affiliation with or endorsement by QuantumNous is implied.
+
+Dashboard UI Kit / SnowUI visual reference
+Creator: ByeWind
+Community file: https://www.figma.com/community/file/1210542873091115123/dashboard-ui-kit-dashboard-free-admin-dashboard
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+License URL: https://creativecommons.org/licenses/by/4.0/
+Adaptation: the dashboard layout, pale purple/blue metric cards, rounded panels,
+spacing, and recent-activity column were adapted to local experiment management.
+Charts display actual catalog counts. Existing application icons are retained;
+no template portraits or sample business data are distributed. The reference
+screenshot stays in local research materials and is not an application asset.
+The design was adapted in HTML/CSS/JavaScript; no endorsement by ByeWind is implied.
+
+Additional dashboard visual references
+Shadcn Admin: https://github.com/satnaing/shadcn-admin
+Tabler: https://github.com/tabler/tabler
+TailAdmin React Free: https://github.com/TailAdmin/free-react-tailwind-admin-dashboard
+The compact table spacing, segmented view controls, restrained borders, and
+experiment ID tags were informed by their public previews. No source code,
+icons, images, or runtime packages from these projects are distributed here.
+
+Corresponding source:
+The distribution is the complete editable source. No frontend build step
+or third-party runtime package is required. Use Python 3.9+ to run it.
+The application's footer offers a source ZIP generated from an explicit
+file allowlist. It excludes all experiment records, attachments, logs,
+research snapshots, and other local user files.
+Local source download: /api/source.zip
+Full license: /license.txt
+
+Earlier independent Experiment Data Catalog code was provided under the MIT license.
+That notice is retained in LICENSE-MIT. The combined distribution is
+provided under AGPL-3.0-or-later; do not remove the upstream notices when
+redistributing it. Experimental data is not licensed as software by this
+notice and is never included in the software distribution.
