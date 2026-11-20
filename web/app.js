@@ -49,7 +49,7 @@ function builtinCustomLabel(projectId, field, language = "zh") {
   if (!projectId) return "";
   const label = projectEntry(projectId)?.settings?.builtin?.[BUILTIN_OF[field] || field]?.label || {};
   const pick = value => typeof value === "string" ? value.trim() : "";
-  return language === "en" ? pick(label.en) || pick(label.zh) : pick(label.zh) || pick(label.en);
+  return pick(language === "en" ? label.en : label.zh);
 }
 function builtinLabel(projectId, field, language = "zh") {
   const key = BUILTIN_OF[field] || field;
@@ -62,7 +62,7 @@ function builtinCaption(projectId, field, language = "zh") {
   if (!custom) return I18n.translate(BUILTIN_CAPTIONS[key] || key, language);
   return key === "temperature" ? `${custom} / °C` : key === "duration" ? `${custom} · min` : custom;
 }
-const keyFieldId = info => `key:${info.section}:${info.label}`;
+const keyFieldId = info => typeof info.id === "string" && info.id ? info.id : `key:${info.section}:${String(info.label).toLowerCase()}`;
 function keyFieldsOf(projectId) {
   const fields = projectEntry(projectId)?.fields;
   return Array.isArray(fields) ? fields.filter(field => field && field.available !== false && typeof field.label === "string") : [];
@@ -72,8 +72,8 @@ function findKeyField(projectId, id) {
 }
 // A key field resolves in the record's own template version: same section, same label (case-insensitive), same type.
 function keyFieldValue(record, info) {
-  const label = info.label.toLocaleLowerCase();
-  const field = record.template?.fields?.find(item => item.section === info.section && item.type === info.type && String(item.label).toLocaleLowerCase() === label);
+  const label = String(info.label).toLowerCase();
+  const field = record.template?.fields?.find(item => item.section === info.section && item.type === info.type && String(item.label).toLowerCase() === label);
   const values = record.lab_data?.values || {};
   if (!field || !Object.hasOwn(values, field.key)) return {present: false, field: field || null};
   const unit = field.unit || "";
@@ -90,7 +90,8 @@ function keyFieldMembers(record, id) {
   const result = keyFieldValue(record, info);
   if (!result.present) return [];
   if (Array.isArray(result.value)) return result.value.map(String);
-  return [info.type === "number" && result.unitDiffers ? keyFieldText(result) : String(result.value)];
+  if (info.type === "number" && result.unitDiffers) return [result.unit ? `${result.value} ${result.unit}` : `${result.value} (—)`];
+  return [String(result.value)];
 }
 const ROMAN = {I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10};
 
@@ -319,12 +320,22 @@ function filterRecords(records, filters) {
       }
     }
     // A built-in switched off for the selected project no longer filters (its hidden control may keep an old value).
-    const uses = field => !filters.project || builtinEnabled(filters.project, field);
+    // With several projects shown, an active filter only matches records whose own project uses that field.
+    const shown = field => !filters.project || builtinEnabled(filters.project, field);
+    const applies = (field, active) => {
+      if (!active || !shown(field)) return null;
+      return builtinEnabled(record.project_id, field);
+    };
     for (const field of ["precursor", "solvent", "ligand", "status"]) {
-      if (filters[field] && (field === "status" || uses(field)) && !conditionMembers(record, field).includes(filters[field])) return false;
+      if (!filters[field]) continue;
+      if (field === "status") { if (!conditionMembers(record, field).includes(filters[field])) return false; continue; }
+      const own = applies(field, true);
+      if (own === false || (own && !conditionMembers(record, field).includes(filters[field]))) return false;
     }
-    if (uses("temperature") && !inRange(record.temperature, filters.tempMin ?? "", filters.tempMax ?? "")) return false;
-    if (uses("duration") && !inRange(record.duration, filters.timeMin ?? "", filters.timeMax ?? "")) return false;
+    for (const [field, low, high] of [["temperature", filters.tempMin ?? "", filters.tempMax ?? ""], ["duration", filters.timeMin ?? "", filters.timeMax ?? ""]]) {
+      const own = applies(field, low !== "" || high !== "");
+      if (own === false || (own && !inRange(record[field], low, high))) return false;
+    }
     for (const filter of Array.isArray(filters.keyFilters) ? filters.keyFilters : []) {
       if (isDatasetRecord(record)) return false;
       const result = keyFieldValue(record, filter.info);
@@ -382,7 +393,8 @@ function comparisonRows(records, language = "zh") {
   const fields = [["实验系列", "series"], ["实验编号", "experiment_no"], ["实验日期", "experiment_date"], ["前驱体", "precursor"],
     ["温度 / °C", "temperature"], ["反应 / 取样时间 · min", "duration"], ["溶剂 / 配体", "solvent"], ["记录状态", "status"], ["实验项目", "project_name"]]
     .filter(([, key]) => !BUILTIN_OF[key] || projects.some(project => builtinEnabled(project, key)));
-  const rows = fields.map(([label, key]) => ({label: BUILTIN_OF[key] ? builtinCaption(shared, key, language) : t(label), values: records.map(record => key === "status" ? t(record[key]) : ["series", "project_name"].includes(key) ? I18n.recordLabel(record, key, language) : (key === "solvent" ? materialSummary(record) : record[key]))}));
+  const rows = fields.map(([label, key]) => ({label: BUILTIN_OF[key] ? builtinCaption(shared, key, language) : t(label), values: records.map(record =>
+    BUILTIN_OF[key] && !builtinEnabled(record.project_id, key) ? "" : key === "status" ? t(record[key]) : ["series", "project_name"].includes(key) ? I18n.recordLabel(record, key, language) : (key === "solvent" ? materialSummary(record) : record[key]))}));
   const keyInfos = new Map(projects.flatMap(project => keyFieldsOf(project).map(info => [keyFieldId(info), info])));
   for (const [id, info] of keyInfos) {
     rows.push({label: info.label + (info.unit ? ` (${info.unit})` : ""), key: id, values: records.map(record => {
@@ -541,9 +553,7 @@ function initialize() {
     for (const [id, field] of [["temp-min", "temperature"], ["time-min", "duration"]]) $(id).closest("fieldset").hidden = !visible(field);
     const table = document.querySelector(".records-table");
     for (const field of ["precursor", "temperature", "duration", "materials"]) table?.classList.toggle(`hide-${field}`, !visible(field));
-    for (const select of [$("dashboard-condition-field"), $("review-add-field")]) {
-      for (const option of select.options) if (BUILTIN_OF[option.value]) option.hidden = option.disabled = !visible(option.value);
-    }
+    for (const option of $("dashboard-condition-field").options) if (BUILTIN_OF[option.value]) option.hidden = option.disabled = !visible(option.value);
     const select = $("dashboard-condition-field"), chosen = select.value;
     for (const option of [...select.querySelectorAll("option[data-key-field]")]) option.remove();
     for (const info of project ? keyFieldsOf(project) : []) {
@@ -554,6 +564,7 @@ function initialize() {
     }
     if ([...select.options].some(option => option.value === chosen && !option.disabled)) select.value = chosen;
     else select.value = [...select.options].find(option => !option.disabled)?.value ?? "";
+    if (chartCondition && chartCondition.field !== "missing" && ![...select.options].some(option => option.value === chartCondition.field && !option.disabled)) chartCondition = null;
     renderKeyFilters(project);
   }
   function renderKeyFilters(project) {
@@ -563,7 +574,11 @@ function initialize() {
     const signature = JSON.stringify([project, language, infos.map(info => [keyFieldId(info), info.type, info.unit, info.options])]);
     if (signature === keyFilterSignature) return;
     keyFilterSignature = signature;
-    for (const id of [...keyFilterState.keys()]) if (!infos.some(info => keyFieldId(info) === id)) keyFilterState.delete(id);
+    for (const [id, state] of [...keyFilterState]) {
+      const info = infos.find(item => keyFieldId(item) === id);
+      if (!info) keyFilterState.delete(id);
+      else if (state.value && !(info.options || []).includes(state.value)) delete state.value;
+    }
     box.innerHTML = infos.map(info => {
       const id = escape(keyFieldId(info)), state = keyFilterState.get(keyFieldId(info)) || {};
       const caption = escape(info.label + (info.unit ? ` (${info.unit})` : ""));
@@ -631,9 +646,10 @@ function initialize() {
     if (chartCondition) $("chart-filter-label").textContent = chartCondition.field === "missing"
       ? (chartCondition.value ? t("缺少条件 · {field}", {field: t(conditionLabels[chartCondition.value] || chartCondition.value)}) :
         t(scoped.some(record => record.template) ? "缺少条件" : "缺少核心条件"))
-      : `${[...$("dashboard-condition-field").options].find(option => option.value === chartCondition.field).textContent} · ${chartCondition.value === "" ? t("尚未记录") : chartCondition.value}`;
-    const invalid = (f.tempMin !== "" && f.tempMax !== "" && Number(f.tempMin) > Number(f.tempMax)) ||
-      (f.timeMin !== "" && f.timeMax !== "" && Number(f.timeMin) > Number(f.timeMax));
+      : `${[...$("dashboard-condition-field").options].find(option => option.value === chartCondition.field)?.textContent || chartCondition.field} · ${chartCondition.value === "" ? t("尚未记录") : chartCondition.value}`;
+    // Only ranges whose controls are visible are validated.
+    const invalid = (builtinEnabled(projectId, "temperature") && f.tempMin !== "" && f.tempMax !== "" && Number(f.tempMin) > Number(f.tempMax)) ||
+      (builtinEnabled(projectId, "duration") && f.timeMin !== "" && f.timeMax !== "" && Number(f.timeMin) > Number(f.timeMax));
     $("filter-error").hidden = !invalid && !loadError;
     $("filter-error").textContent = loadError ? I18n.translateError(loadError, language) : invalid ? t("筛选范围的下限不能大于上限。") : "";
     visible = invalid ? [] : filterRecords(records, f);
@@ -668,8 +684,8 @@ function initialize() {
       return `<tr class="experiment-group ${open ? "is-expanded" : ""}" data-experiment="${escape(group.number)}" data-project="${escape(group.projectId)}">
         <td class="check-cell"><button class="group-toggle" data-expand="${escape(group.key)}" aria-expanded="${open}" ${open ? `aria-controls="${panelId}"` : ""} aria-label="${escape(t(open ? "收起 {sample}" : "展开 {sample}", {sample: group.number}))}"><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></button></td>
         <td><button class="sample-link" data-expand="${escape(group.key)}" aria-expanded="${open}" ${open ? `aria-controls="${panelId}"` : ""}>${escape(group.number)}</button><span class="subline">${escape(countText)}${!projectId ? " · " + escape(projectLabel(group.projectId)) : ""}</span></td>
-        <td class="group-value col-precursor">${summary("precursor")}</td><td class="numeric col-temperature">${summary("temperature")}</td><td class="numeric col-duration">${summary("duration")}</td>
-        <td class="group-value col-materials">${summary("solvent")}</td>
+        <td class="group-value col-precursor">${groupCell(group, "precursor", summary)}</td><td class="numeric col-temperature">${groupCell(group, "temperature", summary)}</td><td class="numeric col-duration">${groupCell(group, "duration", summary)}</td>
+        <td class="group-value col-materials">${groupCell(group, "solvent", summary)}</td>
         <td class="file-types">${files.length ? fileTags(files) : `<span class="muted">${t("未关联")}</span>`}<span class="subline">${escape(t("{count} 个附件", {count: files.length}))}</span></td><td class="status-cell">${statuses}</td>
         <td>${open ? "" : addButton}</td></tr>` +
         (open ? `<tr class="expansion-row"><td colspan="9"><section class="sample-panel" id="${panelId}" aria-label="${escape(group.number + " · " + t("样品与数据"))}">
@@ -701,14 +717,15 @@ function initialize() {
     if (!show || workspaceView) return;
     const samples = experiments.flatMap(group => group.records), field = $("dashboard-condition-field").value;
     const conditions = new Map();
-    for (const group of experiments) for (const record of group.records) {
+    for (const group of field ? experiments : []) for (const record of group.records) {
+      if (BUILTIN_OF[field] && !builtinEnabled(record.project_id, field)) continue;
       const members = conditionMembers(record, field);
       for (const value of members.length ? members : [""]) {
         if (!conditions.has(value)) conditions.set(value, new Map());
         conditions.get(value).set(group.key, group);
       }
     }
-    $("dashboard-condition-column").textContent = $("dashboard-condition-field").selectedOptions[0].textContent;
+    $("dashboard-condition-column").textContent = $("dashboard-condition-field").selectedOptions[0]?.textContent || t("条件");
     const keyInfo = field.startsWith("key:") ? findKeyField(projectId, field) : null;
     const numeric = field === "temperature" || field === "duration" || keyInfo?.type === "number";
     const expandedConditions = new Set([...$("dashboard-condition-rows").querySelectorAll("details[open]")].map(details => details.dataset.conditionMore));
@@ -1036,6 +1053,10 @@ function initialize() {
     } catch (error) { if (version === previewVersion) area.textContent = I18n.translateError(error.message, language); }
   }
 
+  function groupCell(group, field, summary) {
+    return builtinEnabled(group.projectId, field) ? summary(field) : `<span class="muted">—</span>`;
+  }
+
   function sampleRow(record, dataset = false) {
     // Chips follow the project's fields: switched-off built-ins are left out, custom labels used, key fields appended.
     const pid = record.project_id, shortLabels = {precursor: "前驱体", temperature: "温度", duration: "时间", materials: "溶剂 / 配体"};
@@ -1123,7 +1144,7 @@ function initialize() {
     const presets = Array.isArray(configured) && configured.length ? configured : PHASE_PRESETS.get(project) || [];
     const recorded = records.filter(record => record.project_id === project && !record.archived && !isDatasetRecord(record))
       .flatMap(record => resultSummary(record).phases);
-    const suggestions = [...new Set([...presets, ...recorded])].slice(0, 8);
+    const suggestions = [...new Set([...presets, ...[...new Set(recorded)].filter(value => !presets.includes(value)).slice(0, 8)])];
     const phases = [...new Set([...suggestions, ...selected])];
     container.innerHTML = phases.map(phase => `<button type="button" class="phase-choice" data-phase-choice="${escape(phase)}" aria-pressed="${selected.includes(phase)}"${busy ? ' aria-disabled="true"' : ""}>${escape(phase)}</button>`).join("");
     if (focused !== undefined) {
@@ -1533,7 +1554,7 @@ function initialize() {
   }
 
   function selectProject(value) {
-    if (projectId !== value) { workspaceKey = ""; workspaceSample = ""; workspaceFile = ""; chartCondition = null; }
+    if (projectId !== value) { workspaceKey = ""; workspaceSample = ""; workspaceFile = ""; chartCondition = null; keyFilterState.clear(); keyFilterSignature = ""; }
     projectId = value;
     $("project-select").value = value;
     try { localStorage.setItem("catalog-project", value); } catch {}
@@ -2056,23 +2077,32 @@ function initialize() {
     $("confirm-bulk").disabled = bulkBusy || !bulkPlan || !bulkPreview?.updated;
   }
 
-  function bulkValue(field, value) {
+  function bulkValue(field, value, unit = "") {
+    if (unit && typeof value === "number") return `${value} ${unit}`;
     if (field === "confirmation") return t(({pending: "待确认", confirmed: "已确认"})[value] || "尚未记录结果");
     if (field === "status") return t(value);
     return Array.isArray(value) ? value.join(" / ") || "—" : value === null || value === "" ? "—" : String(value);
   }
 
   function bulkChangeLabel(field) {
+    const keyed = bulkActive.find(entry => entry.key && keyFieldId(entry.key) === String(field).toLowerCase());
+    if (keyed) return keyed.caption;
     if (String(field).startsWith("key:")) return String(field).split(":").slice(2).join(":");
     const item = bulkActive.find(entry => entry.field === field) || bulkFields.find(entry => entry.field === field);
     return item ? item.caption || t(item.label) : field;
+  }
+
+  // Review items name a built-in (translated) or a key field ("key:{section}:{label}", shown by its label).
+  function workflowFieldLabel(field) {
+    if (String(field).startsWith("key:")) return findKeyField(reviewItem?.project_id || projectId, String(field).toLowerCase())?.label || String(field).split(":").slice(2).join(":");
+    return t(workflowFields[field] || field);
   }
 
   function renderBulkReview() {
     $("bulk-subtitle").textContent = t("已选择 {count} 条样品；保存前将逐条预览。", {count: bulkTargets.length});
     if (!bulkPreview) return;
     $("bulk-review-summary").textContent = t("将修改 {changed} / {total} 条样品；相同值不重复保存。", {changed: bulkPreview.updated, total: bulkTargets.length});
-    $("bulk-review").innerHTML = bulkPreview.rows.map(row => `<section class="bulk-sample"><h3>${escape(row.sample_id)}<small>${escape(projectLabel(row.project_id))} · ${escape(row.experiment_no)}</small></h3>${row.changes.length ? `<table class="bulk-change-table"><thead><tr><th>${t("字段")}</th><th>${t("修改前")}</th><th>${t("修改后")}</th></tr></thead><tbody>${row.changes.map(change => `<tr><th scope="row">${escape(bulkChangeLabel(change.field))}</th><td>${escape(bulkValue(change.field, change.before))}</td><td>${escape(bulkValue(change.field, change.after))}</td></tr>`).join("")}</tbody></table>` : `<p class="field-help">${t("无变更")}</p>`}</section>`).join("");
+    $("bulk-review").innerHTML = bulkPreview.rows.map(row => `<section class="bulk-sample"><h3>${escape(row.sample_id)}<small>${escape(projectLabel(row.project_id))} · ${escape(row.experiment_no)}</small></h3>${row.changes.length ? `<table class="bulk-change-table"><thead><tr><th>${t("字段")}</th><th>${t("修改前")}</th><th>${t("修改后")}</th></tr></thead><tbody>${row.changes.map(change => `<tr><th scope="row">${escape(bulkChangeLabel(change.field))}</th><td>${escape(bulkValue(change.field, change.before, change.unit))}</td><td>${escape(bulkValue(change.field, change.after, change.unit))}</td></tr>`).join("")}</tbody></table>` : `<p class="field-help">${t("无变更")}</p>`}</section>`).join("");
   }
 
   function openBulkEditor() {
@@ -2081,7 +2111,7 @@ function initialize() {
     bulkTargets = chosen.map(({id, revision}) => ({id, revision}));
     const chosenProjects = [...new Set(chosen.map(record => record.project_id))];
     const single = chosenProjects.length === 1 ? chosenProjects[0] : "";
-    bulkActive = [...bulkFields.filter(item => !BUILTIN_OF[item.field] || chosenProjects.some(project => builtinEnabled(project, item.field)))
+    bulkActive = [...bulkFields.filter(item => !BUILTIN_OF[item.field] || chosenProjects.every(project => builtinEnabled(project, item.field)))
       .map(item => BUILTIN_OF[item.field] && single && builtinCustomLabel(single, item.field, language) ? {...item, caption: builtinCaption(single, item.field, language)} : item),
       ...(single ? keyFieldsOf(single).map((info, index) => ({field: `key${index}`, key: info, caption: info.label + (info.unit ? ` (${info.unit})` : ""),
         label: info.label, type: info.type === "multi" ? "list" : info.type === "single" ? "choice" : info.type, options: info.options || []})) : [])];
@@ -2092,7 +2122,7 @@ function initialize() {
       const heading = caption ? `<label for="bulk-${field}">${escape(caption)}</label>` : `<label for="bulk-${field}" data-i18n="${escape(label)}">${escape(t(label))}</label>`;
       const clearable = !["status", "confirmation"].includes(type);
       const value = type === "choice" ? `<select id="bulk-${field}">${choices.map(value => `<option value="${escape(value)}">${escape(value)}</option>`).join("")}</select>`
-        : choices.length ? `<select id="bulk-${field}">${choices.map(value => `<option value="${value}" data-i18n="${field === "confirmation" ? value === "pending" ? "待确认" : "已确认" : value}">${escape(bulkValue(field, value))}</option>`).join("")}</select>` : type === "list" || type === "textarea" ? `<textarea id="bulk-${field}" rows="${type === "list" ? 2 : 3}" ${type === "textarea" ? 'maxlength="2000"' : ""}></textarea>` : `<input id="bulk-${field}" type="${type}" ${type === "number" ? `step="any" min="${field === "temperature" ? -273.15 : 0}" max="${field === "temperature" ? 2500 : 100000}"` : 'maxlength="250"'} list="bulk-${field}-options">`;
+        : choices.length ? `<select id="bulk-${field}">${choices.map(value => `<option value="${value}" data-i18n="${field === "confirmation" ? value === "pending" ? "待确认" : "已确认" : value}">${escape(bulkValue(field, value))}</option>`).join("")}</select>` : type === "list" || type === "textarea" ? `<textarea id="bulk-${field}" rows="${type === "list" ? 2 : 3}" ${type === "textarea" ? 'maxlength="2000"' : ""}></textarea>` : `<input id="bulk-${field}" type="${type}" ${type === "number" ? key ? 'step="any"' : `step="any" min="${field === "temperature" ? -273.15 : 0}" max="${field === "temperature" ? 2500 : 100000}"` : 'maxlength="250"'} list="bulk-${field}-options">`;
       const suggestions = key ? options : field === "precursors" ? conditionValues("precursor") : field === "solvents" ? conditionValues("solvent") : ["phases", "morphologies"].includes(field) ? [...new Set(records.flatMap(record => resultSummary(record)[field]))] : [];
       const datalist = ["temperature", "duration"].includes(field) ? `<datalist id="bulk-${field}-options">${conditionValues(field).map(value => `<option value="${escape(value)}"></option>`).join("")}</datalist>` : "";
       return `<section class="bulk-field"><div class="bulk-field-heading">${heading}<select id="bulk-${field}-mode" data-bulk-mode="${field}" aria-label="${escape(t("{field} 操作", {field: caption || t(label)}))}"><option value="" data-i18n="不修改">${t("不修改")}</option><option value="set" data-i18n="${type === "list" ? "替换" : "设为"}">${t(type === "list" ? "替换" : "设为")}</option>${type === "list" ? `<option value="append" data-i18n="追加">${t("追加")}</option>` : ""}${clearable ? `<option value="clear" data-i18n="清空">${t("清空")}</option>` : ""}</select></div><div id="bulk-${field}-control" hidden>${value}${datalist}${type === "list" ? `<p class="field-help" data-i18n="每行一个值，或点击已有值添加。">${t("每行一个值，或点击已有值添加。")}</p><div class="bulk-suggestions">${suggestions.map(value => `<button type="button" class="quiet" data-bulk-suggest="${field}" data-value="${escape(value)}">${escape(value)}</button>`).join("")}</div>` : ""}</div></section>`;
@@ -2150,7 +2180,9 @@ function initialize() {
         if (key) {
           // Multi-choice key fields replace or append; the others set or clear.
           const keyMode = type === "list" && mode === "set" ? "replace" : mode;
-          keyChanges.push(mode === "clear" ? {section: key.section, label: key.label, mode} : {section: key.section, label: key.label, mode: keyMode, value});
+          const change = mode === "clear" ? {section: key.section, label: key.label, mode} : {section: key.section, label: key.label, mode: keyMode, value};
+          if (type === "number" && mode !== "clear") change.unit = key.unit || "";
+          keyChanges.push(change);
           continue;
         }
         changes[field] = mode === "clear" ? {mode} : {mode, value};
@@ -2180,7 +2212,9 @@ function initialize() {
           const confirmed = bulkPreview.rows.every(row => {
             const record = latest.experiments.find(record => record.id === row.id);
             return record && record.revision === row.revision + (row.changes.length ? 1 : 0) && row.changes.every(change => {
-              const value = change.field === "solvents" ? materialSummary(record) : Object.hasOwn(resultSummary(record), change.field) ? resultSummary(record)[change.field] : record[change.field];
+              const keyInfo = String(change.field).startsWith("key:") ? findKeyField(record.project_id, String(change.field).toLowerCase()) : null;
+              const keyResult = keyInfo ? keyFieldValue(record, keyInfo) : null;
+              const value = keyInfo ? (keyResult.present ? keyResult.value : null) : change.field === "solvents" ? materialSummary(record) : Object.hasOwn(resultSummary(record), change.field) ? resultSummary(record)[change.field] : record[change.field];
               return JSON.stringify(value) === JSON.stringify(change.after);
             });
           });
@@ -2249,7 +2283,7 @@ function initialize() {
       $("history-content").innerHTML = note + (undoPreview ? `<p class="form-hint">${t("确认后恢复下列字段。后续修改有冲突时整批撤销取消。")}</p>` : "") + workflowRows(rows);
     } else {
       $("history-subtitle").textContent = historyRecord ? records.find(record => record.id === historyRecord)?.sample_id || "" : projectId ? projectLabel(projectId) : t("全部项目");
-      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${t(historyActions[batch.action] || batch.action)}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
+      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${escape(t(historyActions[batch.action] || batch.action))}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
       $("history-content").insertAdjacentHTML("beforeend", fileEventsHtml(historyFileEvents));
     }
   }
@@ -2384,7 +2418,7 @@ function initialize() {
     }
     if (reviewItem.kind === "folder_import" && !record) $("review-edit-record").hidden = true;
     $("review-subtitle").textContent = `${reviewItem.sample_id} · ${t(reviewItem.title)}`;
-    const current = record && reviewItem.field ? `<section class="workflow-row"><h3>${t("当前记录")} · ${t(workflowFields[reviewItem.field] || reviewItem.field)}</h3><pre class="workflow-value">${escape(reviewItem.field === "solvents" ? materialSummary(record) : workflowValue(reviewItem.field, record[reviewItem.field]))}</pre></section>` : "";
+    const current = record && reviewItem.field ? `<section class="workflow-row"><h3>${t("当前记录")} · ${escape(workflowFieldLabel(reviewItem.field))}</h3><pre class="workflow-value">${escape(reviewItem.field === "solvents" ? materialSummary(record) : workflowValue(reviewItem.field, record[reviewItem.field]))}</pre></section>` : "";
     $("review-content").innerHTML = current + `<div class="review-source-grid">${reviewItem.sources.map((source, index) => `<figure class="review-source"><figcaption>${escape(t(source.label))}</figcaption>${source.source_id ? `<a href="api/review-sources/${source.source_id}" target="_blank" rel="noopener"><img src="api/review-sources/${source.source_id}" alt="${escape(source.label)}" loading="lazy"></a>` : ""}<p>${escape(workflowValue(reviewItem.field, source.value))}</p>${source.candidate && canApply ? `<button data-review-candidate="${index}">${t("采用此值")}</button>` : ""}</figure>`).join("")}</div>` + (record?.files.length ? `<details><summary>${t("当前附件")}</summary><ul class="files-list">${fileListHtml(record.files)}</ul></details>` : "") + (reviewItem.resolution ? `<p class="form-hint">${escape(reviewItem.resolution)}</p>` : "");
     $("review-edit-record").textContent = t(record ? "编辑样品" : "新建实验");
     if (reviewPlan) $("review-change-preview").innerHTML = changeTable(reviewPlan.preview.changes);
@@ -2418,6 +2452,9 @@ function initialize() {
   $("record-review").addEventListener("click", () => {
     if (workflowBusy) return;
     $("detail").close(); reviewItem = null; reviewPlan = null; reviewAddRecord = detailId; workflowDirty = false;
+    const reviewProject = records.find(record => record.id === detailId)?.project_id;
+    for (const option of $("review-add-field").options) if (BUILTIN_OF[option.value]) option.hidden = option.disabled = !builtinEnabled(reviewProject, option.value);
+    if ($("review-add-field").selectedOptions[0]?.disabled) $("review-add-field").value = [...$("review-add-field").options].find(option => !option.disabled)?.value ?? "";
     $("review-add-form").reset(); $("review-error").hidden = true;
     $("review-dialog").showModal(); renderReviews(); $("review-add-title").focus();
   });
@@ -2801,7 +2838,8 @@ function initialize() {
 
   // ---- Project settings: built-in fields, key fields, phase presets (PUT api/projects/{id}/settings) ----
   const BUILTIN_ROWS = [["precursor", "前驱体"], ["temperature", "温度 / °C"], ["duration", "反应 / 取样时间 · min"], ["materials", "溶剂 / 配体"]];
-  let settingsProject = "", settingsRevision = 0, settingsBusy = false, settingsDirty = false;
+  // The draft and its revision belong to settingsLoadedFor; saving is possible only after that project loaded.
+  let settingsProject = "", settingsRevision = 0, settingsBusy = false, settingsDirty = false, settingsLoadedFor = "";
   function settingsTemplateFields(project) {
     const template = templates[project];
     return (template?.fields || []).filter(field => ["text", "number", "single", "multi"].includes(field.type));
@@ -2824,13 +2862,14 @@ function initialize() {
       return `<tr><td><input type="checkbox" data-key-pick="${index}" ${entry ? "checked" : ""} aria-label="${escape(t("设为关键字段：{field}", {field: field.label}))}"></td><td>${escape(field.label)}${field.unit ? ` <small class="muted">${escape(field.unit)}</small>` : ""}</td>
         <td>${t(field.section === "result" ? "结果" : "条件")}</td><td><input type="checkbox" data-key-missing="${index}" ${entry?.check_missing ? "checked" : ""} ${entry ? "" : "disabled"} aria-label="${escape(t("缺少时提示：{field}", {field: field.label}))}"></td></tr>`;
     }).join("")}</tbody></table>` : `<p class="empty">${t("这个项目还没有实验模板。先在“实验模板”中添加字段，再回来选择关键字段。")}</p>`)
-      + (stale.length ? `<p class="field-help">${t("以下关键字段已不在当前模板中，保存时会移除：{fields}", {fields: stale.map(entry => entry.label).join("、")})}</p>` : "");
+      + (stale.length ? `<p class="field-help">${escape(t("以下关键字段已不在当前模板中，保存时会移除：{fields}", {fields: stale.map(entry => entry.label).join("、")}))}</p>` : "");
     $("settings-phases").value = (Array.isArray(settings.phase_presets) ? settings.phase_presets : []).join("\n");
     settingsDirty = false;
     syncProjectSettingsControls();
   }
   function syncProjectSettingsControls() {
     for (const control of $("project-settings-dialog").querySelectorAll("button,input,select,textarea")) control.disabled = settingsBusy;
+    $("save-project-settings").disabled = settingsBusy || !settingsProject || settingsLoadedFor !== settingsProject;
     if (settingsBusy) return;
     for (const box of $("settings-key-fields").querySelectorAll("[data-key-missing]")) {
       box.disabled = !$("settings-key-fields").querySelector(`[data-key-pick="${box.dataset.keyMissing}"]`).checked;
@@ -2854,13 +2893,18 @@ function initialize() {
     return {builtin, key_fields, phase_presets};
   }
   async function loadProjectSettings(project) {
-    settingsProject = project;
+    settingsProject = project; settingsLoadedFor = ""; settingsDirty = false;
+    $("settings-builtin").textContent = t("正在读取…"); $("settings-key-fields").textContent = ""; $("settings-phases").value = "";
     $("project-settings-error").hidden = true;
     settingsBusy = true; syncProjectSettingsControls();
     try {
       const entry = await api(`api/projects/${encodeURIComponent(project)}/settings`);
       if (settingsProject !== project) return;
       fillProjectSettings(entry);
+      settingsLoadedFor = project;
+    } catch (error) {
+      if (settingsProject === project) { $("settings-builtin").textContent = ""; $("settings-key-fields").textContent = ""; }
+      throw error;
     } finally { if (settingsProject === project) { settingsBusy = false; syncProjectSettingsControls(); } }
   }
   async function openProjectSettings() {
@@ -2888,7 +2932,7 @@ function initialize() {
     syncProjectSettingsControls();
   });
   $("save-project-settings").addEventListener("click", async () => {
-    if (settingsBusy) return;
+    if (settingsBusy || settingsLoadedFor !== settingsProject) return;
     const draft = projectSettingsDraft(), project = settingsProject;
     if (draft.phase_presets.length > 20) return showError("project-settings-error", "物相预设最多 20 个。");
     if (draft.key_fields.length > 8) return showError("project-settings-error", "关键字段最多 8 个。");
@@ -2914,18 +2958,23 @@ function initialize() {
 
   // ---- Catalog conventions in data/local-catalog.json (GET/PUT api/local-catalog) ----
   let conventionsRevision = "", conventionsBusy = false, conventionsDirty = false;
-  function aliasLines(aliases) {
-    return (Array.isArray(aliases) ? aliases : []).map(entry => `${entry.label} = ${(entry.aliases || []).join(", ")}`).join("\n");
+  // Aliases are edited as structured rows: a label and one alias per line, so names may contain "=" or commas.
+  function aliasRowHtml(entry) {
+    return `<div class="alias-row" data-alias-row>
+      <label><span>${escape(t("显示名称"))}</span><input data-alias-label maxlength="250" value="${escape(entry.label || "")}"></label>
+      <label><span>${escape(t("别名（每行一个）"))}</span><textarea data-alias-list rows="2" spellcheck="false">${escape((entry.aliases || []).join("\n"))}</textarea></label>
+      <button type="button" class="quiet danger" data-remove-alias>${escape(t("删除"))}</button></div>`;
   }
-  function parseAliasLines(text) {
+  function renderAliasRows(entries) {
+    $("conventions-aliases").innerHTML = (entries.length ? entries : [{label: "", aliases: []}]).map(aliasRowHtml).join("");
+  }
+  function readAliasRows() {
     const entries = [];
-    for (const [index, raw] of text.split(/\r?\n/).entries()) {
-      const line = raw.trim();
-      if (!line) continue;
-      const split = line.indexOf("=");
-      const label = (split < 0 ? line : line.slice(0, split)).trim();
-      const aliases = split < 0 ? [] : [...new Set(line.slice(split + 1).split(/[,，、]/).map(value => value.trim()).filter(Boolean))];
-      if (!label) throw new Error(t("第 {line} 行缺少显示名称。", {line: index + 1}));
+    for (const [index, row] of [...$("conventions-aliases").querySelectorAll("[data-alias-row]")].entries()) {
+      const label = row.querySelector("[data-alias-label]").value.trim();
+      const aliases = [...new Set(row.querySelector("[data-alias-list]").value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
+      if (!label && !aliases.length) continue;
+      if (!label) throw new Error(t("第 {line} 组缺少显示名称。", {line: index + 1}));
       entries.push({label, aliases});
     }
     return entries;
@@ -2934,7 +2983,7 @@ function initialize() {
     const prefixes = [...new Set($("conventions-prefixes").value.split(/[\s,，、]+/).map(value => value.trim()).filter(Boolean))];
     const invalid = prefixes.find(prefix => !/^[A-Za-z]{1,20}$/.test(prefix));
     if (invalid) throw new Error(t("编号前缀只能包含 1–20 个英文字母：{prefix}", {prefix: invalid}));
-    const precursor_aliases = parseAliasLines($("conventions-aliases").value);
+    const precursor_aliases = readAliasRows();
     let translations = {};
     const source = $("conventions-translations").value.trim();
     if (source) {
@@ -2950,7 +2999,7 @@ function initialize() {
     const catalog = result?.catalog || {};
     conventionsRevision = typeof result?.revision === "string" ? result.revision : "";
     $("conventions-prefixes").value = (catalog.notebook_prefixes || []).join(", ");
-    $("conventions-aliases").value = aliasLines(catalog.precursor_aliases);
+    renderAliasRows(Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : []);
     const translations = catalog.translations || {};
     $("conventions-translations").value = Object.keys(translations).some(key => Object.keys(translations[key] || {}).length) ? JSON.stringify(translations, null, 2) : "";
     conventionsDirty = false;
@@ -2972,6 +3021,18 @@ function initialize() {
     $("conventions-dialog").close();
   }
   $("conventions-view").addEventListener("click", openConventions);
+  $("add-alias-row").addEventListener("click", () => {
+    if (conventionsBusy) return;
+    $("conventions-aliases").insertAdjacentHTML("beforeend", aliasRowHtml({label: "", aliases: []}));
+    conventionsDirty = true;
+    $("conventions-aliases").lastElementChild.querySelector("[data-alias-label]").focus();
+  });
+  $("conventions-aliases").addEventListener("click", event => {
+    const remove = event.target.closest("[data-remove-alias]");
+    if (!remove || conventionsBusy) return;
+    remove.closest("[data-alias-row]").remove();
+    conventionsDirty = true;
+  });
   for (const type of ["input", "change"]) $("conventions-dialog").addEventListener(type, () => { conventionsDirty = true; });
   $("save-conventions").addEventListener("click", async () => {
     if (conventionsBusy) return;

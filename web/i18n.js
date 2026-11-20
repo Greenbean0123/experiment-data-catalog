@@ -2,6 +2,15 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "每组一个显示名称，别名每行一个。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。": "One display name per group, one alias per line. Affects display, filtering and sort order (as listed) only; stored values stay unchanged.",
+    "添加一组别名": "Add alias group",
+    "显示名称": "Display name",
+    "别名（每行一个）": "Aliases (one per line)",
+    "第 {line} 组缺少显示名称。": "Group {line} has no display name.",
+    "条件": "Condition",
+    "local-catalog.json 无法解析，请先修复文件或删除后再编辑。": "local-catalog.json cannot be read. Fix or delete the file before editing it here.",
+    "以下样品所在项目已关闭字段 {label}：{samples}": "These samples' projects have switched off {label}: {samples}",
+    "以下样品的单位与所填单位不同：{samples}": "These samples use a different unit from the one entered: {samples}",
     "{field} 最低": "{field} minimum",
     "{field} 最高": "{field} maximum",
     "包含…": "Contains…",
@@ -595,7 +604,9 @@ const CatalogI18n = (() => {
     for (const table of [categories, datasetTitles, noteLines]) for (const key of Object.keys(table)) delete table[key];
     noteRules.length = 0;
     if (!local || typeof local !== "object") return;
-    for (const [key, text] of textEntries(local.en)) en[key] = text;
+    // Local labels may add translations for catalog-specific terms but never replace the program's own wording,
+    // which is also used inside HTML templates.
+    for (const [key, text] of textEntries(local.en)) if (!Object.hasOwn(baseEn, key)) en[key] = text;
     for (const [table, values] of [[categories, local.categories], [datasetTitles, local.datasetTitles], [noteLines, local.noteLines]]) {
       for (const [key, text] of textEntries(values)) table[key] = text;
     }
@@ -645,6 +656,10 @@ const CatalogI18n = (() => {
     }
     let keyMatch = message.match(/^以下样品的模板没有字段 (.+)：(.+)$/);
     if (keyMatch) return `These samples' templates have no field ${keyMatch[1]}: ${keyMatch[2].replace(/、/g, ", ")}`;
+    keyMatch = message.match(/^以下样品所在项目已关闭字段 (.+)：(.+)$/);
+    if (keyMatch) return `These samples' projects have switched off ${keyMatch[1]}: ${keyMatch[2].replace(/、/g, ", ")}`;
+    keyMatch = message.match(/^以下样品的单位与所填单位不同：(.+)$/);
+    if (keyMatch) return `These samples use a different unit from the one entered: ${keyMatch[1].replace(/、/g, ", ")}`;
     keyMatch = message.match(/^本地约定格式不正确：(.+)$/);
     if (keyMatch) return `Invalid catalog conventions: ${keyMatch[1]}`;
     let match = message.match(/^备份磁盘空间不足：还需要约 (.+) GB，可用 (.+) GB。$/);

@@ -147,7 +147,8 @@ assert.equal(comparisonRows([record("imported", {notes: sourceNotes})], "en").fi
   assert.equal(keyFieldValue(other, thickness).unitDiffers, true, "A different unit is flagged");
   assert.equal(builtinEnabled("p", "temperature"), false);
   assert.equal(builtinEnabled("", "temperature"), false, "With every project switching it off, the all-projects view hides it too");
-  assert.equal(builtinCaption("p", "precursor", "en"), "电解液", "Falls back to the other language's custom label");
+  assert.equal(builtinCaption("p", "precursor", "en"), "Precursor", "An empty English label uses the default, not the Chinese custom label");
+  assert.equal(builtinCaption("p", "precursor", "zh"), "电解液");
   assert.equal(builtinCaption("p", "duration", "en"), "Reaction / sampling time · min", "Defaults stay exact");
   assert.deepEqual(missingConditions([bare]).includes("temperature"), false, "Switched-off built-ins are not missing");
   assert.ok(missingConditions([bare]).includes("Substrate"), "check_missing key fields are reported");
