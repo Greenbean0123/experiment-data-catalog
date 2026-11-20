@@ -21,7 +21,6 @@ import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from http.client import HTTPConnection, HTTPException
-from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
@@ -32,6 +31,7 @@ KINDS = ("XRD", "NMR", "TEM", "SEM", "XPS", "DFT", "其他")
 CONDITION_FIELDS = ("precursor", "solvent", "ligand", "temperature", "duration")
 NUMERIC_CONDITIONS = {"temperature": (-273.15, 2500), "duration": (0, 100000)}
 EMPTY_RESULT = {"phases": [], "morphologies": [], "confirmation": "", "conclusion": "", "evidence_ids": []}
+RESULT_LIST_ERROR = "物相和形貌各最多 20 项，每项最多 80 个字符；证据附件最多 100 个。"
 MAX_FILE = 256 * 1024 * 1024
 MAX_FOLDER_FILES = 300
 IMPORT_ISSUES = {
@@ -65,6 +65,7 @@ COMPRESSED_SUFFIXES = {".zip", ".7z", ".rar", ".gz", ".tgz", ".bz2", ".xz", ".zs
                        ".xlsx", ".pptx", ".opju", ".jdx", ".brml"}
 BACKUP_MARKER = "backup-info.json"
 SESSION_FILE = ".catalog-session.json"
+PENDING_PURGE_PREFIX = "purge-file:"
 APP_ID = "experiment-data-catalog"
 # Lab-specific conventions (labels, precursor aliases, phase presets, ID prefixes) live in the data folder,
 # never in the program source. See README, "Lab conventions".
@@ -255,12 +256,12 @@ def validate_result_summary(value):
     if not isinstance(value, dict) or set(value) - set(EMPTY_RESULT):
         raise Problem("实验结果格式不正确。")
     result = {}
-    for field, maximum, limit in (("phases", 20, 80), ("morphologies", 20, 80), ("evidence_ids", 100, 80)):
+    for field in ("phases", "morphologies", "evidence_ids"):
         items = value.get(field, [])
-        if (not isinstance(items, list) or len(items) > maximum or
-                any(not isinstance(item, str) or not item.strip() or len(item) > limit or
+        if (not isinstance(items, list) or (field != "evidence_ids" and len(items) > 20) or
+                any(not isinstance(item, str) or not item.strip() or len(item) > 80 or
                     any(ord(char) < 32 for char in item) for item in items)):
-            raise Problem("物相和形貌各最多 20 项，每项最多 80 个字符；证据附件最多 100 个。")
+            raise Problem(RESULT_LIST_ERROR)
         result[field] = list(dict.fromkeys(item.strip() for item in items))
     confirmation = value.get("confirmation", "")
     if confirmation not in ("", "pending", "confirmed"):
@@ -1260,15 +1261,17 @@ class Store:
                     raise Problem("该类别已不存在，请刷新后重试。", 409)
                 if len(kinds) <= 1:
                     raise Problem("至少保留一个数据类别。")
-                count = db.execute("SELECT count(*) FROM files WHERE kind=?", (name,)).fetchone()[0]
-                if (count or replacement) and (replacement not in kinds or replacement == name):
+                files = db.execute("SELECT * FROM files WHERE kind=?", (name,)).fetchall()
+                if (files or replacement) and (replacement not in kinds or replacement == name):
                     raise Problem("请选择其他类别接收附件。")
-                if count:
-                    db.execute("UPDATE experiments SET revision=revision+1, updated_at=? WHERE id IN "
-                               "(SELECT experiment_id FROM files WHERE kind=?)", (timestamp(), name))
+                if files:
+                    now = timestamp()
                     db.execute("UPDATE files SET kind=? WHERE kind=?", (replacement, name))
+                    self.touch_file_records(db, {file["experiment_id"] for file in files}, now)
+                    for file in files:
+                        self.log_file_event(db, "recategorize", file, {**file, "kind": replacement}, now)
                 db.execute("DELETE FROM categories WHERE name=?", (name,))
-                return {"ok": True, "moved": count}
+                return {"ok": True, "moved": len(files)}
         except sqlite3.IntegrityError:
             raise Problem("目标类别存在同一样品的同名附件，未作任何更改。请选择其他类别。", 409)
 
@@ -1406,14 +1409,17 @@ class Store:
                     evidence = result["evidence_ids"]
                     previous = json.loads(current["result_summary"]).get("evidence_ids", []) if current else []
                     owned = {row["id"] for row in db.execute("SELECT id FROM files WHERE experiment_id=? AND deleted_at IS NULL", (record_id,))}
-                    if set(evidence) - owned - set(previous):
+                    added = set(evidence) - set(previous)
+                    if added - owned:
                         raise Problem("结果证据只能选择本样品已有的附件；请先保存样品并上传文件。")
-                    # Editors only receive active evidence. Preserve hidden links when those lists are saved back.
-                    if evidence == [file_id for file_id in previous if file_id in owned]:
+                    visible = [file_id for file_id in evidence if file_id in owned]
+                    # Restoring a file can expose more than 100 links, which can still be saved without adding more.
+                    if added and len(visible) > 100:
+                        raise Problem(RESULT_LIST_ERROR)
+                    if visible == [file_id for file_id in previous if file_id in owned]:
                         result["evidence_ids"] = previous
                     else:
-                        hidden = [file_id for file_id in previous if file_id not in owned and file_id not in evidence]
-                        evidence.extend(hidden[:100 - len(evidence)])
+                        result["evidence_ids"] = visible + [file_id for file_id in previous if file_id not in owned]
                     clean["result_summary"] = json.dumps(result, ensure_ascii=False)
                 if "solvents" not in payload:
                     clean["solvents"] = current["solvents"] if current and clean["solvent"] == current["solvent"] else None
@@ -1828,6 +1834,14 @@ class Store:
     def trash_count(db):
         return db.execute("SELECT count(*) FROM files WHERE deleted_at IS NOT NULL").fetchone()[0]
 
+    @staticmethod
+    def category_counts(db):
+        return {row["name"]: {"active": row["active"], "trashed": row["trashed"]} for row in db.execute("""
+            SELECT c.name, count(CASE WHEN f.deleted_at IS NULL THEN f.id END) AS active,
+                   count(f.deleted_at) AS trashed
+            FROM categories c LEFT JOIN files f ON f.kind=c.name GROUP BY c.name
+        """)}
+
     def trash(self, project_id=""):
         with self.connect() as db:
             items = [dict(row) for row in db.execute("""SELECT f.*, r.id AS record_id, r.sample_id, r.experiment_no,
@@ -1919,22 +1933,81 @@ class Store:
         with self.file_copy_lock:
             with self.lock, self.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                files = [db.execute("SELECT * FROM files WHERE id=? AND deleted_at IS NOT NULL", (file_id,)).fetchone()
+                files = [db.execute("""SELECT files.*, experiments.project_id FROM files
+                             JOIN experiments ON experiments.id=files.experiment_id
+                             WHERE files.id=? AND files.deleted_at IS NOT NULL""", (file_id,)).fetchone()
                          for file_id in dict.fromkeys(ids)]
-                if any(file is None for file in files):
+                if any(file is None or ("project_id" in payload and file["project_id"] != payload["project_id"]) for file in files):
                     raise Problem("回收站内容已变化，请刷新后再清空。", 409)
                 now = timestamp()
+                pending = {file["id"]: file["size"] for file in files}
                 for file in files:
                     db.execute("DELETE FROM folder_import_receipts WHERE file_id=?", (file["id"],))
                     db.execute("DELETE FROM files WHERE id=?", (file["id"],))
                     self.log_file_event(db, "purge", file, None, now)
+                if pending:
+                    for row in db.execute("SELECT id, result_summary FROM experiments").fetchall():
+                        result = json.loads(row["result_summary"])
+                        evidence = result.get("evidence_ids", [])
+                        kept = [file_id for file_id in evidence if file_id not in pending]
+                        if kept != evidence:
+                            result["evidence_ids"] = kept
+                            db.execute("UPDATE experiments SET result_summary=?, revision=revision+1, updated_at=? WHERE id=?",
+                                       (json.dumps(result, ensure_ascii=False), now, row["id"]))
+                    # Commit the unlink intent with the purge in case the process stops after the transaction.
+                    db.executemany("INSERT OR REPLACE INTO app_settings VALUES (?, ?)",
+                                   ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
                 remaining = self.trash_count(db)
-            for file in files:
-                try:
-                    (self.files / file["id"]).unlink(missing_ok=True)
-                except OSError as exc:
-                    logging.getLogger(__name__).warning("无法删除已清空的附件副本 %s: %s", file["id"], exc)
-        return {"purged": len(files), "bytes": sum(file["size"] for file in files), "trash_count": remaining}
+            reclaimed, pending_bytes = self.unlink_purged_files(pending)
+        return {"purged": len(files), "bytes": reclaimed, "pending_bytes": pending_bytes, "trash_count": remaining}
+
+    def unlink_purged_files(self, pending):
+        reclaimed = pending_bytes = 0
+        completed = []
+        for file_id, size in pending.items():
+            path = self.files / file_id
+            try:
+                size = path.lstat().st_size
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                pending_bytes += size
+                logging.getLogger(__name__).warning("无法删除已清空的附件副本 %s: %s", file_id, exc)
+                continue
+            else:
+                reclaimed += size
+            completed.append((PENDING_PURGE_PREFIX + file_id,))
+        if completed:
+            try:
+                with self.lock, self.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.executemany("DELETE FROM app_settings WHERE key=?", completed)
+            except sqlite3.Error as exc:
+                logging.getLogger(__name__).warning("无法清除已删除附件的待处理记录: %s", exc)
+        return reclaimed, pending_bytes
+
+    def reconcile_storage(self):
+        with self.connect() as db:
+            referenced = {row["id"] for row in db.execute("SELECT id FROM files")}
+            pending = {}
+            for row in db.execute("SELECT key, value FROM app_settings WHERE key GLOB ?", (PENDING_PURGE_PREFIX + "*",)):
+                file_id = row["key"][len(PENDING_PURGE_PREFIX):]
+                if file_id not in referenced and re.fullmatch(r"[a-f0-9]{32}", file_id):
+                    pending[file_id] = json.loads(row["value"])
+        self.unlink_purged_files(pending)
+        orphaned = self.data / "orphaned"
+        for path in self.files.iterdir():
+            if path.name in referenced or path.name in pending or not (path.is_symlink() or path.is_file()):
+                continue
+            try:
+                orphaned.mkdir(exist_ok=True)
+                destination = orphaned / path.name
+                while os.path.lexists(destination):
+                    destination = orphaned / uuid.uuid4().hex
+                path.rename(destination)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("无法移出无记录的附件副本 %s: %s", path.name, exc)
 
     def file(self, file_id):
         with self.connect() as db:
@@ -2283,7 +2356,8 @@ class Handler(BaseHTTPRequestHandler):
     def send_file(self, path, content_type, filename=None, *, status=200):
         with path.open("rb") as stream:
             self.send_headers(status, content_type, os.fstat(stream.fileno()).st_size, filename)
-            shutil.copyfileobj(stream, self.wfile)
+            if self.command != "HEAD":
+                shutil.copyfileobj(stream, self.wfile)
 
     def body_length(self, maximum):
         try:
@@ -2320,60 +2394,93 @@ class Handler(BaseHTTPRequestHandler):
         return bool(value and value.isascii() and secrets.compare_digest(value, self.server.session_token))
 
     def valid_cookie(self):
-        cookie = SimpleCookie()
-        try:
-            cookie.load(self.headers.get("Cookie", ""))
-        except CookieError:
-            return False
-        session = cookie.get("catalog_session")
-        return self.valid_token(session.value) if session else False
+        # A legacy Path=/ cookie may follow the current cookie in the same header.
+        for header in self.headers.get_all("Cookie", []):
+            for pair in header.split(";"):
+                name, _, value = pair.strip().partition("=")
+                if name == "catalog_session" and self.valid_token(value.strip('"')):
+                    return True
+        return False
+
+    def locked_page(self, status=401):
+        return self.send_file(ROOT / "web" / "locked.html", "text/html; charset=utf-8", status=status)
 
     def root_page(self, query):
         params = parse_qsl(query, keep_blank_values=True)
         if any(name == "token" and self.valid_token(value) for name, value in params):
             remaining = urlencode([(name, value) for name, value in params if name != "token"])
-            location = "/?" + remaining if remaining else "/"
-            cookie = f"catalog_session={self.server.session_token}; HttpOnly; SameSite=Strict; Path=/"
+            prefix = self.server.session_prefix
+            location = prefix + "?" + remaining if remaining else prefix
+            cookie = f"catalog_session={self.server.session_token}; HttpOnly; SameSite=Strict; Path={prefix}"
             return self.send_headers(303, "text/html; charset=utf-8", 0, headers=(("Location", location), ("Set-Cookie", cookie)))
-        authorized = self.valid_cookie()
-        return self.send_file(ROOT / "web" / ("index.html" if authorized else "locked.html"),
-                              "text/html; charset=utf-8", status=200 if authorized else 401)
+        return self.locked_page()
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        try:
+            return self.authorize_request()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return False
+
+    def authorize_request(self):
+        self.allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+        if self.headers.get("Host") not in self.allowed_hosts:
+            self.send_json({"error": "仅接受本机地址访问。"}, 403)
+            return False
+        try:
+            self.url = urlsplit(self.path)
+        except ValueError:
+            self.send_json({"error": "找不到该页面或操作。"}, 404)
+            return False
+        path = unquote(self.url.path)
+        namespaced = path.startswith("/s/")
+        self.scoped = path.startswith(self.server.session_prefix)
+        self.route = "/" + path[3:].partition("/")[2] if namespaced else path
+        api = self.route == "/api" or self.route.startswith("/api/")
+        if namespaced:
+            if self.scoped and self.valid_cookie():
+                return True
+            if not api:
+                self.locked_page()
+                return False
+        elif not api or self.valid_token(self.headers.get("X-Catalog-Token")):
+            return True
+        elif self.command == "GET" and self.route == "/api/health":
+            self.send_json({"app": APP_ID, "version": 1})
+            return False
+        self.send_json({"error": "会话已失效，请从启动入口重新打开实验数据目录。"}, 401)
+        return False
 
     def dispatch(self):
-        allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
-        if self.headers.get("Host") not in allowed_hosts:
-            raise Problem("仅接受本机地址访问。", 403)
-        url = urlsplit(self.path)
-        path = unquote(url.path)
-        store = self.server.store
-        if path.startswith("/api/"):
-            authorized = self.valid_token(self.headers.get("X-Catalog-Token")) or self.valid_cookie()
-            if self.command == "GET" and path == "/api/health":
-                health = {"app": APP_ID, "version": 1}
-                if authorized:
-                    health["workspace"] = str(store.data.resolve())
-                return self.send_json(health)
-            if not authorized:
-                return self.send_json({"error": "会话已失效，请从启动入口重新打开实验数据目录。"}, 401)
+        path, store = self.route, self.server.store
         if self.command != "GET":
-            if self.headers.get("Origin") not in {"http://" + host for host in allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
+            if self.headers.get("Origin") not in {"http://" + host for host in self.allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
                 raise Problem("请从本机实验数据目录页面操作。", 403)
-        query = parse_qs(url.query)
+        query = parse_qs(self.url.query)
         if self.command == "GET":
             if path == "/":
-                return self.root_page(url.query)
-            static = {"/app.js": ("app.js", "text/javascript; charset=utf-8"),
-                      "/i18n.js": ("i18n.js", "text/javascript; charset=utf-8"),
-                      "/newapi-theme.css": ("newapi-theme.css", "text/css; charset=utf-8"),
-                      "/style.css": ("style.css", "text/css; charset=utf-8"),
-                      "/locked.css": ("locked.css", "text/css; charset=utf-8")}
-            if path in static:
-                name, mime = static[path]
-                return self.send_file(ROOT / "web" / name, mime)
-            if path == "/notices.txt":
-                return self.send_file(ROOT / "THIRD_PARTY_NOTICES.txt", "text/plain; charset=utf-8")
-            if path == "/license.txt":
-                return self.send_file(ROOT / "LICENSE", "text/plain; charset=utf-8")
+                if self.scoped:
+                    return self.send_file(ROOT / "web" / "index.html", "text/html; charset=utf-8")
+                return self.root_page(self.url.query)
+            if path == "/locked.html":
+                return self.locked_page(200)
+            if path == "/locked.css":
+                return self.send_file(ROOT / "web" / "locked.css", "text/css; charset=utf-8")
+            if self.scoped:
+                static = {"/app.js": ("web/app.js", "text/javascript"),
+                          "/i18n.js": ("web/i18n.js", "text/javascript"),
+                          "/newapi-theme.css": ("web/newapi-theme.css", "text/css"),
+                          "/style.css": ("web/style.css", "text/css"),
+                          "/notices.txt": ("THIRD_PARTY_NOTICES.txt", "text/plain"),
+                          "/license.txt": ("LICENSE", "text/plain")}
+                if path in static:
+                    name, mime = static[path]
+                    return self.send_file(ROOT / name, mime + "; charset=utf-8")
+            elif path.endswith(".html"):
+                return self.locked_page()
+            if path == "/api/health":
+                return self.send_json({"app": APP_ID, "version": 1, "workspace": str(store.data.resolve())})
             if path == "/api/source.zip":
                 from package_app import FILES, PACKAGE_NAME
                 with tempfile.TemporaryDirectory() as folder:
@@ -2386,7 +2493,7 @@ class Handler(BaseHTTPRequestHandler):
                 with store.lock, store.connect() as db:
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
                               "translations": store.local_translations(), "conventions": store.conventions(),
-                              "trash_count": store.trash_count(db)}
+                              "trash_count": store.trash_count(db), "category_counts": store.category_counts(db)}
                 return self.send_json(result)
             if path == "/api/trash":
                 return self.send_json(store.trash(query.get("project_id", [""])[0]))
@@ -2527,7 +2634,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.dispatch()
         except Problem as exc:
-            if (self.path.partition("?")[0] in ("/api/experiments/share.zip", "/api/backup.zip")
+            if (self.route in ("/api/experiments/share.zip", "/api/backup.zip")
                     and "text/html" in self.headers.get("Accept", "")):
                 message = str(exc).encode("utf-8")
                 self.send_headers(exc.status, "text/plain; charset=utf-8", len(message))
@@ -2567,12 +2674,15 @@ def make_server(data_dir, port=8765, *, server_type=LocalHTTPServer):
     try:
         server.daemon_threads = False  # Finish in-flight writes before the process exits.
         server.store = Store(data_dir)
+        server.store.reconcile_storage()
         server.session_token = secrets.token_urlsafe(32)
+        server.instance = secrets.token_hex(8)
+        server.session_prefix = f"/s/{server.instance}/"
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=session_path.parent,
                                          prefix=".part-catalog-session-", delete=False) as output:
             temporary = Path(output.name)
             json.dump({"port": server.server_port, "token": server.session_token,
-                       "pid": os.getpid(), "started_at": timestamp()}, output)
+                       "instance": server.instance, "pid": os.getpid(), "started_at": timestamp()}, output)
         temporary.replace(session_path)
     except BaseException:
         try:

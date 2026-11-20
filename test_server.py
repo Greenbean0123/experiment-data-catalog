@@ -12,11 +12,13 @@ import threading
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from http.client import HTTPConnection
+from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from urllib.parse import urlencode
 
 import server
@@ -40,6 +42,17 @@ def session_cookie(service):
     if status != 303:
         raise AssertionError(f"Expected session redirect, received {status}")
     return headers["Set-Cookie"].split(";", 1)[0]
+
+
+@contextmanager
+def serving(service):
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        service.shutdown()
+        thread.join()
 
 
 class StoreTests(unittest.TestCase):
@@ -748,6 +761,43 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
                                           "target_record_id": owner, "target_revision": undone["revision"]})["records"][1]
         self.assertEqual(returned["result_summary"]["evidence_ids"], [file_id])
 
+    def test_dormant_evidence_is_preserved_at_limit_and_removed_from_all_records_on_purge(self):
+        owner = self.store.save({"sample_id": "Evidence owner"})
+        original = [self.store.add_file(owner, f"scan-{i}.csv", "XRD", io.BytesIO(b"1"), 1) for i in range(100)]
+        row = self.store.list()[0]
+        self.store.save({**row, "result_summary": {"evidence_ids": original}}, owner)
+        row = self.store.list()[0]
+        dormant = original[-1]
+        self.store.change_file(dormant, "delete", {"record_revision": row["revision"]})
+        replacement = self.store.add_file(owner, "replacement.csv", "XRD", io.BytesIO(b"2"), 1)
+        extra = self.store.add_file(owner, "extra.csv", "XRD", io.BytesIO(b"3"), 1)
+        row = self.store.list()[0]
+        visible = [*original[:-1], replacement]
+        with self.assertRaises(Problem) as exceeded:
+            self.store.save({**row, "result_summary": {"evidence_ids": [*visible, extra]}}, owner)
+        self.assertEqual(str(exceeded.exception), server.RESULT_LIST_ERROR)
+        self.store.save({**row, "result_summary": {"evidence_ids": visible}}, owner)
+        row = self.store.list()[0]
+        self.assertEqual(row["result_summary"]["evidence_ids"], visible)
+        with self.store.connect() as db:
+            stored = json.loads(db.execute("SELECT result_summary FROM experiments WHERE id=?", (owner,)).fetchone()[0])
+        self.assertEqual(stored["evidence_ids"], [*visible, dormant])
+
+        row = self.store.change_file(dormant, "restore", {"record_revision": row["revision"]})["records"][0]
+        self.assertEqual(row["result_summary"]["evidence_ids"], [*visible, dormant])
+        self.store.save({**row, "notes": "Preserve restored links"}, owner)
+        row = self.store.list()[0]
+        target = self.store.save({"sample_id": "Evidence destination"})
+        _, destination = self.store.change_file(dormant, "update", {
+            "record_revision": row["revision"], "target_record_id": target, "target_revision": 1})["records"]
+        self.store.save({**destination, "result_summary": {"evidence_ids": [dormant]}}, target)
+        self.store.change_file(dormant, "delete", {"record_revision": destination["revision"] + 1})
+        self.store.purge_trash({"file_ids": [dormant], "confirm": "purge"})
+        with self.store.connect() as db:
+            evidence = {row["id"]: json.loads(row["result_summary"])["evidence_ids"]
+                        for row in db.execute("SELECT id, result_summary FROM experiments")}
+        self.assertEqual(evidence, {owner: visible, target: []})
+
     def test_undo_of_result_restores_a_purged_evidence_id(self):
         record_id = self.store.save({"sample_id": "Purged result"})
         file_id = self.store.add_file(record_id, "evidence.csv", "XRD", io.BytesIO(b"1,2"), 3)
@@ -1117,6 +1167,9 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
             self.assertEqual(row["files"][0], dict(old["files"][0], kind="NMR"))
             self.assertEqual(self.store.file(row["files"][0]["id"])[0].read_bytes(), b"1,2\n")
         self.assertEqual({row["files"][0]["id"] for row in self.store.list()}, set(files))
+        events = [event for event in self.store.history()["file_events"] if event["action"] == "recategorize"]
+        self.assertCountEqual([event["file_id"] for event in events], files)
+        self.assertTrue(all(event["before"]["kind"] == "XRD" and event["after"]["kind"] == "NMR" for event in events))
         self.assertNotIn("XRD", Store(self.store.data).catalog()["kinds"])
         # A merge that would violate file uniqueness must roll back revisions and every file update.
         self.store.add_file(ids[0], "pattern.csv", "TEM", io.BytesIO(b"3,4\n"), 4)
@@ -1444,7 +1497,7 @@ class HTTPTests(unittest.TestCase):
 
         with patch.object(Path, "unlink", verify_committed), self.assertLogs("server", "WARNING") as logged:
             result = self.request_json(route, payload, "POST")
-        self.assertEqual(result, {"purged": 2, "bytes": 6, "trash_count": base_count})
+        self.assertEqual(result, {"purged": 2, "bytes": 3, "pending_bytes": 3, "trash_count": base_count})
         self.assertEqual(attempted, [first, second])
         self.assertIn(second, logged.output[0])
         self.assertFalse((store.files / first).exists())
@@ -1453,6 +1506,25 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request(route, payload, "POST")[0], 409)
         events = self.request_json(f"/api/history?record_id={owner}")["file_events"]
         self.assertEqual([event["action"] for event in events if event["file_id"] == first], ["purge", "delete", "upload"])
+
+    def test_purge_project_scope_rejects_mixed_projects_atomically(self):
+        store = self.server.store
+        foreign_project = store.add_catalog_item("projects", {"name": "Separate purge scope"})["project"]["id"]
+        files = []
+        for project_id in ("default", foreign_project):
+            owner = store.save({"sample_id": "Scoped purge", "project_id": project_id})
+            file_id = store.add_file(owner, "purge.csv", "XRD", io.BytesIO(b"123"), 3)
+            store.change_file(file_id, "delete", {"record_revision": 2})
+            files.append(file_id)
+        trash = self.request_json("/api/trash")
+        route = "/api/trash/purge"
+        payload = {"file_ids": files, "confirm": "purge"}
+        self.assertEqual(self.request_json(route, {**payload, "project_id": "default"}, "POST", 409),
+                         {"error": "回收站内容已变化，请刷新后再清空。"})
+        self.assertEqual(self.request_json("/api/trash"), trash)
+        self.assertTrue(all((store.files / file_id).is_file() for file_id in files))
+        self.assertEqual(self.request_json(route, {**payload, "file_ids": files[:1], "project_id": "default"}, "POST")["purged"], 1)
+        self.assertEqual(self.request_json(route, {**payload, "file_ids": files[1:]}, "POST")["purged"], 1)
 
     def test_experiment_zip_browser_navigation_and_stale_message(self):
         record_id = self.server.store.save({"sample_id": "ZIP-HTTP"})
@@ -1550,13 +1622,15 @@ class HTTPTests(unittest.TestCase):
         cls.thread.join()
         cls.folder.cleanup()
 
-    def request(self, path, body=None, method="GET", origin=None, headers=None, *, authenticate=True):
+    def request(self, path, body=None, method="GET", origin=None, headers=None, *, authenticate=True, scoped=True):
         request_headers = {"Content-Type": "application/json", "X-Catalog-Local": "1",
                            "Origin": origin or self.address}
         if authenticate:
             request_headers["Cookie"] = self.cookie
         request_headers.update(headers or {})
         data = json.dumps(body).encode() if body is not None and not isinstance(body, bytes) else body
+        if scoped:
+            path = self.server.session_prefix + path[1:]
         request = Request(self.address + path, data=data, headers=request_headers, method=method)
         try:
             with urlopen(request, timeout=3) as response:
@@ -1566,8 +1640,9 @@ class HTTPTests(unittest.TestCase):
 
     def test_session_redirect_cookie_health_header_and_locked_page(self):
         message = {"error": "会话已失效，请从启动入口重新打开实验数据目录。"}
-        for method in ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
-            status, body, _ = self.request("/api/experiments", method=method, authenticate=False)
+        for method in ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "PROPFIND"):
+            status, body, _ = self.request("/api/experiments", method=method, authenticate=False,
+                                           headers={"Origin": "", "X-Catalog-Local": ""})
             self.assertEqual(status, 401)
             self.assertEqual(json.loads(body), message)
         self.assertEqual(self.request("/api/experiments", method="HEAD", authenticate=False)[0], 401)
@@ -1581,38 +1656,77 @@ class HTTPTests(unittest.TestCase):
         token = self.server.session_token
         header_auth = {"X-Catalog-Token": token}
         self.assertEqual(self.request("/api/experiments?token=" + token, authenticate=False)[0], 401)
-        self.assertEqual(self.request("/api/experiments", headers=header_auth, authenticate=False)[0], 200)
+        self.assertEqual(self.request("/api/experiments", scoped=False)[0], 401)
+        self.assertEqual(self.request("/api/experiments", method="PROPFIND", scoped=False)[0], 401)
+        self.assertEqual(self.request("/api/experiments", headers=header_auth, authenticate=False, scoped=False)[0], 200)
+        self.assertEqual(self.request("/api/experiments", headers=header_auth, authenticate=False)[0], 401)
         self.assertEqual(self.request("/api/experiments", {"sample_id": "Rejected"}, "POST",
-                                      "https://example.com", header_auth, authenticate=False)[0], 403)
+                                      "https://example.com", header_auth, authenticate=False, scoped=False)[0], 403)
         self.assertEqual(self.request("/api/experiments", {"sample_id": "Rejected"}, "POST",
-                                      headers={**header_auth, "X-Catalog-Local": ""}, authenticate=False)[0], 403)
+                                      headers={**header_auth, "X-Catalog-Local": ""}, authenticate=False, scoped=False)[0], 403)
         public = {"app": "experiment-data-catalog", "version": 1}
-        self.assertEqual(json.loads(self.request("/api/health", authenticate=False)[1]), public)
-        self.assertEqual(json.loads(self.request("/api/health", headers={"X-Catalog-Token": "wrong"}, authenticate=False)[1]), public)
+        self.assertEqual(json.loads(self.request("/api/health", scoped=False)[1]), public)
+        self.assertEqual(json.loads(self.request("/api/health", headers={"X-Catalog-Token": "wrong"},
+                                                 authenticate=False, scoped=False)[1]), public)
+        self.assertEqual(self.request("/api/health", authenticate=False)[0], 401)
         full = {**public, "workspace": str(self.server.store.data.resolve())}
-        self.assertEqual(json.loads(self.request("/api/health", headers=header_auth, authenticate=False)[1]), full)
+        self.assertEqual(json.loads(self.request("/api/health", headers=header_auth, authenticate=False, scoped=False)[1]), full)
         self.assertEqual(self.request_json("/api/health"), full)
 
-        status, page, _ = self.request("/", headers=header_auth, authenticate=False)
+        status, page, _ = self.request("/", scoped=False)
         self.assertEqual(status, 401)
         self.assertIn(b"/locked.css", page)
         self.assertNotIn(b"<script", page)
+        self.assertEqual(self.request("/", authenticate=False)[:2], (401, page))
+        self.assertEqual(self.request("/index.html", scoped=False)[:2], (401, page))
+        self.assertEqual(self.request("/locked.html", authenticate=False, scoped=False)[:2], (200, page))
+        status, _, headers = self.request("/locked.css", authenticate=False, scoped=False)
+        self.assertEqual((status, headers.get_content_type()), (200, "text/css"))
         status, _, headers = launch_request(self.server, token="wrong")
         self.assertEqual(status, 401)
         self.assertNotIn("Set-Cookie", headers)
         for path, content_type in (("/app.js", "text/javascript"), ("/i18n.js", "text/javascript"),
-                                   ("/style.css", "text/css"), ("/locked.css", "text/css"),
+                                   ("/style.css", "text/css"),
                                    ("/notices.txt", "text/plain"), ("/license.txt", "text/plain")):
-            status, _, headers = self.request(path, authenticate=False)
+            status, _, headers = self.request(path)
             self.assertEqual(status, 200)
             self.assertEqual(headers.get_content_type(), content_type)
+            self.assertEqual(self.request(path, scoped=False)[0], 404)
         with patch.object(server.Handler, "log_message") as log:
             status, page, headers = launch_request(self.server, desktop=1, token=token, blank="")
-        self.assertEqual((status, page, headers["Location"]), (303, b"", "/?desktop=1&blank="))
-        self.assertEqual(headers["Set-Cookie"], self.cookie + "; HttpOnly; SameSite=Strict; Path=/")
+        prefix = f"/s/{self.server.instance}/"
+        self.assertEqual((status, page, headers["Location"]), (303, b"", prefix + "?desktop=1&blank="))
+        self.assertEqual(headers["Set-Cookie"], self.cookie + "; HttpOnly; SameSite=Strict; Path=" + prefix)
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
         self.assertNotIn(token, repr(log.call_args_list))
-        self.assertEqual(self.request(headers["Location"])[0], 200)
+        self.assertEqual(self.request(headers["Location"], scoped=False)[0], 200)
+        legacy_cookie = {"Cookie": self.cookie + "; catalog_session=legacy-root-cookie"}
+        self.assertEqual(self.request("/api/experiments", headers=legacy_cookie)[0], 200)
+        self.assertEqual(self.request("/api/experiments", headers=legacy_cookie, scoped=False)[0], 401)
+
+    def test_browser_cookies_are_isolated_across_ports(self):
+        with tempfile.TemporaryDirectory() as folder, make_server(Path(folder), 0) as other, serving(other):
+            other_address = f"http://127.0.0.1:{other.server_port}"
+            jar = CookieJar()
+            browser = build_opener(HTTPCookieProcessor(jar))
+            for address, service in ((self.address, self.server), (other_address, other)):
+                with browser.open(address + "/?token=" + service.session_token, timeout=3) as response:
+                    self.assertEqual(response.geturl(), address + service.session_prefix)
+            self.assertEqual({cookie.path: cookie.value for cookie in jar},
+                             {self.server.session_prefix: self.server.session_token, other.session_prefix: other.session_token})
+            for address, service in ((self.address, self.server), (other_address, other)):
+                with browser.open(address + service.session_prefix + "api/health", timeout=3) as response:
+                    self.assertEqual(json.load(response)["workspace"], str(service.store.data.resolve()))
+            with self.assertRaises(HTTPError) as rejected:
+                browser.open(other_address + self.server.session_prefix, timeout=3)
+            with rejected.exception as response:
+                self.assertEqual(response.code, 401)
+                self.assertIn(b"/locked.css", response.read())
+            with self.assertRaises(HTTPError) as rejected:
+                browser.open(other_address + self.server.session_prefix + "api/experiments", timeout=3)
+            with rejected.exception as response:
+                self.assertEqual(response.code, 401)
+                self.assertEqual(response.headers.get_content_type(), "application/json")
 
     def test_browser_api_round_trip_and_origin_boundary(self):
         status, data, _ = self.request("/api/experiments", {"sample_id": "HTTP-01"}, "POST")
@@ -1628,7 +1742,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(data)["record"]["temperature"], 220)
         self.assertEqual(json.loads(data)["record"]["revision"], 2)
         attachment = b"angle,intensity\n20,42\n"
-        file_request = Request(self.address + "/api/experiments/" + record_id + "/files?" +
+        file_request = Request(self.address + self.server.session_prefix + "api/experiments/" + record_id + "/files?" +
                                urlencode({"name": "HTTP 衍射.csv", "kind": "XRD"}), data=attachment,
                                headers={"Origin": self.address, "X-Catalog-Local": "1", "Content-Type": "application/octet-stream",
                                         "Cookie": self.cookie})
@@ -1751,6 +1865,35 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn("Content-Disposition", headers)
         self.assertIn("attachment", self.request(f"/api/files/{image_id}")[2]["Content-Disposition"])
 
+    def test_category_counts_and_reassignment_of_an_archived_trashed_attachment(self):
+        store = self.server.store
+        retired, replacement = "Retired scan type", "Current scan type"
+        for name in (retired, replacement):
+            self.request_json("/api/categories", {"name": name}, "POST", 201)
+        project = store.add_catalog_item("projects", {"name": "Second scan project"})["project"]["id"]
+        owner, archived = [store.save({"sample_id": "Categorized sample", "project_id": project_id})
+                           for project_id in ("default", project)]
+        for record_id in (owner, archived):
+            store.add_file(record_id, "active.csv", replacement, io.BytesIO(b"1"), 1)
+        trashed = store.add_file(archived, "old.csv", retired, io.BytesIO(b"2"), 1)
+        row = store.change_file(trashed, "delete", {"record_revision": 3})["records"][0]
+        store.archive(archived, {"archived": True, "revision": row["revision"]})
+        counts = self.request_json("/api/experiments")["category_counts"]
+        self.assertEqual(counts[retired], {"active": 0, "trashed": 1})
+        self.assertEqual(counts[replacement], {"active": 2, "trashed": 0})
+        self.assertEqual(self.request_json("/api/categories", {"name": retired}, "DELETE", 400),
+                         {"error": "请选择其他类别接收附件。"})
+        self.assertEqual(self.request_json("/api/categories", {"name": retired, "replacement": replacement}, "DELETE"),
+                         {"ok": True, "moved": 1})
+        counts = self.request_json("/api/experiments")["category_counts"]
+        self.assertNotIn(retired, counts)
+        self.assertEqual(counts[replacement], {"active": 2, "trashed": 1})
+        events = self.request_json(f"/api/history?record_id={archived}")["file_events"]
+        event, = [event for event in events if event["action"] == "recategorize"]
+        self.assertEqual(event["file_id"], trashed)
+        self.assertEqual(event["before"], {"name": "old.csv", "kind": retired, "record_id": archived})
+        self.assertEqual(event["after"], {**event["before"], "kind": replacement})
+
     def test_shutdown_is_local_and_graceful(self):
         with tempfile.TemporaryDirectory() as folder:
             server = make_server(Path(folder), 0)
@@ -1759,7 +1902,7 @@ class HTTPTests(unittest.TestCase):
             address = f"http://127.0.0.1:{server.server_port}"
             try:
                 token = session_cookie(server)
-                request = Request(address + "/api/shutdown", data=b"", method="POST",
+                request = Request(address + server.session_prefix + "api/shutdown", data=b"", method="POST",
                                   headers={"Origin": address, "X-Catalog-Local": "1", "Cookie": token})
                 with urlopen(request, timeout=3) as response:
                     self.assertTrue(json.load(response)["ok"])
@@ -1954,9 +2097,11 @@ class DataSafetyTests(unittest.TestCase):
         self.assertFalse(session_path.exists())
         with make_server(self.store.data, 0) as first:
             session = json.loads(session_path.read_text(encoding="utf-8"))
-            self.assertEqual(set(session), {"port", "token", "pid", "started_at"})
+            self.assertEqual(set(session), {"port", "token", "instance", "pid", "started_at"})
             self.assertEqual((session["port"], session["pid"]), (first.server_port, os.getpid()))
             self.assertRegex(session["token"], r"^[A-Za-z0-9_-]{43}$")
+            self.assertRegex(session["instance"], r"^[0-9a-f]{16}$")
+            self.assertEqual(session["instance"], first.instance)
             self.assertTrue(session["started_at"])
             self.assertEqual(session["token"], first.session_token)
             with self.assertRaises(CatalogUnavailable):
@@ -1973,6 +2118,7 @@ class DataSafetyTests(unittest.TestCase):
         with make_server(self.store.data, 0) as again:
             first.server_close()
             self.assertNotEqual(again.session_token, first.session_token)
+            self.assertNotEqual(again.instance, first.instance)
             self.assertEqual(json.loads(session_path.read_text(encoding="utf-8"))["token"], again.session_token)
         self.assertFalse(session_path.exists())
 
@@ -1982,6 +2128,7 @@ class DataSafetyTests(unittest.TestCase):
             thread = threading.Thread(target=running.serve_forever)
             thread.start()
             try:
+                cookie = session_cookie(running)
                 with self.assertRaises(OSError):
                     with make_server(self.root / "other", running.server_port):
                         self.fail("A second server bound the same address and port")
@@ -2000,8 +2147,16 @@ class DataSafetyTests(unittest.TestCase):
                     running.shutdown()
                 thread.join()
         self.assertFalse((data / server.SESSION_FILE).exists())
-        with make_server(data, running.server_port) as restarted:
+        with make_server(data, running.server_port) as restarted, serving(restarted):
             self.assertNotEqual(running.session_token, restarted.session_token)
+            address = f"http://127.0.0.1:{restarted.server_port}"
+            for suffix, mime in (("", "text/html"), ("api/experiments", "application/json")):
+                request = Request(address + running.session_prefix + suffix, headers={"Cookie": cookie})
+                with self.assertRaises(HTTPError) as rejected:
+                    urlopen(request, timeout=3)
+                with rejected.exception as response:
+                    self.assertEqual(response.code, 401)
+                    self.assertEqual(response.headers.get_content_type(), mime)
 
     def test_open_starts_with_actual_port_and_session_token(self):
         data = self.store.data
@@ -2018,6 +2173,31 @@ class DataSafetyTests(unittest.TestCase):
             server.main()
         self.assertEqual(launch.call_count, 1)
         self.assertFalse(path.exists())
+
+    def test_startup_keeps_orphans_and_retries_a_committed_purge(self):
+        owner, pending = self.add("Held purge", "held.csv", b"held")
+        _, active = self.add("Keep active", "active.csv", b"active")
+        self.store.change_file(pending, "delete", {"record_revision": 2})
+        with patch.object(Path, "unlink", side_effect=PermissionError("fixture holds the file open")), \
+                self.assertLogs("server", "WARNING"):
+            result = self.store.purge_trash({"file_ids": [pending], "confirm": "purge"})
+        self.assertEqual(result, {"purged": 1, "bytes": 0, "pending_bytes": 4, "trash_count": 0})
+        self.assertTrue((self.store.files / pending).exists())
+        orphan, partial = "unreferenced", ".part-interrupted"
+        (self.store.files / orphan).write_bytes(b"orphan")
+        (self.store.files / partial).write_bytes(b"partial")
+        orphaned = self.store.data / "orphaned"
+        orphaned.mkdir()
+        (orphaned / orphan).write_bytes(b"previous orphan")
+        with make_server(self.store.data, 0) as restarted:
+            self.assertEqual(restarted.store.trash()["items"], [])
+            self.assertEqual([path.name for path in restarted.store.files.iterdir()], [active])
+            self.assertEqual((orphaned / orphan).read_bytes(), b"previous orphan")
+            self.assertEqual((orphaned / partial).read_bytes(), b"partial")
+            self.assertCountEqual([path.read_bytes() for path in orphaned.iterdir()], [b"orphan", b"partial", b"previous orphan"])
+            self.assertEqual(restarted.store.history(record_id=owner)["file_events"][0]["action"], "purge")
+            with restarted.store.connect() as db:
+                self.assertIsNone(restarted.store.setting(db, server.PENDING_PURGE_PREFIX + pending))
 
     def test_zip_backup_stores_compressed_attachments_without_recompressing(self):
         self.add("Z-1", "raw.zip", b"PK" + b"x" * 500)
