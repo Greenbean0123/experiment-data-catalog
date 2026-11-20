@@ -627,6 +627,9 @@ const CatalogI18n = (() => {
   }
 
   function translate(key, language = "zh", values = {}) {
+    // Generated review titles carry the field name, so they are translated by pattern.
+    const generated = language === "en" && typeof key === "string" && !Object.hasOwn(en, key) ? key.match(/^缺少关键字段：(.+)$/) : null;
+    if (generated) return `Missing key field: ${generated[1]}`;
     const template = language === "en" ? (en[key] ?? key) : key;
     return template.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(values, name) ? String(values[name]) : match);
   }
