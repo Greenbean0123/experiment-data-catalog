@@ -38,4 +38,4 @@ if ($process.HasExited -and $process.ExitCode -ne 0) {
     Read-Host 'Startup failed. Press Enter to close'
     exit 1
 }
-Write-Host 'Experiment Data Catalog: http://127.0.0.1:8765'
+Write-Host 'Experiment Data Catalog was opened in your browser. Run this launcher again to reopen it.'

@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import threading
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -21,6 +23,23 @@ import server
 from server import Store, Problem, export_csv, make_server, validate, experiment_number
 
 server.NOTEBOOK_PREFIXES.add("XY")  # Synthetic notebook prefix used throughout these tests.
+
+
+def launch_request(service, **params):
+    client = HTTPConnection("127.0.0.1", service.server_port, timeout=3)
+    try:
+        client.request("GET", "/?" + urlencode(params))
+        with client.getresponse() as response:
+            return response.status, response.read(), response.headers
+    finally:
+        client.close()
+
+
+def session_cookie(service):
+    status, _, headers = launch_request(service, token=service.session_token)
+    if status != 303:
+        raise AssertionError(f"Expected session redirect, received {status}")
+    return headers["Set-Cookie"].split(";", 1)[0]
 
 
 class StoreTests(unittest.TestCase):
@@ -1480,6 +1499,7 @@ class HTTPTests(unittest.TestCase):
         cls.address = f"http://127.0.0.1:{cls.server.server_port}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
+        cls.cookie = session_cookie(cls.server)
 
     @classmethod
     def tearDownClass(cls):
@@ -1488,9 +1508,11 @@ class HTTPTests(unittest.TestCase):
         cls.thread.join()
         cls.folder.cleanup()
 
-    def request(self, path, body=None, method="GET", origin=None, headers=None):
+    def request(self, path, body=None, method="GET", origin=None, headers=None, *, authenticate=True):
         request_headers = {"Content-Type": "application/json", "X-Catalog-Local": "1",
                            "Origin": origin or self.address}
+        if authenticate:
+            request_headers["Cookie"] = self.cookie
         request_headers.update(headers or {})
         data = json.dumps(body).encode() if body is not None else None
         request = Request(self.address + path, data=data, headers=request_headers, method=method)
@@ -1499,6 +1521,56 @@ class HTTPTests(unittest.TestCase):
                 return response.status, response.read(), response.headers
         except HTTPError as exc:
             return exc.code, exc.read(), exc.headers
+
+    def test_session_redirect_cookie_health_header_and_locked_page(self):
+        message = {"error": "会话已失效，请从启动入口重新打开实验数据目录。"}
+        for method in ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+            status, body, _ = self.request("/api/experiments", method=method, authenticate=False)
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(body), message)
+        self.assertEqual(self.request("/api/experiments", method="HEAD", authenticate=False)[0], 401)
+        for headers in ({"X-Catalog-Token": "wrong"}, {"X-Catalog-Token": "invalid-é"}, {"Cookie": "catalog_session=wrong"},
+                        {"Accept": "text/html"}):
+            status, body, headers = self.request("/api/backup.zip", headers=headers, authenticate=False)
+            self.assertEqual(status, 401)
+            self.assertEqual(headers.get_content_type(), "application/json")
+            self.assertEqual(json.loads(body), message)
+
+        token = self.server.session_token
+        header_auth = {"X-Catalog-Token": token}
+        self.assertEqual(self.request("/api/experiments?token=" + token, authenticate=False)[0], 401)
+        self.assertEqual(self.request("/api/experiments", headers=header_auth, authenticate=False)[0], 200)
+        self.assertEqual(self.request("/api/experiments", {"sample_id": "Rejected"}, "POST",
+                                      "https://example.com", header_auth, authenticate=False)[0], 403)
+        self.assertEqual(self.request("/api/experiments", {"sample_id": "Rejected"}, "POST",
+                                      headers={**header_auth, "X-Catalog-Local": ""}, authenticate=False)[0], 403)
+        public = {"app": "experiment-data-catalog", "version": 1}
+        self.assertEqual(json.loads(self.request("/api/health", authenticate=False)[1]), public)
+        self.assertEqual(json.loads(self.request("/api/health", headers={"X-Catalog-Token": "wrong"}, authenticate=False)[1]), public)
+        full = {**public, "workspace": str(self.server.store.data.resolve())}
+        self.assertEqual(json.loads(self.request("/api/health", headers=header_auth, authenticate=False)[1]), full)
+        self.assertEqual(self.request_json("/api/health"), full)
+
+        status, page, _ = self.request("/", headers=header_auth, authenticate=False)
+        self.assertEqual(status, 401)
+        self.assertIn(b"/locked.css", page)
+        self.assertNotIn(b"<script", page)
+        status, _, headers = launch_request(self.server, token="wrong")
+        self.assertEqual(status, 401)
+        self.assertNotIn("Set-Cookie", headers)
+        for path, content_type in (("/app.js", "text/javascript"), ("/i18n.js", "text/javascript"),
+                                   ("/style.css", "text/css"), ("/locked.css", "text/css"),
+                                   ("/notices.txt", "text/plain"), ("/license.txt", "text/plain")):
+            status, _, headers = self.request(path, authenticate=False)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get_content_type(), content_type)
+        with patch.object(server.Handler, "log_message") as log:
+            status, page, headers = launch_request(self.server, desktop=1, token=token, blank="")
+        self.assertEqual((status, page, headers["Location"]), (303, b"", "/?desktop=1&blank="))
+        self.assertEqual(headers["Set-Cookie"], self.cookie + "; HttpOnly; SameSite=Strict; Path=/")
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertNotIn(token, repr(log.call_args_list))
+        self.assertEqual(self.request(headers["Location"])[0], 200)
 
     def test_browser_api_round_trip_and_origin_boundary(self):
         status, data, _ = self.request("/api/experiments", {"sample_id": "HTTP-01"}, "POST")
@@ -1516,7 +1588,8 @@ class HTTPTests(unittest.TestCase):
         attachment = b"angle,intensity\n20,42\n"
         file_request = Request(self.address + "/api/experiments/" + record_id + "/files?" +
                                urlencode({"name": "HTTP 衍射.csv", "kind": "XRD"}), data=attachment,
-                               headers={"Origin": self.address, "X-Catalog-Local": "1", "Content-Type": "application/octet-stream"})
+                               headers={"Origin": self.address, "X-Catalog-Local": "1", "Content-Type": "application/octet-stream",
+                                        "Cookie": self.cookie})
         with urlopen(file_request, timeout=3) as response:
             self.assertEqual(response.status, 201)
             file_id = json.load(response)["id"]
@@ -1563,7 +1636,8 @@ class HTTPTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(data)) as source:
             self.assertIsNone(source.testzip())
             self.assertEqual(set(source.namelist()), {PACKAGE_NAME + "/" + name for name in FILES})
-            for name in ("web/i18n.js", "web/newapi-theme.css", "LICENSE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.txt"):
+            for name in ("web/i18n.js", "web/newapi-theme.css", "web/locked.html", "web/locked.css",
+                         "LICENSE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.txt"):
                 self.assertIn(PACKAGE_NAME + "/" + name, source.namelist())
             self.assertFalse(any(part in name for name in source.namelist()
                                  for part in ("/data/", "/research/", "/.test-tools/", ".log")))
@@ -1642,8 +1716,9 @@ class HTTPTests(unittest.TestCase):
             thread.start()
             address = f"http://127.0.0.1:{server.server_port}"
             try:
+                token = session_cookie(server)
                 request = Request(address + "/api/shutdown", data=b"", method="POST",
-                                  headers={"Origin": address, "X-Catalog-Local": "1"})
+                                  headers={"Origin": address, "X-Catalog-Local": "1", "Cookie": token})
                 with urlopen(request, timeout=3) as response:
                     self.assertTrue(json.load(response)["ok"])
                 thread.join(timeout=3)
@@ -1806,14 +1881,74 @@ class DataSafetyTests(unittest.TestCase):
 
     def test_data_folder_lock_allows_one_service(self):
         from server import CatalogUnavailable
-        first = make_server(self.store.data, 0)
-        try:
+        session_path = self.store.data / ".catalog-session.json"
+        self.assertFalse(session_path.exists())
+        with make_server(self.store.data, 0) as first:
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(session), {"port", "token", "pid", "started_at"})
+            self.assertEqual((session["port"], session["pid"]), (first.server_port, os.getpid()))
+            self.assertRegex(session["token"], r"^[A-Za-z0-9_-]{43}$")
+            self.assertTrue(session["started_at"])
+            self.assertEqual(session["token"], first.session_token)
             with self.assertRaises(CatalogUnavailable):
                 make_server(self.store.data, 0)
-        finally:
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), session)
+            backup = self.root / "session.zip"
+            first.store.backup(backup)
+            with zipfile.ZipFile(backup) as archive:
+                self.assertNotIn("data/.catalog-session.json", archive.namelist())
+            mirror = self.root / "session-mirror"
+            first.store.folder_backup(mirror)
+            self.assertFalse((mirror / "data" / session_path.name).exists())
+        self.assertFalse(session_path.exists())
+        with make_server(self.store.data, 0) as again:
             first.server_close()
-        again = make_server(self.store.data, 0)
-        again.server_close()
+            self.assertNotEqual(again.session_token, first.session_token)
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8"))["token"], again.session_token)
+        self.assertFalse(session_path.exists())
+
+    def test_open_reuses_busy_local_port_and_stop_reads_session_file(self):
+        data = self.store.data
+        with make_server(data, 0) as running:
+            thread = threading.Thread(target=running.serve_forever)
+            thread.start()
+            try:
+                with self.assertRaises(OSError):
+                    with make_server(self.root / "other", running.server_port):
+                        self.fail("A second server bound the same address and port")
+                argv = ["server.py", "--data-dir", str(data), "--port", str(running.server_port), "--open"]
+                with patch.object(sys, "argv", argv), patch.object(server.webbrowser, "open") as launch:
+                    server.main()
+                launch.assert_called_once_with(f"http://127.0.0.1:{running.server_port}/?token={running.session_token}")
+                stopped = subprocess.run([sys.executable, "-X", "utf8", "server.py", "--data-dir", str(data), "--stop"],
+                                         cwd=Path(__file__).resolve().parent, capture_output=True, timeout=10)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr.decode("utf-8"))
+                self.assertIn(b"Experiment Data Catalog is stopping", stopped.stdout)
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            finally:
+                if thread.is_alive():
+                    running.shutdown()
+                thread.join()
+        self.assertFalse((data / server.SESSION_FILE).exists())
+        with make_server(data, running.server_port) as restarted:
+            self.assertNotEqual(running.session_token, restarted.session_token)
+
+    def test_open_starts_with_actual_port_and_session_token(self):
+        data = self.store.data
+        path = data / server.SESSION_FILE
+
+        def verify_launch(url):
+            session = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotEqual(session["port"], 0)
+            self.assertEqual(url, f"http://127.0.0.1:{session['port']}/?token={session['token']}")
+
+        argv = ["server.py", "--data-dir", str(data), "--port", "0", "--open"]
+        with patch.object(sys, "argv", argv), patch.object(server.LocalHTTPServer, "serve_forever"), \
+                patch.object(server.webbrowser, "open", side_effect=verify_launch) as launch:
+            server.main()
+        self.assertEqual(launch.call_count, 1)
+        self.assertFalse(path.exists())
 
     def test_zip_backup_stores_compressed_attachments_without_recompressing(self):
         self.add("Z-1", "raw.zip", b"PK" + b"x" * 500)
@@ -1925,7 +2060,8 @@ class DataSafetyTests(unittest.TestCase):
         def call(path, body=None, method="GET"):
             data = json.dumps(body).encode() if body is not None else None
             request = Request(address + path, data=data, method=method,
-                              headers={"Content-Type": "application/json", "X-Catalog-Local": "1", "Origin": address})
+                              headers={"Content-Type": "application/json", "X-Catalog-Local": "1", "Origin": address,
+                                       "X-Catalog-Token": server.session_token})
             try:
                 with urlopen(request, timeout=5) as response:
                     return response.status, response.read()

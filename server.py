@@ -9,7 +9,9 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -18,10 +20,11 @@ import webbrowser
 import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from http.client import HTTPConnection, HTTPException
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 STATUSES = ("待补全", "已记录", "待表征", "已完成")
@@ -61,6 +64,8 @@ COMPRESSED_SUFFIXES = {".zip", ".7z", ".rar", ".gz", ".tgz", ".bz2", ".xz", ".zs
                        ".gif", ".webp", ".heic", ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".m4a", ".docx",
                        ".xlsx", ".pptx", ".opju", ".jdx", ".brml"}
 BACKUP_MARKER = "backup-info.json"
+SESSION_FILE = ".catalog-session.json"
+APP_ID = "experiment-data-catalog"
 # Lab-specific conventions (labels, precursor aliases, phase presets, ID prefixes) live in the data folder,
 # never in the program source. See README, "Lab conventions".
 LOCAL_CATALOG = "local-catalog.json"
@@ -2231,7 +2236,12 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(60)
 
-    def send_headers(self, status, content_type, length, filename=None):
+    def log_request(self, code="-", size="-"):
+        # The launch URL contains a credential until its first redirect.
+        path = getattr(self, "path", "").partition("?")[0]
+        self.log_message('"%s %s %s" %s %s', self.command, path, self.request_version, code, size)
+
+    def send_headers(self, status, content_type, length, filename=None, *, headers=()):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
@@ -2241,16 +2251,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
         if filename:
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename))
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
 
     def send_json(self, value, status=200):
         data = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_headers(status, "application/json; charset=utf-8", len(data))
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
-    def send_file(self, path, content_type, filename=None):
+    def send_file(self, path, content_type, filename=None, *, status=200):
         with path.open("rb") as stream:
-            self.send_headers(200, content_type, os.fstat(stream.fileno()).st_size, filename)
+            self.send_headers(status, content_type, os.fstat(stream.fileno()).st_size, filename)
             shutil.copyfileobj(stream, self.wfile)
 
     def body_length(self, maximum):
@@ -2284,22 +2297,57 @@ class Handler(BaseHTTPRequestHandler):
                                      and experiment_key(project, row["experiment_no"]) == key and not row["archived"] and not is_dataset(row)]
         return self.send_json(result, 200 if record_id else 201)
 
+    def valid_token(self, value):
+        return bool(value and value.isascii() and secrets.compare_digest(value, self.server.session_token))
+
+    def valid_cookie(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        session = cookie.get("catalog_session")
+        return self.valid_token(session.value) if session else False
+
+    def root_page(self, query):
+        params = parse_qsl(query, keep_blank_values=True)
+        if any(name == "token" and self.valid_token(value) for name, value in params):
+            remaining = urlencode([(name, value) for name, value in params if name != "token"])
+            location = "/?" + remaining if remaining else "/"
+            cookie = f"catalog_session={self.server.session_token}; HttpOnly; SameSite=Strict; Path=/"
+            return self.send_headers(303, "text/html; charset=utf-8", 0, headers=(("Location", location), ("Set-Cookie", cookie)))
+        authorized = self.valid_cookie()
+        return self.send_file(ROOT / "web" / ("index.html" if authorized else "locked.html"),
+                              "text/html; charset=utf-8", status=200 if authorized else 401)
+
     def dispatch(self):
         allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
         if self.headers.get("Host") not in allowed_hosts:
             raise Problem("仅接受本机地址访问。", 403)
+        url = urlsplit(self.path)
+        path = unquote(url.path)
+        store = self.server.store
+        if path.startswith("/api/"):
+            authorized = self.valid_token(self.headers.get("X-Catalog-Token")) or self.valid_cookie()
+            if self.command == "GET" and path == "/api/health":
+                health = {"app": APP_ID, "version": 1}
+                if authorized:
+                    health["workspace"] = str(store.data.resolve())
+                return self.send_json(health)
+            if not authorized:
+                return self.send_json({"error": "会话已失效，请从启动入口重新打开实验数据目录。"}, 401)
         if self.command != "GET":
             if self.headers.get("Origin") not in {"http://" + host for host in allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
                 raise Problem("请从本机实验数据目录页面操作。", 403)
-        url = urlsplit(self.path)
-        path, query = unquote(url.path), parse_qs(url.query)
-        store = self.server.store
+        query = parse_qs(url.query)
         if self.command == "GET":
-            static = {"/": ("index.html", "text/html; charset=utf-8"),
-                      "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            if path == "/":
+                return self.root_page(url.query)
+            static = {"/app.js": ("app.js", "text/javascript; charset=utf-8"),
                       "/i18n.js": ("i18n.js", "text/javascript; charset=utf-8"),
                       "/newapi-theme.css": ("newapi-theme.css", "text/css; charset=utf-8"),
-                      "/style.css": ("style.css", "text/css; charset=utf-8")}
+                      "/style.css": ("style.css", "text/css; charset=utf-8"),
+                      "/locked.css": ("locked.css", "text/css; charset=utf-8")}
             if path in static:
                 name, mime = static[path]
                 return self.send_file(ROOT / "web" / name, mime)
@@ -2315,8 +2363,6 @@ class Handler(BaseHTTPRequestHandler):
                         for name in FILES:
                             archive.write(ROOT / name, PACKAGE_NAME + "/" + name)
                     return self.send_file(archive_path, "application/zip", PACKAGE_NAME + "-source.zip")
-            if path == "/api/health":
-                return self.send_json({"app": "experiment-data-catalog", "version": 1, "workspace": str(store.data.resolve())})
             if path == "/api/experiments":
                 with store.lock, store.connect() as db:
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
@@ -2476,13 +2522,20 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send_json({"error": "操作未完成，请检查磁盘空间及服务日志；页面内容尚未清空。"}, 500)
 
-    do_GET = handle_request
-    do_POST = handle_request
-    do_PUT = handle_request
-    do_DELETE = handle_request
+    do_GET = do_POST = do_PUT = do_DELETE = handle_request
+    do_HEAD = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = handle_request
 
 
-def make_server(data_dir, port=8765, *, server_type=ThreadingHTTPServer):
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def make_server(data_dir, port=8765, *, server_type=LocalHTTPServer):
     # Bind first so a second launch of the same service still reaches the "already running" path in main().
     server = server_type(("127.0.0.1", port), Handler)
     try:
@@ -2490,12 +2543,25 @@ def make_server(data_dir, port=8765, *, server_type=ThreadingHTTPServer):
     except BaseException:
         server.server_close()
         raise
+    session_path = lock.path.with_name(SESSION_FILE)
+    temporary = None
     try:
         server.daemon_threads = False  # Finish in-flight writes before the process exits.
         server.store = Store(data_dir)
+        server.session_token = secrets.token_urlsafe(32)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=session_path.parent,
+                                         prefix=".part-catalog-session-", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump({"port": server.server_port, "token": server.session_token,
+                       "pid": os.getpid(), "started_at": timestamp()}, output)
+        temporary.replace(session_path)
     except BaseException:
-        lock.release()
-        server.server_close()
+        try:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        finally:
+            lock.release()
+            server.server_close()
         raise
     close = server.server_close
 
@@ -2503,10 +2569,47 @@ def make_server(data_dir, port=8765, *, server_type=ThreadingHTTPServer):
         try:
             close()
         finally:
-            lock.release()
+            if lock.handle is not None:
+                try:
+                    session_path.unlink(missing_ok=True)
+                finally:
+                    lock.release()
 
     server.server_close = server_close
     return server
+
+
+def launch_url(port, token, **params):
+    return f"http://127.0.0.1:{port}/?" + urlencode({**params, "token": token})
+
+
+def running_session(data_dir, *, stop=False):
+    session = json.loads((data_dir / SESSION_FILE).read_text(encoding="utf-8"))
+    if not isinstance(session, dict):
+        raise ValueError("Invalid local session file.")
+    port, token = session.get("port"), session.get("token")
+    if type(port) is not int or not 1 <= port <= 65535 or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise ValueError("Invalid local session file.")
+    # Talk directly to loopback so the credential stays off proxies and redirects.
+    headers = {"X-Catalog-Token": token}
+    client = HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        client.request("GET", "/api/health", headers=headers)
+        with client.getresponse() as response:
+            health = json.load(response)
+            if (response.status != 200 or not isinstance(health, dict) or health.get("app") != APP_ID or
+                    health.get("workspace") != str(data_dir.resolve())):
+                raise ValueError("This port belongs to another workspace.")
+        if stop:
+            headers.update({"Origin": f"http://127.0.0.1:{port}", "X-Catalog-Local": "1"})
+            client.request("POST", "/api/shutdown", headers=headers)
+            with client.getresponse() as response:
+                stopped = json.load(response)
+                if response.status != 200 or not isinstance(stopped, dict) or not stopped.get("ok"):
+                    raise ValueError("The local server did not accept the shutdown request.")
+    finally:
+        client.close()
+    return port, token
 
 
 def main():
@@ -2516,40 +2619,31 @@ def main():
     parser.add_argument("--open", action="store_true")
     parser.add_argument("--stop", action="store_true", help="Stop this workspace's running local server")
     args = parser.parse_args()
-    address = f"http://127.0.0.1:{args.port}"
     if args.stop:
         try:
-            with urlopen(address + "/api/health", timeout=3) as response:
-                running = json.load(response)
-            if running.get("app") != "experiment-data-catalog" or running.get("workspace") != str(args.data_dir.resolve()):
-                raise ValueError("This port belongs to another workspace.")
-            request = Request(address + "/api/shutdown", data=b"", method="POST",
-                              headers={"Origin": address, "X-Catalog-Local": "1"})
-            with urlopen(request, timeout=5) as response:
-                json.load(response)
-            print("Experiment Data Catalog is stopping. Saved experiments and files are kept.")
-        except Exception as exc:
+            running_session(args.data_dir, stop=True)
+        except (OSError, ValueError, HTTPException) as exc:
             raise SystemExit(f"Could not stop this workspace: {exc}")
+        print("Experiment Data Catalog is stopping. Saved experiments and files are kept.")
         return
     try:
         server = make_server(args.data_dir, args.port)
-    except CatalogUnavailable as exc:
-        raise SystemExit(str(exc))
-    except OSError:
+    except (CatalogUnavailable, OSError) as exc:
         if args.open:
             try:
-                with urlopen(address + "/api/health", timeout=2) as response:
-                    running = json.load(response)
-                    if running.get("app") == "experiment-data-catalog" and running.get("workspace") == str(args.data_dir.resolve()):
-                        webbrowser.open(address)
-                        return
-            except Exception:
+                session = running_session(args.data_dir)
+            except (OSError, ValueError, HTTPException):
                 pass
+            else:
+                webbrowser.open(launch_url(*session))
+                return
+        if isinstance(exc, CatalogUnavailable):
+            raise SystemExit(str(exc))
         raise SystemExit(f"Port {args.port} is unavailable. Use --port with another local port.")
-    print(f"Experiment Data Catalog: {address}\nData: {server.store.data}", flush=True)
-    if args.open:
-        webbrowser.open(address)
+    print(f"Experiment Data Catalog: http://127.0.0.1:{server.server_port}\nData: {server.store.data}", flush=True)
     try:
+        if args.open:
+            webbrowser.open(launch_url(server.server_port, server.session_token))
         server.serve_forever()
     except KeyboardInterrupt:
         pass

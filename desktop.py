@@ -2,27 +2,17 @@
 import argparse
 import ctypes
 import os
-import socket
 import sys
 import threading
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from server import make_server
+from server import launch_url, make_server
 
 
 TITLE = "实验数据目录 · Experiment Data Catalog"
 PORT = 18766
-
-
-class DesktopServer(ThreadingHTTPServer):
-    allow_reuse_address = False
-
-    def server_bind(self):
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        super().server_bind()
 
 
 def guard_close(window):
@@ -59,13 +49,14 @@ def run_desktop(data_dir, profile):
     if initialize("edgechromium").renderer != "edgechromium":
         raise RuntimeError("请安装 Microsoft Edge WebView2 Runtime。Install the Microsoft Edge WebView2 Runtime.")
 
-    with make_server(data_dir, PORT, server_type=DesktopServer) as server:
+    with make_server(data_dir, PORT) as server:
         address = f"http://127.0.0.1:{server.server_port}"
         worker = threading.Thread(target=server.serve_forever, name="catalog-http", daemon=True)
         worker.start()
         try:
             print(f"WebView2: {address}\nData: {server.store.data}", flush=True)
-            window = webview.create_window(TITLE, address + "/?desktop=1", width=1280, height=850, min_size=(780, 560))
+            window = webview.create_window(TITLE, launch_url(server.server_port, server.session_token, desktop=1),
+                                          width=1280, height=850, min_size=(780, 560))
             guard_close(window)
             webview.start(gui="edgechromium", private_mode=False, storage_path=str(profile))
         finally:
