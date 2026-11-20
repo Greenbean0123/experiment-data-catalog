@@ -125,8 +125,7 @@ onboarding and imports (M3), packaging (M4).
   front end uses this id for lookups, settings matching and comparison grouping. Review items for key fields use the
   same lower-cased id in `field` (title keeps the template spelling).
 - Precursor-alias normalization on both sides: lower-case, then remove every character of the JS `\s` class
-  (`	
-`, space, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF). Validation
+  (`\t\n\v\f\r`, space, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF). Validation
   rejects two labels that normalize to the same alias.
 
 ### 5.2 Disabled built-ins are never written by indirect paths
