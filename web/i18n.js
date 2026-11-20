@@ -2,6 +2,8 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "无单位": "no unit",
+    "有别名包含换行，编辑器已把它拆成多个别名。请核对后再保存。": "Some aliases contain line breaks; the editor has split them into separate aliases. Check them before saving.",
     "每组一个显示名称，别名每行一个。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。": "One display name per group, one alias per line. Affects display, filtering and sort order (as listed) only; stored values stay unchanged.",
     "添加一组别名": "Add alias group",
     "显示名称": "Display name",
@@ -660,6 +662,8 @@ const CatalogI18n = (() => {
     if (keyMatch) return `These samples' projects have switched off ${keyMatch[1]}: ${keyMatch[2].replace(/、/g, ", ")}`;
     keyMatch = message.match(/^以下样品的单位与所填单位不同：(.+)$/);
     if (keyMatch) return `These samples use a different unit from the one entered: ${keyMatch[1].replace(/、/g, ", ")}`;
+    keyMatch = message.match(/^以下实验在新的编号前缀下会合并，但共用条件不一致：(.+)。请先统一这些实验的共用条件，再修改前缀。$/);
+    if (keyMatch) return `These experiments would merge under the new prefixes but their shared conditions differ: ${keyMatch[1].replace(/、/g, ", ")}. Make their shared conditions agree before changing the prefixes.`;
     keyMatch = message.match(/^本地约定格式不正确：(.+)$/);
     if (keyMatch) return `Invalid catalog conventions: ${keyMatch[1]}`;
     let match = message.match(/^备份磁盘空间不足：还需要约 (.+) GB，可用 (.+) GB。$/);

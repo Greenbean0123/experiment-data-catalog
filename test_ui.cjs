@@ -2450,5 +2450,51 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("cancel-project-settings").click();
     } finally { env.dom.window.close(); }
   }
+  {
+    // Milestone 2 re-review: per-record visibility everywhere in mixed views, hidden ranges, units, unreadable conventions.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const builtin = enabled => ({precursor: {enabled, label: {}}, temperature: {enabled, label: {}}, duration: {enabled: true, label: {}}, materials: {enabled: true, label: {}}});
+    let settings = {default: {revision: 1, settings: {builtin: builtin(false), key_fields: [], phase_presets: []}, fields: []},
+      "other-lab": {revision: 1, settings: {builtin: builtin(true), key_fields: [], phase_presets: []}, fields: []}};
+    const env = await boot({savedLanguage: "en", extraProjects: [{id: "other-lab", name: "Other lab"}],
+      extraRows: [sample("HIDDEN", {temperature: 250, precursor: "SecretPrecursor"}), sample("SHOWN", {project_id: "other-lab", project_name: "Other lab", temperature: 250})],
+      readHandler: catalog => reply(200, {...catalog, project_settings: settings}),
+      settingsHandler: url => reply(200, {catalog: {notebook_prefixes: [], precursor_aliases: [{label: "Compound", aliases: ["Foo\nBar"]}], translations: {}}, revision: "r1",
+        ...(url.includes("local-catalog") && env.broken ? {error: "local-catalog.json 无法解析，请先修复文件或删除后再编辑。"} : {})})});
+    try {
+      const {$, w} = env;
+      const choose = value => { $("project-select").value = value; $("project-select").dispatchEvent(new w.Event("change", {bubbles: true})); };
+      choose("");
+      // Drill-down from the 250 °C bucket lists only records whose project uses temperature.
+      $("dashboard-overview-tab").click();
+      $("dashboard-condition-field").value = "temperature"; $("dashboard-condition-field").dispatchEvent(new w.Event("change", {bubbles: true}));
+      [...$("dashboard-condition-rows").querySelectorAll("[data-condition-value]")].find(button => button.dataset.conditionValue === "250").click();
+      assert.ok(w.document.querySelector('[data-expand="experiment:other-lab:shown"]'));
+      assert.equal(w.document.querySelector('[data-expand="experiment:default:hidden"]'), null, "A disabled field's bucket never includes that project's records");
+      $("clear-chart-filter").click();
+      // Filter options and text search skip values of fields switched off in the record's project.
+      $("dashboard-records-tab").click();
+      assert.equal([...$("filter-precursor").options].some(option => option.value === "SecretPrecursor"), false);
+      $("search").value = "SecretPrecursor"; $("search").dispatchEvent(new w.Event("input", {bubbles: true}));
+      assert.equal(w.document.querySelector('[data-expand="experiment:default:hidden"]'), null, "Text search ignores switched-off fields");
+      $("clear-filters").click();
+      // A reversed range entered while temperature was visible does not empty the list once it is hidden everywhere.
+      $("temp-min").value = "300"; $("temp-max").value = "100"; $("temp-min").dispatchEvent(new w.Event("input", {bubbles: true}));
+      settings = {...settings, "other-lab": {...settings["other-lab"], settings: {...settings["other-lab"].settings, builtin: builtin(false)}}};
+      w.dispatchEvent(new w.Event("focus")); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("temp-min").closest("fieldset").hidden, true);
+      assert.ok(w.document.querySelector('[data-expand="experiment:default:hidden"]'), "A hidden range no longer filters");
+      assert.equal($("filter-error").hidden, true);
+      // Conventions: an alias with a line break is split visibly; an unreadable file blocks saving.
+      $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.match($("conventions-error").textContent, /contain line breaks/);
+      $("close-conventions").click();
+      env.broken = true;
+      $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.match($("conventions-error").textContent, /cannot be read/);
+      assert.equal($("save-conventions").disabled, true, "An unreadable file cannot be replaced from the editor");
+      $("close-conventions").click();
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

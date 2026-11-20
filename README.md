@@ -145,7 +145,9 @@ Use **×** beside a solvent / ligand to remove it from saved choices. For temper
 - **前驱体别名**：每行 `显示名称 = 别名 1, 别名 2`，只影响显示、筛选和排序（按列出的顺序），保存的原值不变。
 - **英文标签与备注译法（高级）**：JSON，包含 `en`、`categories`、`datasetTitles`、`noteLines` 和 `noteRules`（JavaScript 正则表达式，保存前检查）。
 
-也可以直接编辑 `local-catalog.json`（停止程序后修改，重新启动生效）。旧版文件中的 `phase_presets` 仍会读取，作为没有项目设置时的物相预设。
+如果新增前缀会把两个共用条件不同的实验合并成一个，保存会被拒绝并列出这些实验，请先统一它们的共用条件。英文标签只为本实验库的术语添加译法，不能替换程序自带的文字。
+
+也可以直接编辑 `local-catalog.json`，但请先停止程序再修改：运行中的程序会读取文件的变化，但与界面同时保存时，手工修改可能被覆盖。文件格式有误时，界面会提示并暂停在此编辑，直到修复文件。旧版文件中的 `phase_presets` 仍会读取，作为没有项目设置时的物相预设。
 
 **Catalog conventions** (sidebar) edit `data/local-catalog.json`: ID prefixes whose notebook 1 equals I, precursor aliases, and English labels and note rules. Changes apply immediately and travel with backups.
 

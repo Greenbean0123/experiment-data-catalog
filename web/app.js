@@ -315,6 +315,7 @@ function filterRecords(records, filters) {
         const missing = missingConditions([record]);
         if (filters.condition.value ? !missing.includes(filters.condition.value) : !missing.length) return false;
       } else {
+        if (BUILTIN_OF[filters.condition.field] && !builtinEnabled(record.project_id, filters.condition.field)) return false;
         const members = conditionMembers(record, filters.condition.field);
         if (!(members.length ? members : [""]).includes(filters.condition.value)) return false;
       }
@@ -359,9 +360,10 @@ function filterRecords(records, filters) {
         storedFields(record, "result").some(field => field.value !== undefined))) return false;
     if (filters.resultConfirmation && filters.resultConfirmation !== "unrecorded" && result.confirmation !== filters.resultConfirmation) return false;
     if (filters.outcome && (record.lab_data?.outcome || "") !== filters.outcome) return false;
-    const text = [record.sample_id, record.experiment_no, canonicalExperimentNo(record.experiment_no, record.project_id), ...conditionMembers(record, "precursor"), record.series, record.project_name, I18n.recordLabel(record, "project_name", filters.language), I18n.recordLabel(record, "sample_id", filters.language),
-      I18n.recordLabel(record, "series", filters.language), record.experiment_date, record.precursor,
-      materialSummary(record), record.notes, I18n.recordLabel(record, "notes", filters.language), record.status, I18n.translate(record.status, filters.language),
+    const uses = field => builtinEnabled(record.project_id, field);
+    const text = [record.sample_id, record.experiment_no, canonicalExperimentNo(record.experiment_no, record.project_id), ...(uses("precursor") ? conditionMembers(record, "precursor") : []), record.series, record.project_name, I18n.recordLabel(record, "project_name", filters.language), I18n.recordLabel(record, "sample_id", filters.language),
+      I18n.recordLabel(record, "series", filters.language), record.experiment_date, uses("precursor") ? record.precursor : "",
+      uses("materials") ? materialSummary(record) : "", record.notes, I18n.recordLabel(record, "notes", filters.language), record.status, I18n.translate(record.status, filters.language),
       ...result.phases, ...result.morphologies, result.conclusion, resultConfirmation(record, filters.language),
       ...record.extra_conditions.flatMap(condition => [condition.name, condition.value, condition.unit]),
       record.lab_data?.treatment, OUTCOME_LABELS[record.lab_data?.outcome] ? I18n.translate(OUTCOME_LABELS[record.lab_data.outcome], filters.language) : "",
@@ -471,7 +473,7 @@ function initialize() {
   let trashCount = 0, trashItems = [], trashTotal = 0, trashBusy = false, trashSelected = new Set(), trashRenaming = "";
   let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false, categoryCounts = null;
   let trashLoadVersion = 0, trashScope = null, trashDrafts = new Map();
-  let keyFilterSignature = "", keyFilterState = new Map(), bulkActive = [];
+  let keyFilterSignature = "", keyFilterState = new Map(), bulkActive = [], bulkKeyInfos = new Map();
   let listScrolledTo = "";
   try { $("experiment-order").value = localStorage.getItem("catalog-experiment-order") === "desc" ? "desc" : "asc"; } catch {}
   try { projectId = localStorage.getItem("catalog-project") ?? "default"; } catch {}
@@ -588,11 +590,13 @@ function initialize() {
     }).join("");
   }
 
+  const visibleFilterValue = (id, field) => builtinEnabled(projectId, field) ? $(id).value : "";
   function filters() {
     return {archived, language, project: projectId, condition: chartCondition, query: $("search").value, status: $("filter-status").value, kind: $("filter-kind").value,
-      precursor: $("filter-precursor").value, solvent: $("filter-solvent").value,
+      precursor: visibleFilterValue("filter-precursor", "precursor"), solvent: visibleFilterValue("filter-solvent", "materials"),
       phase: $("filter-phase").value, morphology: $("filter-morphology").value, resultConfirmation: $("filter-result-confirmation").value, outcome: $("filter-outcome").value,
-      tempMin: $("temp-min").value, tempMax: $("temp-max").value, timeMin: $("time-min").value, timeMax: $("time-max").value,
+      tempMin: visibleFilterValue("temp-min", "temperature"), tempMax: visibleFilterValue("temp-max", "temperature"),
+      timeMin: visibleFilterValue("time-min", "duration"), timeMax: visibleFilterValue("time-max", "duration"),
       keyFilters: projectId ? keyFieldsOf(projectId).map(info => ({info, min: "", max: "", value: "", text: "", ...keyFilterState.get(keyFieldId(info))}))
         .filter(filter => filter.min !== "" || filter.max !== "" || filter.value || filter.text) : []};
   }
@@ -1104,7 +1108,7 @@ function initialize() {
     const series = editorSeriesValue();
     const scoped = records.filter(record => !projectId || (record.project_id || "default") === projectId);
     for (const [field, label] of [["series", ""], ["precursor", "全部前驱体"], ["solvent", "全部溶剂 / 配体"]]) {
-      const values = [...new Set(scoped.flatMap(record => field === "series" ? [record.series] : conditionMembers(record, field)).filter(Boolean))].sort((a, b) => compareConditionValues(a, b, language === "en" ? "en" : "zh-CN"));
+      const values = [...new Set(scoped.flatMap(record => field === "series" ? [record.series] : builtinEnabled(record.project_id, field) ? conditionMembers(record, field) : []).filter(Boolean))].sort((a, b) => compareConditionValues(a, b, language === "en" ? "en" : "zh-CN"));
       const options = values.map(value => `<option value="${escape(value)}">${escape(field === "series" ? recordLabel({series: value}, "series") : value)}</option>`).join("");
       if (field === "series") $("series-options").innerHTML = values.map(value => `<option value="${escape(recordLabel({series: value}, "series"))}" data-value="${escape(value)}"></option>`).join("");
       else if (field === "solvent") renderSolventChoices();
@@ -2077,8 +2081,8 @@ function initialize() {
     $("confirm-bulk").disabled = bulkBusy || !bulkPlan || !bulkPreview?.updated;
   }
 
-  function bulkValue(field, value, unit = "") {
-    if (unit && typeof value === "number") return `${value} ${unit}`;
+  function bulkValue(field, value, unit) {
+    if (typeof unit === "string" && typeof value === "number") return unit ? `${value} ${unit}` : `${value} (${t("无单位")})`;
     if (field === "confirmation") return t(({pending: "待确认", confirmed: "已确认"})[value] || "尚未记录结果");
     if (field === "status") return t(value);
     return Array.isArray(value) ? value.join(" / ") || "—" : value === null || value === "" ? "—" : String(value);
@@ -2191,6 +2195,7 @@ function initialize() {
       if (!Object.keys(changes).length) throw new Error("请至少选择一个可批量修改的字段。");
       bulkBusy = true; syncBulkControls();
       const plan = {records: bulkTargets, changes, preview: true};
+      bulkKeyInfos = new Map(bulkActive.filter(item => item.key).map(item => [keyFieldId(item.key), item.key]));
       const preview = await api("api/experiments/bulk", {method: "POST", body: JSON.stringify(plan)});
       bulkPlan = plan; bulkPreview = preview;
       renderBulkReview(); showBulkStep(true);
@@ -2212,7 +2217,7 @@ function initialize() {
           const confirmed = bulkPreview.rows.every(row => {
             const record = latest.experiments.find(record => record.id === row.id);
             return record && record.revision === row.revision + (row.changes.length ? 1 : 0) && row.changes.every(change => {
-              const keyInfo = String(change.field).startsWith("key:") ? findKeyField(record.project_id, String(change.field).toLowerCase()) : null;
+              const keyInfo = String(change.field).startsWith("key:") ? bulkKeyInfos.get(String(change.field).toLowerCase()) || findKeyField(record.project_id, String(change.field).toLowerCase()) : null;
               const keyResult = keyInfo ? keyFieldValue(record, keyInfo) : null;
               const value = keyInfo ? (keyResult.present ? keyResult.value : null) : change.field === "solvents" ? materialSummary(record) : Object.hasOwn(resultSummary(record), change.field) ? resultSummary(record)[change.field] : record[change.field];
               return JSON.stringify(value) === JSON.stringify(change.after);
@@ -2855,7 +2860,7 @@ function initialize() {
     }).join("")}</tbody></table>`;
     const configured = Array.isArray(settings.key_fields) ? settings.key_fields : [];
     const fields = settingsTemplateFields(settingsProject);
-    const same = (a, b) => a.section === b.section && String(a.label).toLocaleLowerCase() === String(b.label).toLocaleLowerCase();
+    const same = (a, b) => a.section === b.section && String(a.label).toLowerCase() === String(b.label).toLowerCase();
     const stale = configured.filter(entry => !fields.some(field => same(field, entry)));
     $("settings-key-fields").innerHTML = (fields.length ? `<table class="workflow-table settings-table"><thead><tr><th>${t("关键字段")}</th><th>${t("模板字段")}</th><th>${t("区域")}</th><th>${t("缺少时提示")}</th></tr></thead><tbody>${fields.map((field, index) => {
       const entry = configured.find(item => same(item, field));
@@ -2995,17 +3000,27 @@ function initialize() {
     }
     return {notebook_prefixes: prefixes, precursor_aliases, translations};
   }
+  let conventionsBlocked = false;
   function fillConventions(result) {
     const catalog = result?.catalog || {};
+    conventionsBlocked = Boolean(result?.error);
+    if (conventionsBlocked) showError("conventions-error", result.error);
     conventionsRevision = typeof result?.revision === "string" ? result.revision : "";
     $("conventions-prefixes").value = (catalog.notebook_prefixes || []).join(", ");
-    renderAliasRows(Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : []);
+    const aliasEntries = Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : [];
+    renderAliasRows(aliasEntries);
+    if (!conventionsBlocked && aliasEntries.some(entry => (entry.aliases || []).some(alias => /[\r\n]/.test(alias)))) {
+      showError("conventions-error", "有别名包含换行，编辑器已把它拆成多个别名。请核对后再保存。");
+    }
     const translations = catalog.translations || {};
     $("conventions-translations").value = Object.keys(translations).some(key => Object.keys(translations[key] || {}).length) ? JSON.stringify(translations, null, 2) : "";
     conventionsDirty = false;
   }
   function syncConventionsControls() {
     for (const control of $("conventions-dialog").querySelectorAll("button,input,textarea")) control.disabled = conventionsBusy;
+    if (!conventionsBusy && conventionsBlocked) {
+      for (const control of $("conventions-dialog").querySelectorAll("input,textarea,#save-conventions,#add-alias-row,[data-remove-alias]")) control.disabled = true;
+    }
   }
   async function openConventions() {
     $("conventions-error").hidden = true;
@@ -3035,7 +3050,7 @@ function initialize() {
   });
   for (const type of ["input", "change"]) $("conventions-dialog").addEventListener(type, () => { conventionsDirty = true; });
   $("save-conventions").addEventListener("click", async () => {
-    if (conventionsBusy) return;
+    if (conventionsBusy || conventionsBlocked) return;
     let catalog;
     try { catalog = parseConventions(); } catch (error) { return showError("conventions-error", error.message); }
     $("conventions-error").hidden = true;
