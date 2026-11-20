@@ -1863,18 +1863,21 @@ class HTTPTests(unittest.TestCase):
                           "lab_data": {"values": {"1": 0, "2": 4, "3": "ordinary"}}})
         other_thickness = {**thickness, "label": "thICKness", "unit": "Å"}
         other = dict(section="condition", label="Comment", type="text")
-        store.save_template(dict(project_id=second, name="Coating", revision=0, fields=[other, other_thickness]))
+        store.save_template(dict(project_id=second, name="Coating", revision=0, fields=[other, {**other_thickness, "unit": ""}]))
+        old_coat = store.save({"project_id": second, "sample_id": "Legacy coating", "lab_data": {"values": {"1": 12}}})
+        store.save_template(dict(project_id=second, name="Coating", revision=1, fields=[other, other_thickness]))
         coat = store.save({"project_id": second, "sample_id": "Coating", "lab_data": {"values": {"0": "+note", "1": 45}}})
         for project, fields in [(first, [thickness_um, formula, current_factor, tags]), (second, [other_thickness, other])]:
             keys = [{"section": field["section"], "label": field["label"]} for field in fields]
             store.save_project_settings(project, {"revision": 0, "settings": {"key_fields": keys}})
-        status, body, _ = self.request("/api/export.csv?" + urlencode({"ids": ",".join([old, new, coat]), "lang": "en"}))
+        status, body, _ = self.request("/api/export.csv?" + urlencode({"ids": ",".join([old, new, old_coat, coat]), "lang": "en"}))
         self.assertEqual(status, 200)
         headers, *rows = csv.reader(io.StringIO(body.decode("utf-8-sig")))
-        self.assertEqual(headers[21:], ["Thickness (µm)", "'=Formula", "Factor", "Tags", "Comment"])
+        self.assertEqual(headers[21:], ["Thickness (µm)", "'=Formula", "Factor ()", "Tags", "Comment"])
         self.assertEqual({row[0]: row[21:] for row in rows}, {
             "Old film": ["8.25 nm", "'=2+2", "", "'@A / B", ""],
             "New film": ["0", "ordinary", "4", "", ""],
+            "Legacy coating": ["12 ", "", "", "", ""],
             "Coating": ["45 Å", "", "", "", "'+note"],
         })
         _, body, _ = self.request(f"/api/export.csv?ids={coat}&lang=en")

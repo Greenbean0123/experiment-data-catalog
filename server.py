@@ -2698,7 +2698,7 @@ def export_csv(records, language="zh", *, include_template=False, project_settin
 
     for info in key_columns.values():
         label, unit = info["label"], info["unit"]
-        headings.append(cell(f"{label} ({unit})" if unit else label))
+        headings.append(cell(f"{label} ({unit})" if info["type"] == "number" else label))
     writer.writerow(headings)
     for record in records:
         result = {**EMPTY_RESULT, **record.get("result_summary", {})}
@@ -2717,7 +2717,7 @@ def export_csv(records, language="zh", *, include_template=False, project_settin
             if isinstance(value, list):
                 value = " / ".join(value)
             elif value is not None and field["type"] == "number" and (field["unit"] != info["unit"] or field["unit"] != column["unit"]):
-                value = f"{value} {field['unit']}".rstrip()
+                value = f"{value} {field['unit']}"
             row.append(cell(value))
         writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
