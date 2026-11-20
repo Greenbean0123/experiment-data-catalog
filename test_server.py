@@ -10,7 +10,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -366,7 +366,9 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         row = next(row for row in self.store.list() if row["id"] == child)
         self.store.save({**row, "result_summary": {"evidence_ids": [file_id], "conclusion": "test result"}}, child)
         output = self.store.data / "share.zip"
-        self.store.share_experiments([child, second], [2, 1], output, "en")
+        revisions = {row["id"]: row["revision"] for row in self.store.list()}
+        current = [revisions[child], revisions[second]]
+        self.store.share_experiments([child, second], current, output, "en")
         with zipfile.ZipFile(output) as zip_file:
             manifest = json.loads(zip_file.read("manifest.json"))
             self.assertEqual({row["id"] for row in manifest["samples"]}, {child, second})
@@ -390,11 +392,11 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
             self.store.share_experiments([child, second], [1, 1], output, "en")
         self.assertEqual(stale.exception.status, 409)
         with self.assertRaises(Problem) as incomplete:
-            self.store.share_experiments([child], [2], output, "en")
+            self.store.share_experiments([child], [revisions[child]], output, "en")
         self.assertEqual(incomplete.exception.status, 409)
         self.store.file(file_id)[0].write_bytes(b"99,99\n")
         with self.assertRaises(Problem) as corrupt:
-            self.store.share_experiments([child, second], [2, 1], output, "en")
+            self.store.share_experiments([child, second], current, output, "en")
         self.assertIn("scan.csv", str(corrupt.exception))
 
     def test_history_single_and_batch_undo_conflict_and_partial_undo(self):
@@ -617,7 +619,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         file_id = self.store.add_file(record_id, "pattern.csv", "XRD", io.BytesIO(b"1,2\n"), 4)
         result = {"phases": [" Phase-A2 ", "Phase-A", "Phase-A2"], "morphologies": ["particles"],
                   "confirmation": "confirmed", "conclusion": " =SUM(A1)\nUnsuccessful target phase ", "evidence_ids": [file_id, file_id]}
-        self.store.save({**row, "result_summary": result}, record_id)
+        self.store.save({**self.store.list()[0], "result_summary": result}, record_id)
         saved = self.store.list()[0]
         expected = {**result, "phases": ["Phase-A2", "Phase-A"], "conclusion": result["conclusion"].strip(), "evidence_ids": [file_id]}
         self.assertEqual(saved["result_summary"], expected)
@@ -674,6 +676,55 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertEqual(saved["result_summary"]["conclusion"], "No particles formed", "Negative outcomes can be recorded without guessing a phase")
         self.store.save({**saved, "result_summary": {}}, first)
         self.assertEqual(next(record for record in self.store.list() if record["id"] == first)["result_summary"]["confirmation"], "")
+
+    def test_evidence_survives_move_and_unrelated_save_and_undo(self):
+        owner = self.store.save({"sample_id": "Evidence owner"})
+        target = self.store.save({"sample_id": "Evidence destination"})
+        file_id = self.store.add_file(owner, "evidence.csv", "XRD", io.BytesIO(b"1,2"), 3)
+        row = next(row for row in self.store.list() if row["id"] == owner)
+        result = {"conclusion": "Measured", "evidence_ids": [file_id]}
+        self.store.save({**row, "result_summary": result}, owner)
+        row = next(row for row in self.store.list() if row["id"] == owner)
+        self.store.save({**row, "notes": "Undo this edit"}, owner)
+        batch_id = self.store.history(record_id=owner)["batches"][0]["id"]
+        row = next(row for row in self.store.list() if row["id"] == owner)
+        target_row = next(row for row in self.store.list() if row["id"] == target)
+        moved = self.store.change_file(file_id, "update", {"record_revision": row["revision"],
+                                      "target_record_id": target, "target_revision": target_row["revision"]})
+        row, target_row = moved["records"]
+        self.assertEqual(row["result_summary"]["evidence_ids"], [])
+        with self.assertRaises(Problem):
+            self.store.save({**row, "result_summary": {**result, "evidence_ids": ["unknown"]}}, owner)
+        self.store.save({**row, "result_summary": result, "temperature": 10}, owner)
+        row = next(row for row in self.store.list() if row["id"] == owner)
+        self.store.save({**row, "temperature": 20}, owner)  # The browser submits the filtered result.
+        preview = self.store.undo_history(batch_id, {"preview": True})
+        undone = self.store.undo_history(batch_id, {"preview": False, "revisions": preview["revisions"]})["records"][0]
+        self.assertEqual((undone["notes"], undone["temperature"], undone["result_summary"]["evidence_ids"]), ("", 20, []))
+        returned = self.store.change_file(file_id, "update", {"record_revision": target_row["revision"],
+                                          "target_record_id": owner, "target_revision": undone["revision"]})["records"][1]
+        self.assertEqual(returned["result_summary"]["evidence_ids"], [file_id])
+
+    def test_undo_of_result_restores_a_purged_evidence_id(self):
+        record_id = self.store.save({"sample_id": "Purged result"})
+        file_id = self.store.add_file(record_id, "evidence.csv", "XRD", io.BytesIO(b"1,2"), 3)
+        row = self.store.list()[0]
+        result = {"conclusion": "Measured", "evidence_ids": [file_id]}
+        self.store.save({**row, "result_summary": result}, record_id)
+        row = self.store.list()[0]
+        self.store.save({**row, "result_summary": {}}, record_id)
+        batch_id = self.store.history()["batches"][0]["id"]
+        row = self.store.list()[0]
+        self.store.change_file(file_id, "delete", {"record_revision": row["revision"]})
+        self.store.purge_trash({"file_ids": [file_id], "confirm": "purge"})
+        preview = self.store.undo_history(batch_id, {"preview": True})
+        undone = self.store.undo_history(batch_id, {"preview": False, "revisions": preview["revisions"]})["records"][0]
+        self.assertEqual((undone["result_summary"]["conclusion"], undone["result_summary"]["evidence_ids"]), ("Measured", []))
+        with self.store.connect() as db:
+            stored = json.loads(db.execute("SELECT result_summary FROM experiments WHERE id=?", (record_id,)).fetchone()[0])
+        self.assertEqual(stored["evidence_ids"], [file_id])
+        self.store.save({**undone, "result_summary": result, "notes": "Saved after purge"}, record_id)
+        self.assertEqual(self.store.list()[0]["notes"], "Saved after purge")
 
     def test_multiple_solvents_roundtrip_legacy_options_and_backup(self):
         legacy = self.store.save({"sample_id": "legacy mixture", "solvent": "ODE + octadecane"})
@@ -838,8 +889,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertEqual(payload["experiment_no"], "XY-III-352")
         data = b"spectrum"
         file_id = self.store.add_file(record_id, "spectrum.txt", "NMR", io.BytesIO(data), len(data))
-        payload["experiment_no"] = "Separate redo"
-        self.store.save(payload, record_id)
+        self.store.save({**self.store.list()[0], "experiment_no": "Separate redo"}, record_id)
         row = Store(self.store.data).list()[0]
         self.assertEqual(row["experiment_no"], "Separate redo")
         self.assertEqual(row["sample_id"], "XY-III-352-01")
@@ -895,6 +945,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         row = next(r for r in self.store.list() if r["id"] == second)
         self.assertEqual(row["project_id"], project["id"], "Older clients must preserve project membership")
         file_id = self.store.add_file(second, "data.csv", "XRD", io.BytesIO(b"data"), 4)
+        row = next(r for r in self.store.list() if r["id"] == second)
         self.store.save({**row, "project_id": "default"}, second)
         moved = next(r for r in self.store.list() if r["id"] == second)
         self.assertEqual(moved["project_id"], "default")
@@ -1008,8 +1059,9 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertNotIn("XPS", self.store.catalog()["kinds"])
         project = self.store.add_catalog_item("projects", {"name": "Second"})["project"]
         ids = [self.store.save({"sample_id": "A"}), self.store.save({"sample_id": "A", "project_id": project["id"]})]
-        self.store.archive(ids[1], {"archived": True, "revision": 1})
         files = [self.store.add_file(record, "pattern.csv", "XRD", io.BytesIO(b"1,2\n"), 4) for record in ids]
+        attached = next(row for row in self.store.list() if row["id"] == ids[1])
+        self.store.archive(ids[1], {"archived": True, "revision": attached["revision"]})
         before = {row["id"]: row for row in self.store.list()}
         with self.assertRaises(Problem):
             self.store.delete_category({"name": "XRD"})
@@ -1154,6 +1206,193 @@ class HTTPTests(unittest.TestCase):
         latest = json.loads(self.request(route)[1])
         self.assertEqual(latest["last_save"], group["token"] + ":" + a)
 
+    def request_json(self, path, body=None, method="GET", status=200):
+        code, data, _ = self.request(path, body, method)
+        self.assertEqual(code, status, data.decode())
+        return json.loads(data)
+
+    def test_attachment_update_checks_revisions_projects_names_and_history(self):
+        store = self.server.store
+        external_project = store.add_catalog_item("projects", {"name": "Attachment test project"})["project"]["id"]
+        owner = store.save({"sample_id": "Attachment owner"})
+        target = store.save({"sample_id": "Attachment target"})
+        external = store.save({"sample_id": "Attachment external", "project_id": external_project})
+        file_id = store.add_file(owner, "scan.csv", "XRD", io.BytesIO(b"1,2"), 3)
+        store.add_file(owner, "taken.csv", "XRD", io.BytesIO(b"3,4"), 3)
+        store.add_file(target, "scan.csv", "XRD", io.BytesIO(b"5,6"), 3)
+        rows = {row["id"]: row for row in store.list()}
+        before = rows[owner]
+        file = next(item for item in before["files"] if item["id"] == file_id)
+        route = f"/api/files/{file_id}/update"
+        current = {"record_revision": before["revision"]}
+        move = {**current, "target_record_id": target, "target_revision": rows[target]["revision"]}
+        stale = "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"
+        cases = [
+            ({**current, "record_revision": before["revision"] - 1, "name": "other.csv"}, 409, stale),
+            ({**move, "target_revision": 0}, 409, stale),
+            ({**current, "name": "scan.csv", "kind": "XRD"}, 400, "没有需要保存的修改。"),
+            ({**current, "name": "../scan.csv"}, 400, "文件名无效，请使用不含路径的文件名。"),
+            ({**current, "kind": "invalid"}, 400, "请选择有效的数据类型。"),
+            ({**current, "name": "taken.csv"}, 409, "同类型附件 taken.csv 已存在，未覆盖。请重命名后再上传。"),
+            (move, 409, "同类型附件 scan.csv 已存在，未覆盖。请重命名后再上传。"),
+            ({**move, "target_record_id": external, "target_revision": rows[external]["revision"]},
+             400, "附件只能移到同一项目的样品。"),
+        ]
+        for payload, status, message in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(self.request_json(route, payload, "POST", status), {"error": message})
+        self.assertEqual({row["id"]: row for row in store.list()}, rows)
+        store.archive(target, {"archived": True, "revision": rows[target]["revision"]})
+        archived = "已归档的记录不能修改附件，请先恢复记录。"
+        self.assertEqual(self.request_json(route, move, "POST", 409), {"error": archived})
+        target_revision = next(row["revision"] for row in store.list() if row["id"] == target)
+        store.archive(target, {"archived": False, "revision": target_revision})
+        rows = {row["id"]: row for row in store.list()}
+        result = self.request_json(route, {**move, "target_revision": rows[target]["revision"], "name": "unique.csv", "kind": "TEM"}, "POST")
+        self.assertEqual(set(result), {"file", "records"})
+        self.assertEqual(result["file"], dict(file, name="unique.csv", kind="TEM", experiment_id=target))
+        self.assertEqual([row["id"] for row in result["records"]], [owner, target])
+        for row in result["records"]:
+            self.assertEqual(row["revision"], rows[row["id"]]["revision"] + 1)
+            self.assertGreater(row["updated_at"], rows[row["id"]]["updated_at"])
+        self.assertNotIn(file_id, {item["id"] for item in result["records"][0]["files"]})
+        self.assertIn(result["file"], result["records"][1]["files"])
+        self.assertEqual(self.request(f"/api/files/{file_id}")[1], b"1,2")
+        events = self.request_json(f"/api/history?record_id={owner}")["file_events"]
+        changes = [event for event in events if event["file_id"] == file_id]
+        self.assertEqual([event["action"] for event in changes], ["move", "recategorize", "rename", "upload"])
+        moved = changes[0]
+        self.assertEqual(set(moved), {"id", "file_id", "record_id", "action", "before", "after", "created_at", "sample_id"})
+        self.assertEqual(moved["before"], {"record_id": owner, "name": "scan.csv", "kind": "XRD"})
+        self.assertEqual(moved["after"], {"record_id": target, "name": "unique.csv", "kind": "TEM"})
+        self.assertEqual(moved["sample_id"], before["sample_id"])
+        self.assertIn(moved, self.request_json(f"/api/history?record_id={target}")["file_events"])
+        self.assertEqual(self.request_json(f"/api/history?project_id={external_project}")["file_events"], [])
+
+    def test_trash_visibility_restore_and_archived_owner(self):
+        store = self.server.store
+        record_id = store.save({"sample_id": "Trash visibility"})
+        content = b"1,2\n3,4\n"
+        file_id = store.add_file(record_id, "trace.csv", "XRD", io.BytesIO(content), len(content))
+        row = next(row for row in store.list() if row["id"] == record_id)
+        original_file = row["files"][0]
+        store.save({**row, "result_summary": {"conclusion": "Measured", "evidence_ids": [file_id]}}, record_id)
+        row = next(row for row in store.list() if row["id"] == record_id)
+        self.assertFalse(any(item["record_id"] == record_id and item["kind"] == "missing_data"
+                             for item in self.request_json("/api/reviews")["items"]))
+        base_count = self.request_json("/api/experiments")["trash_count"]
+        delete = f"/api/files/{file_id}/delete"
+        restore = f"/api/trash/{file_id}/restore"
+        stale = "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"
+        self.assertEqual(self.request_json(delete, {"record_revision": row["revision"] - 1}, "POST", 409), {"error": stale})
+        deleted = self.request_json(delete, {"record_revision": row["revision"]}, "POST")
+        self.assertEqual(set(deleted), {"records", "trash_count"})
+        self.assertEqual(deleted["trash_count"], base_count + 1)
+        trashed = deleted["records"][0]
+        self.assertEqual(trashed["revision"], row["revision"] + 1)
+        self.assertGreater(trashed["updated_at"], row["updated_at"])
+        self.assertEqual(trashed["files"], [])
+        self.assertEqual(trashed["result_summary"]["evidence_ids"], [])
+        catalog = self.request_json("/api/experiments")
+        self.assertEqual(catalog["trash_count"], base_count + 1)
+        self.assertEqual(next(row for row in catalog["experiments"] if row["id"] == record_id), trashed)
+        trash = self.request_json("/api/trash?project_id=default")
+        item = trash["items"][0]
+        self.assertEqual(item, dict(original_file, record_id=record_id, sample_id=row["sample_id"],
+                                   experiment_no=row["experiment_no"], project_id="default", record_archived=False,
+                                   deleted_at=trashed["updated_at"], name_conflict=False))
+        self.assertEqual(trash["total_bytes"], sum(entry["size"] for entry in trash["items"]))
+        self.assertEqual(self.request_json("/api/trash?project_id=unknown"), {"items": [], "total_bytes": 0})
+        self.assertEqual(self.request(f"/api/files/{file_id}")[:2], (200, content))
+        self.assertEqual(self.request_json(f"/api/files/{file_id}/preview")["points"], [[1, 2], [3, 4]])
+        csv_data = self.request(f"/api/export.csv?lang=en&ids={record_id}")[1].decode("utf-8-sig")
+        csv_row = next(csv.DictReader(io.StringIO(csv_data)))
+        self.assertEqual(json.loads(csv_row["Attachments (JSON)"]), [])
+        self.assertEqual(json.loads(csv_row["Result summary (JSON)"])["evidence_ids"], [])
+        status, data, _ = self.request(f"/api/experiments/share.zip?ids={record_id}&revisions={trashed['revision']}")
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(data)) as share:
+            shared = json.loads(share.read("manifest.json"))["samples"][0]
+            self.assertEqual(shared["files"], [])
+            self.assertEqual(shared["result_summary"]["evidence_ids"], [])
+            self.assertFalse(any(name.startswith("files/") for name in share.namelist()))
+        self.assertTrue(any(item["record_id"] == record_id and item["kind"] == "missing_data"
+                             for item in self.request_json("/api/reviews")["items"]))
+        self.assertEqual(self.request_json(restore, {"record_revision": row["revision"]}, "POST", 409), {"error": stale})
+        store.archive(record_id, {"archived": True, "revision": trashed["revision"]})
+        latest = trashed["revision"] + 1
+        locked = self.request_json(restore, {"record_revision": latest}, "POST", 409)
+        self.assertEqual(locked["error"], "已归档的记录不能修改附件，请先恢复记录。")
+        self.assertIs(self.request_json("/api/trash")["items"][0]["record_archived"], True)
+        store.archive(record_id, {"archived": False, "revision": latest})
+        with self.assertRaises(Problem) as reserved:
+            store.add_file(record_id, "trace.csv", "XRD", io.BytesIO(content), len(content))
+        self.assertEqual(reserved.exception.status, 409, "Even a trashed name remains reserved")
+        store.add_file(record_id, "occupied.csv", "XRD", io.BytesIO(content), len(content))
+        current = {"record_revision": latest + 2}
+        self.assertEqual(self.request_json(restore, {**current, "name": "occupied.csv"}, "POST", 409)["error"],
+                         "同类型附件 occupied.csv 已存在，未覆盖。请重命名后再上传。")
+        restored = self.request_json(restore, {**current, "name": "recovered.csv"}, "POST")
+        self.assertEqual(restored["trash_count"], base_count)
+        self.assertEqual(restored["file"], dict(original_file, name="recovered.csv"))
+        active = restored["records"][0]
+        self.assertEqual(active["revision"], current["record_revision"] + 1)
+        self.assertEqual(active["result_summary"]["evidence_ids"], [file_id])
+        events = self.request_json(f"/api/history?record_id={record_id}")["file_events"]
+        self.assertEqual([entry["action"] for entry in events if entry["file_id"] == file_id], ["restore", "delete", "upload"])
+        store.archive(record_id, {"archived": True, "revision": active["revision"]})
+        self.assertEqual(self.request_json(delete, {"record_revision": active["revision"] + 1}, "POST", 409), locked)
+
+    def test_purge_is_atomic_and_unlinks_after_commit(self):
+        store = self.server.store
+        owner = store.save({"sample_id": "Purge test"})
+        receipt = "e" * 32
+        active = store.add_file(owner, "active.csv", "XRD", io.BytesIO(b"1,2"), 3)
+        first = store.add_file(owner, "a.csv", "XRD", io.BytesIO(b"2,3"), 3, receipt=receipt,
+                               folder_target=("default", "Purge test", "Purge test"))["id"]
+        second = store.add_file(owner, "b.csv", "XRD", io.BytesIO(b"3,4"), 3)
+        self.assertEqual(store.folder_receipt(receipt), {"id": first, "record_id": owner})
+        row = next(row for row in store.list() if row["id"] == owner)
+        base_count = self.request_json("/api/experiments")["trash_count"]
+        for file_id in (first, second):
+            row = self.request_json(f"/api/files/{file_id}/delete", {"record_revision": row["revision"]}, "POST")["records"][0]
+        trash = self.request_json("/api/trash")
+        self.assertEqual([item["id"] for item in trash["items"][:2]], [second, first])
+        route = "/api/trash/purge"
+        payload = {"confirm": "purge", "file_ids": [first, second]}
+        self.assertEqual(self.request(route, {**payload, "confirm": "wrong"}, "POST")[0], 400)
+        mixed = self.request_json(route, {**payload, "file_ids": [first, active, second]}, "POST", 409)
+        self.assertEqual(mixed["error"], "回收站内容已变化，请刷新后再清空。")
+        self.assertEqual(self.request_json("/api/trash"), trash)
+        self.assertTrue(all((store.files / file_id).is_file() for file_id in (first, second)))
+
+        unlink = Path.unlink
+        attempted = []
+
+        def verify_committed(path, *, missing_ok=False):
+            if path.parent == store.files:
+                with store.connect() as db:
+                    self.assertIsNone(db.execute("SELECT id FROM files WHERE id=?", (path.name,)).fetchone())
+                    self.assertIsNone(db.execute("SELECT id FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone())
+                    self.assertEqual(db.execute("SELECT count(*) FROM file_events WHERE action='purge' AND record_id=?",
+                                                (owner,)).fetchone()[0], 2)
+                attempted.append(path.name)
+                if path.name == second:
+                    raise PermissionError("fixture holds this attachment open")
+            return unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, "unlink", verify_committed), self.assertLogs("server", "WARNING") as logged:
+            result = self.request_json(route, payload, "POST")
+        self.assertEqual(result, {"purged": 2, "bytes": 6, "trash_count": base_count})
+        self.assertEqual(attempted, [first, second])
+        self.assertIn(second, logged.output[0])
+        self.assertFalse((store.files / first).exists())
+        self.assertTrue((store.files / second).exists())
+        self.assertEqual(self.request(f"/api/files/{second}")[0], 404)
+        self.assertEqual(self.request(route, payload, "POST")[0], 409)
+        events = self.request_json(f"/api/history?record_id={owner}")["file_events"]
+        self.assertEqual([event["action"] for event in events if event["file_id"] == first], ["purge", "delete", "upload"])
+
     def test_experiment_zip_browser_navigation_and_stale_message(self):
         record_id = self.server.store.save({"sample_id": "ZIP-HTTP"})
         route = "/api/experiments/share.zip?" + urlencode({"ids": record_id, "revisions": "1", "lang": "en"})
@@ -1219,6 +1458,7 @@ class HTTPTests(unittest.TestCase):
         row = json.loads(body)["record"]
         self.assertEqual(row["result_summary"]["confirmation"], "pending")
         file_id = self.server.store.add_file(row["id"], "evidence.csv", "XRD", io.BytesIO(b"1,2"), 3)
+        row = next(item for item in self.server.store.list() if item["id"] == row["id"])
         payload = {**row, "result_summary": {**row["result_summary"], "confirmation": "confirmed", "evidence_ids": [file_id]}}
         path = "/api/experiments/" + row["id"]
         status, _, _ = self.request(path, payload, "PUT", origin="https://example.com")
@@ -1464,6 +1704,105 @@ class DataSafetyTests(unittest.TestCase):
         with self.assertRaises(CatalogUnavailable):
             Store(self.store.data)
         self.assertEqual(database.read_bytes(), before, "A newer catalog is left untouched")
+
+    def test_schema_one_attachment_migration_keeps_files_and_receipts(self):
+        content = b"old contents"
+        receipt = "d" * 32
+        imported = self.store.add_file("", "spectrum.csv", "XRD", io.BytesIO(content), len(content), receipt=receipt,
+                                       folder_target=("default", "Version one", "Version one"))
+        expected = self.store.list()
+        # Recreate the attachment table and version marker written by schema 1.
+        with self.store.connect() as db:
+            db.executescript("""PRAGMA foreign_keys=OFF;
+                BEGIN IMMEDIATE;
+                CREATE TABLE files_v1 (
+                    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                    name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(experiment_id, name, kind)
+                );
+                INSERT INTO files_v1 SELECT id,experiment_id,name,kind,size,sha256,source,created_at FROM files;
+                DROP TABLE files;
+                ALTER TABLE files_v1 RENAME TO files;
+                DROP TABLE file_events;
+                PRAGMA user_version=1;
+                COMMIT;
+                PRAGMA foreign_keys=ON;
+            """)
+        migrated = Store(self.store.data)
+        snapshot, = (migrated.data / "migration-backups").glob("experiments-schema1-*.sqlite3")
+        self.assertEqual(self.version(snapshot), 1)
+        copy = sqlite3.connect(snapshot)
+        try:
+            self.assertNotIn("deleted_at", {column[1] for column in copy.execute("PRAGMA table_info(files)")})
+            self.assertEqual(copy.execute("SELECT id, sha256 FROM files").fetchone(),
+                             (imported["id"], hashlib.sha256(content).hexdigest()))
+        finally:
+            copy.close()
+        self.assertEqual(self.version(migrated.db), 2)
+        self.assertEqual(migrated.list(), expected)
+        self.assertEqual(migrated.folder_receipt(receipt), imported)
+        self.assertEqual(migrated.file(imported["id"])[0].read_bytes(), content)
+        self.assertEqual(migrated.history()["file_events"], [])
+        with migrated.connect() as db:
+            self.assertIsNone(db.execute("SELECT deleted_at FROM files").fetchone()[0])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_full_backups_include_trashed_files_and_events(self):
+        content = b"irreplaceable"
+        record_id, file_id = self.add("Back up trash", "test.csv", content)
+        row = self.store.list()[0]
+        self.store.change_file(file_id, "delete", {"record_revision": row["revision"]})
+        expected = self.store.trash()
+        events = self.store.history(record_id=record_id)["file_events"]
+        destination = self.root / "backup.zip"
+        self.store.backup(destination)
+        extracted = self.root / "extracted"
+        with zipfile.ZipFile(destination) as archive:
+            archive.extractall(extracted)
+        mirror = self.root / "mirror"
+        self.store.folder_backup(mirror)
+        for copied in (extracted, mirror):
+            with self.subTest(backup=copied.name):
+                restored = Store(copied / "data")
+                self.assertEqual(restored.trash(), expected)
+                self.assertEqual(restored.history(record_id=record_id)["file_events"], events)
+                self.assertEqual(restored.file(file_id)[0].read_bytes(), content)
+                self.assertEqual(restored.list()[0]["files"], [])
+
+    def test_purge_waits_for_backup_to_copy_trashed_file(self):
+        _, file_id = self.add("Concurrent backup", "data.csv", b"1,2")
+        row = self.store.list()[0]
+        self.store.change_file(file_id, "delete", {"record_revision": row["revision"]})
+        ready, resume, purging = threading.Event(), threading.Event(), threading.Event()
+        original_write = zipfile.ZipFile.write
+        destination = self.root / "concurrent.zip"
+
+        def pause_compression(archive, *args, **kwargs):
+            ready.set()
+            if not resume.wait(5):
+                raise TimeoutError("Backup fixture did not resume")
+            return original_write(archive, *args, **kwargs)
+
+        def purge():
+            purging.set()
+            return self.store.purge_trash({"file_ids": [file_id], "confirm": "purge"})
+
+        with patch.object(zipfile.ZipFile, "write", pause_compression), ThreadPoolExecutor(max_workers=2) as workers:
+            backup = workers.submit(self.store.backup, destination)
+            try:
+                self.assertTrue(ready.wait(3))
+                purge_result = workers.submit(purge)
+                self.assertTrue(purging.wait(3))
+                with self.assertRaises(FutureTimeout):
+                    purge_result.result(timeout=0.2)
+            finally:
+                resume.set()
+            self.assertEqual(backup.result(timeout=3)["files"], 1)
+            self.assertEqual(purge_result.result(timeout=3)["purged"], 1)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertEqual(archive.read("data/files/" + file_id), b"1,2")
+        self.assertFalse((self.store.files / file_id).exists())
 
     def test_data_folder_lock_allows_one_service(self):
         from server import CatalogUnavailable

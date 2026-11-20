@@ -5,6 +5,7 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -51,7 +52,10 @@ OUTCOMES = ("", "not_measured", "measurement_failed", "no_target", "measured")
 EMPTY_SHARED_CONDITIONS = {"precursors": [], "temperature": None,
                            "materials": {"solvents": [], "material_amounts": []}}
 # Bump when the database layout changes; older programs refuse catalogs written by newer ones.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+FILE_FIELDS = ("id", "experiment_id", "name", "kind", "size", "sha256", "source", "created_at")
+STALE_RECORD = "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"
+ARCHIVED_ATTACHMENTS = "已归档的记录不能修改附件，请先恢复记录。"
 # Already-compressed formats gain nothing from DEFLATE; storing them keeps large backups fast.
 COMPRESSED_SUFFIXES = {".zip", ".7z", ".rar", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".png", ".jpg", ".jpeg",
                        ".gif", ".webp", ".heic", ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".m4a", ".docx",
@@ -116,7 +120,14 @@ class DataDirLock:
 
 
 def timestamp():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def validate_file_name(name):
+    if (not isinstance(name, str) or not name or len(name) > 240 or
+            any(ord(char) < 32 or 127 <= ord(char) <= 159 or 0xd800 <= ord(char) <= 0xdfff for char in name) or
+            any(char in name for char in '/\\') or name in (".", "..")):
+        raise Problem("文件名无效，请使用不含路径的文件名。")
 
 
 def experiment_number(sample_id):
@@ -442,6 +453,7 @@ class Store:
         self.db = self.data / "experiments.sqlite3"
         self.lock = threading.RLock()
         self.backup_guard = threading.Lock()
+        self.file_copy_lock = threading.Lock()
         self.backup_state_lock = threading.Lock()
         self.backup_progress = {"state": "idle"}
         NOTEBOOK_PREFIXES.update(self.notebook_prefixes())  # One catalog per running service.
@@ -481,7 +493,7 @@ class Store:
                     id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
                     name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
                     sha256 TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(experiment_id, name, kind)
+                    deleted_at TEXT, UNIQUE(experiment_id, name, kind)
                 );
             """)
             if "experiment_no" not in {row["name"] for row in db.execute("PRAGMA table_info(experiments)")}:
@@ -561,6 +573,13 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS history_record ON history_entries(record_id);
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if "deleted_at" not in {row["name"] for row in db.execute("PRAGMA table_info(files)")}:
+                db.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS file_events (
+                id TEXT PRIMARY KEY, file_id TEXT NOT NULL, record_id TEXT NOT NULL, action TEXT NOT NULL,
+                before TEXT, after TEXT, created_at TEXT NOT NULL
+            )""")
             if "automatic" not in {row["name"] for row in db.execute("PRAGMA table_info(review_items)")}:
                 db.execute("ALTER TABLE review_items ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1))")
             db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -648,12 +667,13 @@ class Store:
     def list(self):
         # shortcut: load the local notebook in one request; add pagination for tens of thousands of records.
         with self.connect() as db:
+            db.execute("BEGIN")
             records = [dict(row) for row in db.execute(
                 "SELECT experiments.*, projects.name AS project_name FROM experiments JOIN projects ON projects.id=project_id "
                 "ORDER BY updated_at DESC, sample_id COLLATE NOCASE")]
             attachments = {}
-            for row in db.execute("SELECT * FROM files ORDER BY created_at, name"):
-                attachments.setdefault(row["experiment_id"], []).append(dict(row))
+            for row in db.execute("SELECT * FROM files WHERE deleted_at IS NULL ORDER BY created_at, name"):
+                attachments.setdefault(row["experiment_id"], []).append({key: row[key] for key in FILE_FIELDS})
             templates = {}
             for row in db.execute("SELECT * FROM template_versions ORDER BY revision"):
                 template = {**json.loads(row["definition"]), "revision": row["revision"]}
@@ -667,8 +687,11 @@ class Store:
                 del record["precursors"]
             record["solvents"] = json.loads(record["solvents"]) if record["solvents"] is not None else ([record["solvent"]] if record["solvent"] else [])
             record["material_amounts"] = json.loads(record["material_amounts"])
-            record["result_summary"] = validate_result_summary(json.loads(record["result_summary"]))
             record["files"] = attachments.get(record["id"], [])
+            active_ids = {file["id"] for file in record["files"]}
+            result = validate_result_summary(json.loads(record["result_summary"]))
+            result["evidence_ids"] = [file_id for file_id in result["evidence_ids"] if file_id in active_ids]
+            record["result_summary"] = result
             record["archived"] = bool(record["archived"])
             details = json.loads(record.pop("lab_data"))
             if details:
@@ -877,6 +900,7 @@ class Store:
         if type(offset) is not int or not 0 <= offset <= 1000000:
             raise Problem("历史记录分页不正确。")
         with self.connect() as db:
+            db.execute("BEGIN")
             rows = db.execute("""SELECT b.*, count(e.record_id) AS count,
                 sum(CASE WHEN e.reverted_by IS NULL THEN 1 ELSE 0 END) AS remaining
                 FROM history_batches b JOIN history_entries e ON e.batch_id=b.id
@@ -884,7 +908,19 @@ class Store:
                               WHERE f.batch_id=b.id AND (?='' OR f.record_id=?) AND (?='' OR r.project_id=?))
                 GROUP BY b.id ORDER BY b.rowid DESC LIMIT 51 OFFSET ?""",
                               (record_id, record_id, project_id, project_id, offset)).fetchall()
-        return {"batches": [dict(row) for row in rows[:50]], "has_more": len(rows) > 50}
+            events = []
+            for row in db.execute("""SELECT e.*, r.sample_id FROM file_events e JOIN experiments r ON r.id=e.record_id
+                WHERE (?='' OR e.record_id=? OR e.action='move') AND (?='' OR r.project_id=?)
+                ORDER BY e.rowid DESC""", (record_id, record_id, project_id, project_id)):
+                event = dict(row)
+                for field in ("before", "after"):
+                    event[field] = json.loads(event[field]) if event[field] else None
+                if record_id and event["record_id"] != record_id and event["after"]["record_id"] != record_id:
+                    continue
+                events.append(event)
+                if len(events) == 200:
+                    break
+        return {"batches": [dict(row) for row in rows[:50]], "has_more": len(rows) > 50, "file_events": events}
 
     def history_detail(self, batch_id):
         with self.connect() as db:
@@ -908,10 +944,6 @@ class Store:
         validate(payload)
         if not db.execute("SELECT 1 FROM projects WHERE id=?", (state["project_id"],)).fetchone():
             raise Problem("原项目已不存在，无法恢复这次修改。", 409)
-        evidence = validate_result_summary(payload["result_summary"])["evidence_ids"]
-        owned = {row["id"] for row in db.execute("SELECT id FROM files WHERE experiment_id=?", (record_id,))}
-        if set(evidence) - owned:
-            raise Problem("原证据附件已变化，无法恢复这次修改。", 409)
         self.validate_lab_data(db, state["project_id"], record_id, payload["lab_data"], state["status"], is_dataset(state))
         self.check_child_links(db, record_id, state["project_id"], is_dataset(state))
 
@@ -1300,7 +1332,7 @@ class Store:
                     if not current:
                         raise Problem("找不到该实验。", 404)
                     if type(payload.get("revision")) is not int or payload["revision"] != current["revision"]:
-                        raise Problem("这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。", 409)
+                        raise Problem(STALE_RECORD, 409)
                     if "precursors" not in payload and current["precursors"] and payload.get("precursor") == current["precursor"]:
                         payload = {**payload, "precursors": json.loads(current["precursors"])}
                 clean = validate(payload)
@@ -1347,10 +1379,19 @@ class Store:
                         clean["lab_data"] = json.dumps(details)
                     self.validate_lab_data(db, project_id, record_id, details, clean["status"], dataset)
                 if "result_summary" in clean:
-                    evidence = json.loads(clean["result_summary"])["evidence_ids"]
-                    owned = {row["id"] for row in db.execute("SELECT id FROM files WHERE experiment_id=?", (record_id,))}
-                    if any(file_id not in owned for file_id in evidence):
+                    result = json.loads(clean["result_summary"])
+                    evidence = result["evidence_ids"]
+                    previous = json.loads(current["result_summary"]).get("evidence_ids", []) if current else []
+                    owned = {row["id"] for row in db.execute("SELECT id FROM files WHERE experiment_id=? AND deleted_at IS NULL", (record_id,))}
+                    if set(evidence) - owned - set(previous):
                         raise Problem("结果证据只能选择本样品已有的附件；请先保存样品并上传文件。")
+                    # Editors only receive active evidence. Preserve hidden links when those lists are saved back.
+                    if evidence == [file_id for file_id in previous if file_id in owned]:
+                        result["evidence_ids"] = previous
+                    else:
+                        hidden = [file_id for file_id in previous if file_id not in owned and file_id not in evidence]
+                        evidence.extend(hidden[:100 - len(evidence)])
+                    clean["result_summary"] = json.dumps(result, ensure_ascii=False)
                 if "solvents" not in payload:
                     clean["solvents"] = current["solvents"] if current and clean["solvent"] == current["solvent"] else None
                 if "material_amounts" not in payload:
@@ -1643,9 +1684,42 @@ class Store:
                    (record_id, *clean.values(), now, now))
         return record_id
 
+    @staticmethod
+    def check_file_kind(db, kind):
+        if not isinstance(kind, str) or not db.execute("SELECT 1 FROM categories WHERE name=? COLLATE BINARY", (kind,)).fetchone():
+            raise Problem("请选择有效的数据类型。")
+
+    @staticmethod
+    def check_file_slot(db, record_id, name, kind, file_id, restoring_original=False):
+        conflict = db.execute("""SELECT deleted_at FROM files WHERE experiment_id=? AND name=? AND kind=? AND id<>?
+                               ORDER BY deleted_at LIMIT 1""", (record_id, name, kind, file_id)).fetchone()
+        if conflict:
+            if restoring_original and conflict["deleted_at"] is None:
+                raise Problem("同名同类附件已存在，请为恢复的附件输入新名称。", 409)
+            raise Problem(f"同类型附件 {name} 已存在，未覆盖。请重命名后再上传。", 409)
+
+    @staticmethod
+    def check_file_record(record, revision):
+        if record["archived"]:
+            raise Problem(ARCHIVED_ATTACHMENTS, 409)
+        if type(revision) is not int or revision != record["revision"]:
+            raise Problem(STALE_RECORD, 409)
+
+    @staticmethod
+    def log_file_event(db, action, before, after, now):
+        file = before if before is not None else after
+        states = [json.dumps({"name": row["name"], "kind": row["kind"], "record_id": row["experiment_id"]},
+                             ensure_ascii=False) if row is not None else None for row in (before, after)]
+        db.execute("INSERT INTO file_events VALUES (?,?,?,?,?,?,?)",
+                   (uuid.uuid4().hex, file["id"], file["experiment_id"], action, *states, now))
+
+    @staticmethod
+    def touch_file_records(db, record_ids, now):
+        db.executemany("UPDATE experiments SET updated_at=?,revision=revision+1 WHERE id=?",
+                       ((now, record_id) for record_id in record_ids))
+
     def add_file(self, record_id, name, kind, stream, size, source="", folder_target=None, receipt=""):
-        if not name or len(name) > 240 or any(ord(c) < 32 for c in name) or any(c in name for c in '/\\') or name in (".", ".."):
-            raise Problem("文件名无效，请使用不含路径的文件名。")
+        validate_file_name(name)
         if not 0 < size <= MAX_FILE:
             raise Problem("请选择非空文件；单个文件上限为 256 MB。", 413)
         file_id = uuid.uuid4().hex
@@ -1666,8 +1740,7 @@ class Store:
             with self.lock:
                 with self.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    if not isinstance(kind, str) or not db.execute("SELECT 1 FROM categories WHERE name=? COLLATE BINARY", (kind,)).fetchone():
-                        raise Problem("请选择有效的数据类型。")
+                    self.check_file_kind(db, kind)
                     if receipt and db.execute("SELECT 1 FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone():
                         raise Problem("这次文件导入已有保存回执。", 409)
                     created = False
@@ -1676,9 +1749,11 @@ class Store:
                         if not db.execute("SELECT 1 FROM projects WHERE id=?", (project,)).fetchone():
                             raise Problem("请选择有效的实验项目。")
                         row = db.execute("SELECT * FROM experiments WHERE project_id=? AND sample_id=?", (project, sample)).fetchone()
-                        if record_id != (row["id"] if row else "") or (row and (row["archived"] or is_dataset(row)
+                        if record_id != (row["id"] if row else "") or (row and (is_dataset(row)
                                 or (row["experiment_no"] or experiment_number(row["sample_id"])) != number)):
                             raise Problem("目标样品已变化，请重新预览文件夹。", 409)
+                        if row and row["archived"]:
+                            raise Problem(ARCHIVED_ATTACHMENTS, 409)
                         if not row:
                             clean = validate({"sample_id": sample, "experiment_no": number})
                             _, _, defaults, _ = self.shared_group(db, project, clean["experiment_no"])
@@ -1689,21 +1764,25 @@ class Store:
                             clean["project_id"] = project
                             record_id = self.insert_record(db, clean, timestamp())
                             created = True
-                    elif not db.execute("SELECT 1 FROM experiments WHERE id=?", (record_id,)).fetchone():
-                        raise Problem("请先保存实验，再添加文件。", 404)
-                    if db.execute("SELECT 1 FROM files WHERE experiment_id=? AND name=? AND kind=?",
-                                  (record_id, name, kind)).fetchone():
-                        raise Problem(f"同类型附件 {name} 已存在，未覆盖。请重命名后再上传。", 409)
+                    else:
+                        row = db.execute("SELECT archived FROM experiments WHERE id=?", (record_id,)).fetchone()
+                        if not row:
+                            raise Problem("请先保存实验，再添加文件。", 404)
+                        if row["archived"]:
+                            raise Problem(ARCHIVED_ATTACHMENTS, 409)
+                    self.check_file_slot(db, record_id, name, kind, file_id)
                     temporary.replace(destination)
                     published = True
                     now = timestamp()
-                    db.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
+                    db.execute("INSERT INTO files(id,experiment_id,name,kind,size,sha256,source,created_at) VALUES (?,?,?,?,?,?,?,?)",
                                (file_id, record_id, name, kind, size, digest.hexdigest(), source, now))
+                    self.log_file_event(db, "upload", None, {"id": file_id, "experiment_id": record_id, "name": name, "kind": kind}, now)
                     if receipt:
                         db.execute("INSERT INTO folder_import_receipts VALUES (?,?)", (receipt, file_id))
-                    db.execute("UPDATE experiments SET updated_at=? WHERE id=?", (now, record_id))
                     if created:
                         self.log_history(db, {record_id: None}, "create", source="folder")
+                    else:
+                        self.touch_file_records(db, (record_id,), now)
         except Exception:
             if published:
                 destination.unlink(missing_ok=True)
@@ -1715,10 +1794,123 @@ class Store:
     def folder_receipt(self, receipt):
         with self.connect() as db:
             row = db.execute("""SELECT files.id, experiment_id AS record_id FROM folder_import_receipts
-                              JOIN files ON files.id=file_id WHERE folder_import_receipts.id=?""", (receipt,)).fetchone()
+                              JOIN files ON files.id=file_id WHERE folder_import_receipts.id=? AND files.deleted_at IS NULL""",
+                             (receipt,)).fetchone()
         if not row:
             raise Problem("本次文件导入尚无保存回执。", 404)
         return dict(row)
+
+    @staticmethod
+    def trash_count(db):
+        return db.execute("SELECT count(*) FROM files WHERE deleted_at IS NOT NULL").fetchone()[0]
+
+    def trash(self, project_id=""):
+        with self.connect() as db:
+            items = [dict(row) for row in db.execute("""SELECT f.*, r.id AS record_id, r.sample_id, r.experiment_no,
+                r.project_id, r.archived AS record_archived, EXISTS (
+                    SELECT 1 FROM files a WHERE a.experiment_id=f.experiment_id AND a.name=f.name
+                    AND a.kind=f.kind AND a.deleted_at IS NULL
+                ) AS name_conflict
+                FROM files f JOIN experiments r ON r.id=f.experiment_id
+                WHERE f.deleted_at IS NOT NULL AND (?='' OR r.project_id=?)
+                ORDER BY f.deleted_at DESC, f.rowid DESC""", (project_id, project_id))]
+        for item in items:
+            item["experiment_no"] = item["experiment_no"] or experiment_number(item["sample_id"])
+            item["record_archived"] = bool(item["record_archived"])
+            item["name_conflict"] = bool(item["name_conflict"])
+        return {"items": items, "total_bytes": sum(item["size"] for item in items)}
+
+    def change_file(self, file_id, action, payload):
+        if not isinstance(payload, dict):
+            raise Problem("附件操作请求不正确。")
+        with self.lock:
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                before = db.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+                if not before:
+                    raise Problem("附件不存在。", 404)
+                owner_id = before["experiment_id"]
+                owner = db.execute("SELECT * FROM experiments WHERE id=?", (owner_id,)).fetchone()
+                if not owner:
+                    raise Problem("找不到该实验。", 404)
+                self.check_file_record(owner, payload.get("record_revision"))
+                if (before["deleted_at"] is not None) != (action == "restore"):
+                    raise Problem("附件不存在。", 404)
+
+                now = timestamp()
+                after = dict(before)
+                events = [action]
+                if action == "delete":
+                    after["deleted_at"] = now
+                else:
+                    after["name"] = payload.get("name", before["name"])
+                    if "name" in payload:
+                        validate_file_name(after["name"])
+                    if action == "restore":
+                        after["deleted_at"] = None
+                    else:
+                        if "kind" in payload:
+                            after["kind"] = payload["kind"]
+                            self.check_file_kind(db, after["kind"])
+                        target_id = payload.get("target_record_id", owner_id)
+                        if not isinstance(target_id, str) or not target_id:
+                            raise Problem("目标样品不存在，请刷新后重试。")
+                        if target_id != owner_id:
+                            target = db.execute("SELECT * FROM experiments WHERE id=?", (target_id,)).fetchone()
+                            if not target:
+                                raise Problem("目标样品不存在，请刷新后重试。", 404)
+                            if target["project_id"] != owner["project_id"]:
+                                raise Problem("附件只能移到同一项目的样品。")
+                            self.check_file_record(target, payload.get("target_revision"))
+                            after["experiment_id"] = target_id
+                        events = [event for key, event in (("name", "rename"), ("kind", "recategorize"), ("experiment_id", "move"))
+                                  if before[key] != after[key]]
+                        if not events:
+                            raise Problem("没有需要保存的修改。")
+                    self.check_file_slot(db, after["experiment_id"], after["name"], after["kind"], file_id,
+                                         restoring_original=action == "restore" and after["name"] == before["name"])
+
+                db.execute("UPDATE files SET name=?,kind=?,experiment_id=?,deleted_at=? WHERE id=?",
+                           (after["name"], after["kind"], after["experiment_id"], after["deleted_at"], file_id))
+                for event in events:
+                    self.log_file_event(db, event, None if action == "restore" else before,
+                                        None if action == "delete" else after, now)
+                record_ids = (owner_id,) if owner_id == after["experiment_id"] else (owner_id, after["experiment_id"])
+                self.touch_file_records(db, record_ids, now)
+                result = {}
+                if action != "delete":
+                    result["file"] = {key: after[key] for key in FILE_FIELDS}
+                if action != "update":
+                    result["trash_count"] = self.trash_count(db)
+            records = {record["id"]: record for record in self.list() if record["id"] in record_ids}
+            result["records"] = [records[record_id] for record_id in record_ids]
+        return result
+
+    def purge_trash(self, payload):
+        if not isinstance(payload, dict) or payload.get("confirm") != "purge":
+            raise Problem("请确认永久删除所选附件。")
+        ids = payload.get("file_ids")
+        if not isinstance(ids, list) or any(not isinstance(file_id, str) for file_id in ids):
+            raise Problem("附件操作请求不正确。")
+        with self.file_copy_lock:
+            with self.lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                files = [db.execute("SELECT * FROM files WHERE id=? AND deleted_at IS NOT NULL", (file_id,)).fetchone()
+                         for file_id in dict.fromkeys(ids)]
+                if any(file is None for file in files):
+                    raise Problem("回收站内容已变化，请刷新后再清空。", 409)
+                now = timestamp()
+                for file in files:
+                    db.execute("DELETE FROM folder_import_receipts WHERE file_id=?", (file["id"],))
+                    db.execute("DELETE FROM files WHERE id=?", (file["id"],))
+                    self.log_file_event(db, "purge", file, None, now)
+                remaining = self.trash_count(db)
+            for file in files:
+                try:
+                    (self.files / file["id"]).unlink(missing_ok=True)
+                except OSError as exc:
+                    logging.getLogger(__name__).warning("无法删除已清空的附件副本 %s: %s", file["id"], exc)
+        return {"purged": len(files), "bytes": sum(file["size"] for file in files), "trash_count": remaining}
 
     def file(self, file_id):
         with self.connect() as db:
@@ -1736,53 +1928,53 @@ class Store:
         if (not 1 <= len(ids) <= 500 or len(revisions) != len(ids) or len(set(ids)) != len(ids)
                 or any(not re.fullmatch(r"[a-f0-9]{32}", key) for key in ids)):
             raise Problem("Select experiments to export." if english else "请选择要导出的实验。")
-        with self.lock:
+        with self.file_copy_lock:
             records = self.list()
-        by_id = {record["id"]: record for record in records if not is_dataset(record)}
-        if any(key not in by_id or by_id[key]["revision"] != version for key, version in zip(ids, revisions)):
-            raise Problem(stale, 409)
-        def group(record):
-            return record["project_id"], experiment_key(record["project_id"], record["experiment_no"]), record["archived"]
+            by_id = {record["id"]: record for record in records if not is_dataset(record)}
+            if any(key not in by_id or by_id[key]["revision"] != version for key, version in zip(ids, revisions)):
+                raise Problem(stale, 409)
+            def group(record):
+                return record["project_id"], experiment_key(record["project_id"], record["experiment_no"]), record["archived"]
 
-        groups = {group(by_id[key]) for key in ids}
-        if {key for key, record in by_id.items() if group(record) in groups} != set(ids):
-            raise Problem(stale, 409)
-        selected = {key: by_id[key] for key in ids}
-        linked, rows, files = {}, [], []
-        for record in selected.values():
-            parent_id = record.get("lab_data", {}).get("parent_id")
-            while parent_id and parent_id not in selected and parent_id not in linked:
-                parent = by_id[parent_id]
-                linked[parent_id] = {key: parent[key] for key in ("id", "sample_id", "experiment_no", "project_id")}
-                parent_id = parent.get("lab_data", {}).get("parent_id")
-                linked[parent["id"]]["parent_id"] = parent_id
-            portable_files = []
-            for file in record["files"]:
-                path = self.files / file["id"]
-                if not path.is_file() or path.stat().st_size != file["size"]:
-                    raise Problem(("Attachment missing or size changed: " if english else "附件缺失或大小已变化：") + file["name"], 409)
-                name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", file["name"]).rstrip(". ") or "file"
-                stem, suffix = Path(name).stem, Path(name).suffix
-                name = stem.encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip(". ")
-                name = (name or "file") + (suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,15}", suffix) else "")
-                member = f"files/{file['id']}-{name}"
-                portable_files.append({**{key: value for key, value in file.items() if key != "source"}, "path": member})
-                files.append((path, member, file))
-            rows.append({**{key: value for key, value in record.items() if key != "notes"}, "files": portable_files})
-        manifest = {"schema": "experiment-data-catalog/share-v1", "experiments": len(groups),
-                    "samples": rows, "external_parents": list(linked.values())}
-        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            archive.writestr("samples.csv", export_csv([{**row, "notes": ""} for row in rows], language, include_template=True))
-            for path, member, file in files:
-                digest = hashlib.sha256()
-                with path.open("rb") as source, archive.open(member, "w") as target:
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                        target.write(chunk)
-                if digest.hexdigest() != file["sha256"]:
-                    raise Problem(("Attachment checksum no longer matches: " if english else "附件校验值已变化：") + file["name"], 409)
-            archive.writestr("README.txt", "Start with samples.csv or manifest.json. The files field in the manifest maps each sample to its original attachments and checksums. Parent IDs outside the selection are listed under external_parents as references. This package is for handoff; use Full backup to restore the app.\n")
+            groups = {group(by_id[key]) for key in ids}
+            if {key for key, record in by_id.items() if group(record) in groups} != set(ids):
+                raise Problem(stale, 409)
+            selected = {key: by_id[key] for key in ids}
+            linked, rows, files = {}, [], []
+            for record in selected.values():
+                parent_id = record.get("lab_data", {}).get("parent_id")
+                while parent_id and parent_id not in selected and parent_id not in linked:
+                    parent = by_id[parent_id]
+                    linked[parent_id] = {key: parent[key] for key in ("id", "sample_id", "experiment_no", "project_id")}
+                    parent_id = parent.get("lab_data", {}).get("parent_id")
+                    linked[parent["id"]]["parent_id"] = parent_id
+                portable_files = []
+                for file in record["files"]:
+                    path = self.files / file["id"]
+                    if not path.is_file() or path.stat().st_size != file["size"]:
+                        raise Problem(("Attachment missing or size changed: " if english else "附件缺失或大小已变化：") + file["name"], 409)
+                    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", file["name"]).rstrip(". ") or "file"
+                    stem, suffix = Path(name).stem, Path(name).suffix
+                    name = stem.encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip(". ")
+                    name = (name or "file") + (suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,15}", suffix) else "")
+                    member = f"files/{file['id']}-{name}"
+                    portable_files.append({**{key: value for key, value in file.items() if key != "source"}, "path": member})
+                    files.append((path, member, file))
+                rows.append({**{key: value for key, value in record.items() if key != "notes"}, "files": portable_files})
+            manifest = {"schema": "experiment-data-catalog/share-v1", "experiments": len(groups),
+                        "samples": rows, "external_parents": list(linked.values())}
+            with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                archive.writestr("samples.csv", export_csv([{**row, "notes": ""} for row in rows], language, include_template=True))
+                for path, member, file in files:
+                    digest = hashlib.sha256()
+                    with path.open("rb") as source, archive.open(member, "w") as target:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            target.write(chunk)
+                    if digest.hexdigest() != file["sha256"]:
+                        raise Problem(("Attachment checksum no longer matches: " if english else "附件校验值已变化：") + file["name"], 409)
+                archive.writestr("README.txt", "Start with samples.csv or manifest.json. The files field in the manifest maps each sample to its original attachments and checksums. Parent IDs outside the selection are listed under external_parents as references. This package is for handoff; use Full backup to restore the app.\n")
 
     def snapshot_database(self, destination):
         """Copy the live database consistently; return the attachments and source photos it references."""
@@ -1800,10 +1992,10 @@ class Store:
         return files, sources, summary
 
     def backup(self, destination):
-        with tempfile.TemporaryDirectory() as folder:
+        with self.file_copy_lock, tempfile.TemporaryDirectory() as folder:
             snapshot = Path(folder) / "experiments.sqlite3"
             files, review_sources, summary = self.snapshot_database(snapshot)
-            # Committed attachment IDs have immutable paths, so compression can run after releasing the write lock.
+            # Prevent purge from removing snapshot files during compression without blocking other writes.
             with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                 archive.write(snapshot, "data/experiments.sqlite3")
                 for file in files:
@@ -1931,41 +2123,42 @@ class Store:
         snapshot = mirror / ".part-experiments.sqlite3"
         snapshot.unlink(missing_ok=True)
         try:
-            files, sources, summary = self.snapshot_database(snapshot)
-            check = sqlite3.connect(snapshot)
-            try:
-                if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise Problem("数据库快照完整性检查未通过，备份未完成。请查看服务日志。", 500)
-            finally:
-                check.close()
-            entries = [(self.files / item["id"], mirror / "files" / item["id"], item["sha256"], item.get("size"), item["name"]) for item in files]
-            entries += [(self.data / "review-sources" / item["id"], mirror / "review-sources" / item["id"], item["sha256"], None, item["name"]) for item in sources]
-            missing = [name for source, _, _, _, name in entries if not source.is_file()]
-            if missing:
-                raise Problem("以下附件在实验库中缺失，备份未完成：" + "、".join(missing[:5]) + (" 等" if len(missing) > 5 else ""), 409)
-            pending = []
-            for source, destination, expected, size, name in entries:
-                size = source.stat().st_size if size is None else size
-                if destination.is_file() and destination.stat().st_size == size and (not verify or self.file_digest(destination) == expected):
-                    continue
-                pending.append((source, destination, expected, size))
-            needed = sum(size for *_, size in pending) + snapshot.stat().st_size * 2
-            free = shutil.disk_usage(target).free
-            if free < needed + 64 * 1024 * 1024:
-                raise Problem(f"备份磁盘空间不足：还需要约 {needed / 1e9:.2f} GB，可用 {free / 1e9:.2f} GB。", 507)
-            total_bytes = sum(size for *_, size in pending)
-            self.set_backup_progress(phase="files", total_files=len(entries), done_files=len(entries) - len(pending),
-                                     total_bytes=total_bytes, done_bytes=0)
-            copied = 0
+            with self.file_copy_lock:
+                files, sources, summary = self.snapshot_database(snapshot)
+                check = sqlite3.connect(snapshot)
+                try:
+                    if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise Problem("数据库快照完整性检查未通过，备份未完成。请查看服务日志。", 500)
+                finally:
+                    check.close()
+                entries = [(self.files / item["id"], mirror / "files" / item["id"], item["sha256"], item.get("size"), item["name"]) for item in files]
+                entries += [(self.data / "review-sources" / item["id"], mirror / "review-sources" / item["id"], item["sha256"], None, item["name"]) for item in sources]
+                missing = [name for source, _, _, _, name in entries if not source.is_file()]
+                if missing:
+                    raise Problem("以下附件在实验库中缺失，备份未完成：" + "、".join(missing[:5]) + (" 等" if len(missing) > 5 else ""), 409)
+                pending = []
+                for source, destination, expected, size, name in entries:
+                    size = source.stat().st_size if size is None else size
+                    if destination.is_file() and destination.stat().st_size == size and (not verify or self.file_digest(destination) == expected):
+                        continue
+                    pending.append((source, destination, expected, size))
+                needed = sum(size for *_, size in pending) + snapshot.stat().st_size * 2
+                free = shutil.disk_usage(target).free
+                if free < needed + 64 * 1024 * 1024:
+                    raise Problem(f"备份磁盘空间不足：还需要约 {needed / 1e9:.2f} GB，可用 {free / 1e9:.2f} GB。", 507)
+                total_bytes = sum(size for *_, size in pending)
+                self.set_backup_progress(phase="files", total_files=len(entries), done_files=len(entries) - len(pending),
+                                         total_bytes=total_bytes, done_bytes=0)
+                copied = 0
 
-            def advance(count):
-                nonlocal copied
-                copied += count
-                self.set_backup_progress(done_bytes=copied)
+                def advance(count):
+                    nonlocal copied
+                    copied += count
+                    self.set_backup_progress(done_bytes=copied)
 
-            for index, (source, destination, expected, _) in enumerate(pending, 1):
-                self.copy_verified(source, destination, expected, advance)
-                self.set_backup_progress(done_files=len(entries) - len(pending) + index, copied_files=index)
+                for index, (source, destination, expected, _) in enumerate(pending, 1):
+                    self.copy_verified(source, destination, expected, advance)
+                    self.set_backup_progress(done_files=len(entries) - len(pending) + index, copied_files=index)
             self.set_backup_progress(phase="database")
             if (self.data / LOCAL_CATALOG).is_file():
                 shutil.copy2(self.data / LOCAL_CATALOG, mirror / LOCAL_CATALOG)
@@ -2057,7 +2250,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_file(self, path, content_type, filename=None):
         with path.open("rb") as stream:
-            self.send_headers(200, content_type, path.stat().st_size, filename)
+            self.send_headers(200, content_type, os.fstat(stream.fileno()).st_size, filename)
             shutil.copyfileobj(stream, self.wfile)
 
     def body_length(self, maximum):
@@ -2125,8 +2318,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/health":
                 return self.send_json({"app": "experiment-data-catalog", "version": 1, "workspace": str(store.data.resolve())})
             if path == "/api/experiments":
-                return self.send_json({"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
-                                       "translations": store.local_translations(), "conventions": store.conventions()})
+                with store.lock, store.connect() as db:
+                    result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
+                              "translations": store.local_translations(), "conventions": store.conventions(),
+                              "trash_count": store.trash_count(db)}
+                return self.send_json(result)
+            if path == "/api/trash":
+                return self.send_json(store.trash(query.get("project_id", [""])[0]))
             if path == "/api/backup/status":
                 return self.send_json(store.backup_status())
             if path == "/api/experiment-defaults":
@@ -2146,14 +2344,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(store.folder_receipt(path.rsplit("/", 1)[-1]))
             if re.fullmatch(r"/api/review-sources/[a-f0-9]{32}", path):
                 return self.send_file(*store.review_source(path.rsplit("/", 1)[-1]))
-            if re.fullmatch(r"/api/files/[a-f0-9]{32}", path):
-                file_path, name = store.file(path.rsplit("/", 1)[-1])
-                return self.send_file(file_path, "application/octet-stream", name)
-            if re.fullmatch(r"/api/files/[a-f0-9]{32}/preview", path):
-                preview = store.preview(path.split("/")[-2])
-                if isinstance(preview, dict):
-                    return self.send_json(preview)
-                return self.send_file(*preview)
+            match = re.fullmatch(r"/api/files/([a-f0-9]{32})(/preview)?", path)
+            if match:
+                file_id, action = match.groups()
+                try:
+                    if action:
+                        preview = store.preview(file_id)
+                        if isinstance(preview, dict):
+                            return self.send_json(preview)
+                        return self.send_file(*preview)
+                    file_path, name = store.file(file_id)
+                    return self.send_file(file_path, "application/octet-stream", name)
+                except FileNotFoundError:
+                    raise Problem("附件文件缺失，请检查数据目录或备份。", 404)
             if path == "/api/export.csv":
                 selected = set(query.get("ids", [""])[0].split(","))
                 records = [record for record in store.list() if record["id"] in selected]
@@ -2190,6 +2393,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem("临时磁盘空间不足，无法生成 ZIP。请改用“备份到文件夹”。", 507) from exc
                 finally:
                     store.backup_guard.release()
+        if self.command == "POST":
+            match = re.fullmatch(r"/api/files/([a-f0-9]{32})/(update|delete)", path)
+            if match:
+                return self.send_json(store.change_file(*match.groups(), self.json_body()))
+            match = re.fullmatch(r"/api/trash/([a-f0-9]{32})/restore", path)
+            if match:
+                return self.send_json(store.change_file(match[1], "restore", self.json_body()))
+            if path == "/api/trash/purge":
+                return self.send_json(store.purge_trash(self.json_body()))
         if self.command == "POST" and path in ("/api/projects", "/api/categories", "/api/condition-options"):
             return self.send_json(store.add_catalog_item(path.rsplit("/", 1)[-1], self.json_body()), 201)
         if self.command == "POST" and path == "/api/backup/folder":
