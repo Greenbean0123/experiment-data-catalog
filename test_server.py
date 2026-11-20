@@ -260,6 +260,139 @@ class StoreTests(unittest.TestCase):
         self.store.undo_history(batch, {"preview": False, "revisions": preview["revisions"]})
         self.assertEqual(self.store.list()[0]["lab_data"], {"template_revision": 1, "outcome": "measured", "values": {"0": 0, "1": 60}})
 
+    def test_key_field_reviews_keep_existing_dispositions_and_waive_results(self):
+        legacy = self.store.save({"sample_id": "Legacy", "duration": 5, "solvent": "Water"})
+        original = next(item for item in self.store.review_list()["items"] if item["kind"] == "missing_conditions")
+        self.assertEqual(original["missing"], ["precursor", "temperature"])
+        registered = self.store.add_review({"issue_id": original["id"]})
+        self.store.decide_review(original["id"], {"preview": False, "status": "resolved",
+                                 "revision": registered["revision"], "record_revision": original["record_revision"]})
+        sample = self.store.save({"sample_id": "Legacy without built-ins"})
+        fields = [dict(section="condition", label="Substrate", type="text"),
+                  dict(section="result", label="Thickness", type="number", unit="nm"),
+                  dict(section="condition", label="Comment", type="text")]
+        self.store.save_template(dict(project_id="default", name="Film", revision=0, fields=fields))
+        settings = {"builtin": {field: {"enabled": False} for field in ("duration", "materials")},
+                    "key_fields": [{"section": field["section"], "label": field["label"], "check_missing": index < 2}
+                                   for index, field in enumerate(fields)]}
+        self.store.save_project_settings("default", {"settings": settings, "revision": 0})
+        waived = [self.store.save({"sample_id": outcome, "lab_data": {"outcome": outcome}})
+                  for outcome in ("not_measured", "measurement_failed", "no_target")]
+        empty = self.store.save({"sample_id": "Measured", "lab_data": {"outcome": "measured"}})
+        filled = self.store.save({"sample_id": "Zero", "lab_data": {"values": {"0": "Si", "1": 0}}})
+        items = self.store.review_list()["items"]
+        self.assertEqual([(item["id"], item["status"]) for item in items if item["record_id"] == legacy
+                          and item["kind"] == "missing_conditions" and not item["field"]], [(original["id"], "resolved")])
+        self.assertEqual([item["missing"] for item in items if item["record_id"] == sample
+                          and item["kind"] == "missing_conditions" and not item["field"]], [["precursor", "temperature"]])
+        for record_id in waived:
+            self.assertEqual([item["field"] for item in items if item["record_id"] == record_id and item["field"]],
+                             ["key:condition:Substrate"])
+        self.assertFalse(any(item["record_id"] == filled and item["field"] for item in items))
+        measured = [item for item in items if item["record_id"] == empty and item["field"]]
+        self.assertEqual([(item["field"], item["title"], item["missing"]) for item in measured], [
+            ("key:condition:Substrate", "缺少关键字段：Substrate", ["Substrate"]),
+            ("key:result:Thickness", "缺少关键字段：Thickness", ["Thickness"]),
+        ])
+        self.store.add_review({"issue_id": measured[1]["id"]})
+        stored = next(item for item in self.store.review_list()["items"] if item["id"] == measured[1]["id"])
+        self.assertEqual((stored["generated"], stored["field"], stored["title"]),
+                         (False, measured[1]["field"], measured[1]["title"]))
+
+    def test_bulk_key_fields_edit_saved_versions_and_undo(self):
+        fields = [dict(section="condition", label="Substrate", type="text"),
+                  dict(section="result", label="Thickness", type="number", unit="nm"),
+                  dict(section="condition", label="Process", type="single", options=["Cold", "Hot"]),
+                  dict(section="condition", label="Dopants", type="multi", options=["A", "B", "C"]),
+                  dict(section="result", label="Notes", type="text")]
+        template = dict(project_id="default", name="Film", revision=0, fields=fields)
+        self.store.save_template(template)
+        original = {"0": "Si", "1": 0, "2": "Cold", "3": ["A"], "4": "Keep"}
+        old = self.store.save({"sample_id": "Old", "lab_data": {"values": original, "outcome": "measured"}})
+        latest = [{**fields[1], "unit": "µm"}, fields[3], fields[0], {**fields[2], "options": ["Cold", "Hot", "Warm"]}, fields[4]]
+        self.store.save_template({**template, "revision": 1, "fields": latest})
+        new = self.store.save({"sample_id": "New", "lab_data": {"values": {str(index): original[str(previous)]
+                               for index, previous in enumerate((1, 3, 0, 2, 4))}}})
+        keys = [{field: definition[field] for field in ("section", "label")} for definition in fields[:4]]
+        self.store.save_project_settings("default", {"settings": {"key_fields": keys}, "revision": 0})
+
+        def bulk(actions, preview=False, **builtins):
+            revisions = {row["id"]: row["revision"] for row in self.store.list()}
+            return self.store.bulk_update({"preview": preview, "changes": {"key_fields": actions, **builtins},
+                                          "records": [{"id": record, "revision": revisions[record]} for record in (new, old)]})
+
+        edits = [{**key, "mode": mode, "value": value} for key, mode, value in
+                 zip(keys, ("set", "set", "set", "replace"), ("  Glass  ", 3.5, "Hot", ["B"]))]
+        edits[0]["label"] = "SUBSTRATE"
+        results = bulk(edits, preview=True, duration={"mode": "set", "value": 15})
+        self.assertEqual(results["updated"], 2)
+        for preview in results["rows"]:
+            self.assertEqual(preview["changes"], [
+                {"field": "duration", "before": None, "after": 15},
+                {"field": "key:condition:Substrate", "before": "Si", "after": "Glass"},
+                {"field": "key:result:Thickness", "before": 0, "after": 3.5},
+                {"field": "key:condition:Process", "before": "Cold", "after": "Hot"},
+                {"field": "key:condition:Dopants", "before": ["A"], "after": ["B"]},
+            ])
+        self.assertTrue(all(row["revision"] == 1 for row in self.store.list()))
+        updated = bulk(edits, duration={"mode": "set", "value": 15})
+        by_id = {row["id"]: row for row in updated["records"]}
+        self.assertEqual(by_id[old]["lab_data"], {"template_revision": 1, "outcome": "measured",
+                         "values": dict(zip("01234", ("Glass", 3.5, "Hot", ["B"], "Keep")))})
+        self.assertEqual(by_id[new]["lab_data"], {"template_revision": 2,
+                         "values": dict(zip("01234", (3.5, ["B"], "Glass", "Hot", "Keep")))})
+        self.assertEqual(bulk(edits, duration={"mode": "set", "value": 15})["updated"], 0)
+        self.assertEqual(self.store.list(), updated["records"])
+
+        for edit in ({**edits[0], "value": "x" * 251}, {**edits[1], "value": float("inf")},
+                     {**edits[1], "value": True}, {**edits[2], "value": "Warm"},
+                     {**edits[3], "value": ["Unknown"]}, {**edits[3], "mode": "set"}):
+            with self.subTest(edit=edit), self.assertRaises(Problem) as invalid:
+                bulk([edit], duration={"mode": "set", "value": 90})
+            self.assertEqual(invalid.exception.status, 400)
+            self.assertEqual(self.store.list(), updated["records"])
+
+        append = [{**keys[-1], "mode": "append", "value": ["B", "C"]}]
+        appended = bulk(append)
+        self.assertTrue(all(row["changes"][0]["after"] == ["B", "C"] for row in appended["rows"]))
+        self.assertEqual(bulk(append)["updated"], 0)
+        cleared = [{**key, "mode": "clear"} for key in keys]
+        result = bulk(cleared)
+        self.assertTrue(all(row["lab_data"]["values"] == {"4": "Keep"} for row in result["records"]))
+        self.assertTrue(all(change["after"] is None for row in result["rows"] for change in row["changes"]))
+        self.assertEqual(bulk(cleared)["updated"], 0)
+        batch = self.store.history()["batches"][0]
+        self.assertEqual(batch["action"], "bulk")
+        preview = self.store.undo_history(batch["id"], {"preview": True})
+        self.assertTrue(all(row["changes"][0]["field"] == "lab_data" for row in preview["rows"]))
+        restored = self.store.undo_history(batch["id"], {"preview": False, "revisions": preview["revisions"]})
+        self.assertEqual({row["id"]: row["lab_data"] for row in restored["records"]},
+                         {row["id"]: row["lab_data"] for row in appended["records"]})
+
+    def test_bulk_key_field_missing_samples_are_bounded_and_atomic(self):
+        old_template = dict(project_id="default", name="Film", revision=0,
+                            fields=[dict(section="condition", label="Power", type="text")])
+        self.store.save_template(old_template)
+        samples = [f"Legacy {index}" for index in range(11)]
+        old_ids = [self.store.save({"sample_id": sample, "lab_data": {"values": {"0": "Old"}}}) for sample in samples]
+        self.store.save_template({**old_template, "revision": 1,
+                                  "fields": [{**old_template["fields"][0], "type": "number"}]})
+        key = {"section": "condition", "label": "Power"}
+        self.store.save_project_settings("default", {"settings": {"key_fields": [key]}, "revision": 0})
+        new = self.store.save({"sample_id": "Current", "lab_data": {"values": {"0": 0}}})
+        before = self.store.list()
+        history = self.store.history()
+        for preview in (True, False):
+            with self.assertRaises(Problem) as invalid:
+                self.store.bulk_update({"preview": preview, "records": [{"id": record, "revision": 1}
+                                       for record in [new, *old_ids]],
+                                       "changes": {"temperature": {"mode": "set", "value": 300},
+                                                   "key_fields": [{**key, "mode": "set", "value": 50}]}})
+            self.assertEqual((invalid.exception.status, str(invalid.exception)),
+                             (400, "以下样品的模板没有字段 Power：" + "、".join(samples[:10])))
+            self.assertEqual(self.store.list(), before)
+            self.assertEqual(self.store.history(), history)
+
     def test_sample_lineage_refuses_cycles_and_cross_project_links(self):
         parent = self.store.save({"sample_id": "BATCH"})
         child = self.store.save({"sample_id": "SPLIT-A", "lab_data": {"parent_id": parent, "treatment": "Anneal"}})
@@ -1645,6 +1778,110 @@ class HTTPTests(unittest.TestCase):
         self.assertIn("275", result["condition_options"]["temperature"])
         self.assertEqual(self.request(path, {**payload, "preview": False}, "POST")[0], 409)
 
+    def test_project_settings_http_defaults_normalize_validate_and_track_availability(self):
+        store = self.server.store
+        project = store.add_catalog_item("projects", {"name": "Project settings"})["project"]["id"]
+        path = f"/api/projects/{project}/settings"
+
+        def request(body=None, expected=200, **kwargs):
+            status, data, _ = self.request(path, body, "PUT" if body is not None else "GET", **kwargs)
+            self.assertEqual(status, expected, data)
+            return json.loads(data)
+
+        self.assertEqual(set(request()), {"settings", "revision", "fields"})
+        defaults = request()
+        self.assertEqual(defaults, {"settings": {"builtin": {
+            field: {"enabled": True, "label": {"zh": "", "en": ""}}
+            for field in ("precursor", "temperature", "duration", "materials")},
+            "key_fields": [], "phase_presets": []}, "fields": [], "revision": 0})
+        with store.connect() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM project_settings WHERE project_id=?", (project,)).fetchone())
+        for method, body in (("GET", None), ("PUT", {"revision": 0, "settings": {}})):
+            status, data, _ = self.request("/api/projects/unknown/settings", body, method)
+            self.assertEqual((status, json.loads(data)), (404, {"error": "找不到该项目。"}))
+        request(expected=401, authenticate=False)
+        request({"revision": 0, "settings": {}}, expected=403, origin="https://example.com")
+
+        fields = [dict(section="condition", label="Straße", type="single", options=["A", "B"])]
+        fields += [dict(section="condition", label=f"Field {index}", type="text") for index in range(8)]
+        template = dict(project_id=project, name="Settings test", revision=0, fields=fields)
+        store.save_template(template)
+        key = {"section": "condition", "label": "  STRASSE ", "check_missing": True}
+        payload = {"revision": 0, "settings": {"builtin": {"temperature": {"enabled": False, "label": {"en": "  Heater "}},
+                                                           "materials": {"label": {"zh": "材料"}}},
+                                             "phase_presets": ["  Phase I ", "Phase II"], "key_fields": [key]}}
+        saved = request(payload)
+        self.assertEqual(saved, request())
+        expected = defaults["settings"]
+        expected["builtin"]["temperature"] = {"enabled": False, "label": {"zh": "", "en": "Heater"}}
+        expected["builtin"]["materials"]["label"]["zh"] = "材料"
+        expected["key_fields"] = [{"section": "condition", "label": "Straße", "check_missing": True}]
+        expected["phase_presets"] = ["Phase I", "Phase II"]
+        self.assertEqual(saved, {"settings": expected, "revision": 1,
+                                 "fields": [{**expected["key_fields"][0], "available": True, "type": "single",
+                                             "unit": "", "options": ["A", "B"]}]})
+        self.assertEqual(request(payload, expected=409), {"error": "项目设置已在其他窗口修改，请刷新后再保存。"})
+        invalid_settings = [
+            {"builtin": {"precursor": {"label": {"zh": label}}}} for label in ("x" * 41, "a\x7fb", "b\n")
+        ] + [
+            {"key_fields": [{"section": field["section"], "label": field["label"]} for field in fields]},
+            {"key_fields": [key, {**key, "label": "Straße"}]},
+            {"phase_presets": ["Phase", " phase "]}, {"phase_presets": ["x" * 81]},
+            {"phase_presets": [str(index) for index in range(21)]},
+        ]
+        for settings in invalid_settings:
+            with self.subTest(settings=settings):
+                request({"revision": 1, "settings": settings}, expected=400)
+        for invalid in ({**key, "label": "Unlisted"}, {**key, "section": "result"}):
+            self.assertEqual(request({"revision": 1, "settings": {"key_fields": [invalid]}}, expected=400),
+                             {"error": "关键字段必须来自当前实验模板。"})
+        store.save_template({**template, "revision": 1, "fields": fields[1:]})
+        unavailable = request()
+        self.assertEqual(unavailable["fields"], [{**expected["key_fields"][0], "available": False, "type": "",
+                                                  "unit": "", "options": []}])
+        self.assertEqual(unavailable["revision"], 1)
+        experiments = json.loads(self.request("/api/experiments")[1])
+        self.assertEqual(set(experiments["project_settings"]), {entry["id"] for entry in experiments["projects"]})
+        self.assertEqual(experiments["project_settings"][project], unavailable)
+        self.assertEqual(experiments["conventions"]["phase_presets"][project], ["Phase I", "Phase II"])
+        self.assertEqual(store.history(project_id=project)["batches"], [])
+
+    def test_csv_key_fields_use_each_samples_template_version_and_project(self):
+        store = self.server.store
+        first = store.add_catalog_item("projects", {"name": "CSV thin films"})["project"]["id"]
+        second = store.add_catalog_item("projects", {"name": "CSV coatings"})["project"]["id"]
+        thickness = dict(section="result", label="Thickness", type="number", unit="nm")
+        formula = dict(section="condition", label="=Formula", type="text")
+        factor = dict(section="condition", label="Factor", type="text")
+        tags = dict(section="condition", label="Tags", type="multi", options=["@A", "B"])
+        store.save_template(dict(project_id=first, name="Film", revision=0, fields=[thickness, formula, factor, tags]))
+        old = store.save({"project_id": first, "sample_id": "Old film",
+                          "lab_data": {"values": {"0": 8.25, "1": "=2+2", "2": "Different type", "3": ["@A", "B"]}}})
+        thickness_um = {**thickness, "unit": "µm"}
+        current_factor = {**factor, "type": "number"}
+        store.save_template(dict(project_id=first, name="Film", revision=1, fields=[tags, thickness_um, current_factor, formula]))
+        new = store.save({"project_id": first, "sample_id": "New film",
+                          "lab_data": {"values": {"1": 0, "2": 4, "3": "ordinary"}}})
+        other_thickness = {**thickness, "label": "thICKness", "unit": "Å"}
+        other = dict(section="condition", label="Comment", type="text")
+        store.save_template(dict(project_id=second, name="Coating", revision=0, fields=[other, other_thickness]))
+        coat = store.save({"project_id": second, "sample_id": "Coating", "lab_data": {"values": {"0": "+note", "1": 45}}})
+        for project, fields in [(first, [thickness_um, formula, current_factor, tags]), (second, [other_thickness, other])]:
+            keys = [{"section": field["section"], "label": field["label"]} for field in fields]
+            store.save_project_settings(project, {"revision": 0, "settings": {"key_fields": keys}})
+        status, body, _ = self.request("/api/export.csv?" + urlencode({"ids": ",".join([old, new, coat]), "lang": "en"}))
+        self.assertEqual(status, 200)
+        headers, *rows = csv.reader(io.StringIO(body.decode("utf-8-sig")))
+        self.assertEqual(headers[21:], ["Thickness (µm)", "'=Formula", "Factor", "Tags", "Comment"])
+        self.assertEqual({row[0]: row[21:] for row in rows}, {
+            "Old film": ["8.25 nm", "'=2+2", "", "'@A / B", ""],
+            "New film": ["0", "ordinary", "4", "", ""],
+            "Coating": ["45 Å", "", "", "", "'+note"],
+        })
+        _, body, _ = self.request(f"/api/export.csv?ids={coat}&lang=en")
+        headers, row = csv.reader(io.StringIO(body.decode("utf-8-sig")))
+        self.assertEqual((headers[21:], row[21:]), (["thICKness (Å)", "Comment"], ["45", "'+note"]))
+
     def test_results_http_roundtrip_and_ownership(self):
         status, body, _ = self.request("/api/experiments", {"sample_id": "HTTP-result", "result_summary": {"phases": ["Phase-A2"]}}, "POST")
         self.assertEqual(status, 201)
@@ -2075,6 +2312,24 @@ class DataSafetyTests(unittest.TestCase):
             Store(self.store.data)
         self.assertEqual(database.read_bytes(), before, "A newer catalog is left untouched")
 
+    def test_schema_two_migration_snapshots_before_adding_project_settings(self):
+        record = self.store.save({"sample_id": "From schema 2"})
+        with self.store.connect() as db:
+            db.execute("DROP TABLE project_settings")
+            db.execute("PRAGMA user_version=2")
+        upgraded = Store(self.store.data)
+        self.assertEqual(self.version(upgraded.db), 3)
+        self.assertEqual(upgraded.get_project_settings("default")["revision"], 0)
+        self.assertEqual(upgraded.list()[0]["id"], record)
+        snapshot, = (self.store.data / "migration-backups").glob("experiments-schema2-*.sqlite3")
+        self.assertEqual(self.version(snapshot), 2)
+        original = sqlite3.connect(snapshot)
+        try:
+            self.assertIsNone(original.execute("SELECT 1 FROM sqlite_master WHERE name='project_settings'").fetchone())
+            self.assertEqual(original.execute("SELECT id FROM experiments").fetchone()[0], record)
+        finally:
+            original.close()
+
     def test_legacy_attachment_migration_keeps_files_and_receipts(self):
         for version in (1, 2):
             with self.subTest(version=version):
@@ -2128,7 +2383,7 @@ class DataSafetyTests(unittest.TestCase):
                              (imported["id"], hashlib.sha256(content).hexdigest()))
         finally:
             copy.close()
-        self.assertEqual(self.version(migrated.db), 2)
+        self.assertEqual(self.version(migrated.db), server.SCHEMA_VERSION)
         self.assertEqual(migrated.list(), expected_records)
         self.assertEqual(migrated.trash(), expected_trash)
         self.assertEqual(migrated.folder_receipt(receipt), imported)

@@ -23,12 +23,14 @@ from datetime import date, datetime, timezone
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from sys import float_info
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 STATUSES = ("待补全", "已记录", "待表征", "已完成")
 KINDS = ("XRD", "NMR", "TEM", "SEM", "XPS", "DFT", "其他")
 CONDITION_FIELDS = ("precursor", "solvent", "ligand", "temperature", "duration")
+PROJECT_BUILTINS = ("precursor", "temperature", "duration", "materials")
 NUMERIC_CONDITIONS = {"temperature": (-273.15, 2500), "duration": (0, 100000)}
 EMPTY_RESULT = {"phases": [], "morphologies": [], "confirmation": "", "conclusion": "", "evidence_ids": []}
 RESULT_LIST_ERROR = "物相和形貌各最多 20 项，每项最多 80 个字符；证据附件最多 100 个。"
@@ -55,7 +57,7 @@ OUTCOMES = ("", "not_measured", "measurement_failed", "no_target", "measured")
 EMPTY_SHARED_CONDITIONS = {"precursors": [], "temperature": None,
                            "materials": {"solvents": [], "material_amounts": []}}
 # Bump when the database layout changes; older programs refuse catalogs written by newer ones.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FILE_FIELDS = ("id", "experiment_id", "name", "kind", "size", "sha256", "source", "created_at")
 STALE_RECORD = "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"
 ARCHIVED_ATTACHMENTS = "已归档的记录不能修改附件，请先恢复记录。"
@@ -362,7 +364,7 @@ def validate(payload):
 
 def lab_text(value, maximum, required=False):
     if (not isinstance(value, str) or len(value) > maximum or
-            any(ord(char) < 32 for char in value) or (required and not value.strip())):
+            any(ord(char) < 32 or 0xd800 <= ord(char) <= 0xdfff for char in value) or (required and not value.strip())):
         raise Problem("模板或样品扩展字段格式不正确。")
     return value.strip()
 
@@ -395,6 +397,100 @@ def validate_template(payload):
         fields.append(dict(key=str(index), label=label, section=section, type=kind,
                            unit=unit, options=options, required=required))
     return {"name": name, "fields": fields}
+
+
+def key_field_identity(field):
+    return field["section"], field["label"].casefold()
+
+
+def key_field_name(field):
+    return f"key:{field['section']}:{field['label']}"
+
+
+def template_field(template, identity):
+    return next((field for field in template["fields"] if key_field_identity(field) == identity), None) if template else None
+
+
+def valid_settings_text(value, maximum):
+    return (isinstance(value, str) and len(value) <= maximum
+            and not re.search(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]", value))
+
+
+def validate_project_settings(payload, template):
+    invalid = Problem("项目设置格式不正确。")
+    if not isinstance(payload, dict) or set(payload) - {"builtin", "key_fields", "phase_presets"}:
+        raise invalid
+    builtin, key_fields, phases = payload.get("builtin", {}), payload.get("key_fields", []), payload.get("phase_presets", [])
+    if not isinstance(builtin, dict) or set(builtin) - set(PROJECT_BUILTINS):
+        raise invalid
+    settings = {"builtin": {}, "key_fields": [], "phase_presets": []}
+    for field in PROJECT_BUILTINS:
+        entry = builtin.get(field, {})
+        if not isinstance(entry, dict) or set(entry) - {"enabled", "label"}:
+            raise invalid
+        enabled, label = entry.get("enabled", True), entry.get("label", {})
+        if (type(enabled) is not bool or not isinstance(label, dict) or set(label) - {"zh", "en"}
+                or any(not valid_settings_text(value, 40) for value in label.values())):
+            raise invalid
+        settings["builtin"][field] = {"enabled": enabled, "label": {lang: label.get(lang, "").strip() for lang in ("zh", "en")}}
+    if not isinstance(key_fields, list) or len(key_fields) > 8:
+        raise Problem("关键字段最多支持 8 项。")
+    seen = set()
+    for key in key_fields:
+        if not isinstance(key, dict) or set(key) - {"section", "label", "check_missing"}:
+            raise invalid
+        section, label, check_missing = key.get("section"), key.get("label"), key.get("check_missing", False)
+        field = (template_field(template, (section, label.strip().casefold()))
+                 if section in ("condition", "result") and valid_settings_text(label, 80) else None)
+        if not field:
+            raise Problem("关键字段必须来自当前实验模板。")
+        identity = key_field_identity(field)
+        if identity in seen:
+            raise Problem("关键字段不能重复。")
+        if type(check_missing) is not bool:
+            raise invalid
+        seen.add(identity)
+        settings["key_fields"].append({"section": section, "label": field["label"], "check_missing": check_missing})
+    if not isinstance(phases, list) or len(phases) > 20 or any(not valid_settings_text(tag, 80) or not tag.strip() for tag in phases):
+        raise Problem("物相预设最多支持 20 项，每项最多 80 个字符。")
+    settings["phase_presets"] = [tag.strip() for tag in phases]
+    if len({tag.casefold() for tag in settings["phase_presets"]}) != len(phases):
+        raise Problem("物相预设不能重复。")
+    return settings
+
+
+def project_settings_info(settings, revision, template):
+    fields = []
+    for key in settings["key_fields"]:
+        field = template_field(template, key_field_identity(key)) or {}
+        fields.append({**key, "available": bool(field), "type": field.get("type", ""),
+                       "unit": field.get("unit", ""), "options": field.get("options", [])})
+    return {"settings": settings, "revision": revision, "fields": fields}
+
+
+def resolve_key_field(template, details, info):
+    if not info or not info["available"] or not template or template["revision"] != details.get("template_revision"):
+        return None, None
+    field = template_field(template, key_field_identity(info))
+    if field is None or field["type"] != info["type"]:
+        return None, None
+    return field, details.get("values", {}).get(field["key"])
+
+
+def validate_template_value(field, value):
+    kind = field["type"]
+    if kind == "number":
+        if type(value) not in (int, float) or not -float_info.max <= value <= float_info.max:
+            raise Problem("数值字段必须是有限数字。")
+    elif kind == "text":
+        return lab_text(value, 250, required=True)
+    elif kind == "single":
+        if value not in field["options"]:
+            raise Problem("请选择模板中已有的选项。")
+    elif (not isinstance(value, list) or not value or len(value) > len(field["options"])
+          or any(option not in field["options"] for option in value) or len(set(value)) != len(value)):
+        raise Problem("请选择模板中已有的选项。")
+    return value
 
 
 def missing_template_fields(template, details, section):
@@ -607,6 +703,9 @@ class Store:
                 db.execute("ALTER TABLE review_items ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1))")
             db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT OR IGNORE INTO app_settings VALUES ('catalog_id', ?)", (json.dumps(uuid.uuid4().hex),))
+            db.execute("""CREATE TABLE IF NOT EXISTS project_settings (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id), settings TEXT NOT NULL, revision INTEGER NOT NULL
+            )""")
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             if rebuild_files:
                 db.commit()
@@ -666,8 +765,16 @@ class Store:
                 aliases.append({"label": entry["label"].strip()[:250],
                                 "aliases": [name.strip()[:250] for name in names if isinstance(name, str) and name.strip()][:50]})
         presets = local.get("phase_presets") if isinstance(local.get("phase_presets"), dict) else {}
-        phases = {project: [tag.strip()[:80] for tag in tags if isinstance(tag, str) and tag.strip()][:20]
-                  for project, tags in presets.items() if isinstance(project, str) and isinstance(tags, list)}
+        phases = {}
+        for project, tags in presets.items():
+            if isinstance(tags, list):
+                unique = {}
+                for tag in tags:
+                    if isinstance(tag, str):
+                        tag = tag.strip()[:80]
+                        if tag and valid_settings_text(tag, 80):
+                            unique.setdefault(tag.casefold(), tag)
+                phases[project] = list(unique.values())[:20]
         return {"precursor_aliases": aliases[:200], "phase_presets": phases, "notebook_prefixes": sorted(NOTEBOOK_PREFIXES)}
 
     def notebook_prefixes(self):
@@ -848,6 +955,41 @@ class Store:
             db.execute("INSERT INTO template_versions VALUES (?,?,?)", (project_id, revision + 1, json.dumps(definition, ensure_ascii=False)))
         return {**definition, "revision": revision + 1}
 
+    def project_settings(self, db, project_id, legacy_phases=()):
+        row = db.execute("SELECT settings, revision FROM project_settings WHERE project_id=?", (project_id,)).fetchone()
+        settings, revision = (json.loads(row["settings"]), row["revision"]) if row else (
+            validate_project_settings({"phase_presets": list(legacy_phases)}, None), 0)
+        return project_settings_info(settings, revision, self.project_template(db, project_id))
+
+    def project_settings_map(self, db, legacy_phases):
+        return {row["id"]: self.project_settings(db, row["id"], legacy_phases.get(row["id"], []))
+                for row in db.execute("SELECT id FROM projects ORDER BY rowid")}
+
+    def get_project_settings(self, project_id):
+        with self.lock, self.connect() as db:
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise Problem("找不到该项目。", 404)
+            return self.project_settings(db, project_id, self.conventions()["phase_presets"].get(project_id, []))
+
+    def save_project_settings(self, project_id, payload):
+        if not isinstance(payload, dict) or type(payload.get("revision")) is not int or payload["revision"] < 0:
+            raise Problem("项目设置格式不正确。")
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise Problem("找不到该项目。", 404)
+            row = db.execute("SELECT revision FROM project_settings WHERE project_id=?", (project_id,)).fetchone()
+            revision = row["revision"] if row else 0
+            if payload["revision"] != revision:
+                raise Problem("项目设置已在其他窗口修改，请刷新后再保存。", 409)
+            template = self.project_template(db, project_id)
+            settings = validate_project_settings(payload.get("settings"), template)
+            revision += 1
+            db.execute("""INSERT INTO project_settings VALUES (?,?,?)
+                          ON CONFLICT(project_id) DO UPDATE SET settings=excluded.settings, revision=excluded.revision""",
+                       (project_id, json.dumps(settings, ensure_ascii=False), revision))
+            return project_settings_info(settings, revision, template)
+
     def check_required_fields(self, db, project_id, details, status):
         if status != STATUSES[-1] or not details.get("template_revision"):
             return
@@ -869,23 +1011,7 @@ class Store:
         fields = {field["key"]: field for field in template["fields"]} if template else {}
         if set(values) - set(fields):
             raise Problem("字段与所选模板版本不匹配。", 409)
-        clean = {}
-        for key, value in values.items():
-            field = fields[key]
-            kind = field["type"]
-            if kind == "number":
-                if type(value) not in (int, float) or not -1e100 <= value <= 1e100:
-                    raise Problem("数值字段必须是有限数字。")
-            elif kind == "text":
-                value = lab_text(value, 250, required=True)
-            elif kind == "single":
-                if value not in field["options"]:
-                    raise Problem("请选择模板中已有的选项。")
-            else:
-                if (not isinstance(value, list) or not value or len(value) > len(field["options"])
-                        or any(option not in field["options"] for option in value) or len(set(value)) != len(value)):
-                    raise Problem("请选择模板中已有的选项。")
-            clean[key] = value
+        clean = {key: validate_template_value(fields[key], value) for key, value in values.items()}
         parent_id = lab_text(details.get("parent_id", ""), 32)
         treatment = lab_text(details.get("treatment", ""), 250)
         outcome = details.get("outcome", "")
@@ -1054,13 +1180,14 @@ class Store:
         return result
 
     def review_list(self):
-        records = self.list()
-        by_id = {row["id"]: row for row in records}
-        with self.connect() as db:
+        with self.lock, self.connect() as db:
+            records = self.list()
+            settings = self.project_settings_map(db, {})
             sources = {}
             for row in db.execute("SELECT r.*,s.name FROM record_sources r JOIN review_sources s ON s.id=r.source_id"):
                 sources.setdefault(row["record_id"], []).append({"label": row["name"] + " · p. " + row["page"], "source_id": row["source_id"], "value": row["caption"]})
             items = [dict(row) for row in db.execute("SELECT * FROM review_items ORDER BY created_at, rowid")]
+        by_id = {row["id"]: row for row in records}
         for item in items:
             item["sources"] = json.loads(item["sources"])
             record = by_id.get(item["record_id"])
@@ -1082,13 +1209,25 @@ class Store:
                 missing.remove("temperature")
             if not record_materials(record) and extra.get("Reaction medium") != "Solvent-free":
                 missing.append("materials")
-            if record.get("template"):
-                missing = missing_template_fields(record["template"], record.get("lab_data", {}), "condition")
+            project = settings[record["project_id"]]
+            details, template = record.get("lab_data", {}), record.get("template")
+            if template:
+                missing = missing_template_fields(template, details, "condition")
+            else:
+                missing = [field for field in missing if project["settings"]["builtin"][field]["enabled"]]
             base = {"record_id": record["id"], "project_id": record["project_id"], "experiment_no": record["experiment_no"],
                     "sample_id": record["sample_id"], "record_revision": record["revision"], "sources": sources.get(record["id"], []),
                     "status": "pending", "resolution": "", "generated": True, "field": "", "revision": 0}
             if missing:
                 items.append({**base, "id": "conditions-" + record["id"], "kind": "missing_conditions", "title": "缺少实验条件", "missing": missing})
+            for info in project["fields"]:
+                if not info["check_missing"] or (info["section"] == "result" and details.get("outcome") in OUTCOMES[1:4]):
+                    continue
+                _, value = resolve_key_field(template, details, info)
+                if value is None:
+                    field = key_field_name(info)
+                    items.append({**base, "id": "conditions-" + record["id"] + ":" + field, "field": field,
+                                  "kind": "missing_conditions", "title": f"缺少关键字段：{info['label']}", "missing": [info["label"]]})
             usable = [file for file in record["files"] if not any(marker in file["name"] for marker in ("-empty-only.zip", "-missing.json")) and file["size"] > 0 and (self.files / file["id"]).is_file()]
             if not usable:
                 items.append({**base, "id": "data-" + record["id"], "kind": "missing_data", "title": "数据附件待补充", "missing": []})
@@ -1107,19 +1246,19 @@ class Store:
 
     def add_review(self, payload):
         if isinstance(payload, dict) and payload.get("issue_id"):
-            existing = next((item for item in self.review_list()["items"] if item["id"] == payload["issue_id"]), None)
-            if not existing:
-                raise Problem("待核对项已变化，请刷新后再处理。", 409)
-            if not existing["generated"]:
-                return {"id": existing["id"], "revision": existing["revision"]}
-            now = timestamp()
             with self.lock, self.connect() as db:
+                existing = next((item for item in self.review_list()["items"] if item["id"] == payload["issue_id"]), None)
+                if not existing:
+                    raise Problem("待核对项已变化，请刷新后再处理。", 409)
+                if not existing["generated"]:
+                    return {"id": existing["id"], "revision": existing["revision"]}
+                now = timestamp()
                 db.execute("BEGIN IMMEDIATE")
                 record = db.execute("SELECT revision FROM experiments WHERE id=?", (existing["record_id"],)).fetchone()
                 if record["revision"] != existing["record_revision"]:
                     raise Problem("样品已有后续修改，请刷新后再核对。", 409)
                 db.execute("INSERT OR IGNORE INTO review_items(id,record_id,project_id,experiment_no,kind,field,title,sources,created_at,updated_at,automatic) VALUES (?,?,?,?,?,?,?,?,?,?,1)",
-                           (existing["id"], existing["record_id"], existing["project_id"], existing["experiment_no"], existing["kind"], "", existing["title"], json.dumps(existing["sources"], ensure_ascii=False), now, now))
+                           (existing["id"], existing["record_id"], existing["project_id"], existing["experiment_no"], existing["kind"], existing["field"], existing["title"], json.dumps(existing["sources"], ensure_ascii=False), now, now))
             return {"id": existing["id"], "revision": 1}
         if not isinstance(payload, dict) or not isinstance(payload.get("record_id"), str) or not isinstance(payload.get("title"), str) or not 1 <= len(payload["title"].strip()) <= 250 or "\x00" in payload["title"]:
             raise Problem("请填写待核对内容，最多 250 个字符。")
@@ -1502,6 +1641,28 @@ class Store:
             self.log_history(db, before_rows, "status")
         return {"ok": True, "updated": len(items)}
 
+    def resolve_bulk_key_fields(self, db, rows, actions):
+        projects = {}
+        for project in {row["project_id"] for row in rows.values()}:
+            projects[project] = {key_field_identity(info): info for info in self.project_settings(db, project)["fields"]}
+        details = {record_id: json.loads(row["lab_data"]) for record_id, row in rows.items()}
+        versions = {record_id: (row["project_id"], details[record_id].get("template_revision")) for record_id, row in rows.items()}
+        templates = {(project, revision): self.project_template(db, project, revision)
+                     for project, revision in set(versions.values()) if revision}
+        resolved = {record_id: [] for record_id in rows}
+        for identity, action in actions.items():
+            missing = []
+            for record_id, row in rows.items():
+                info = projects[row["project_id"]].get(identity)
+                field, value = resolve_key_field(templates.get(versions[record_id]), details[record_id], info)
+                if field is None:
+                    missing.append(row["sample_id"])
+                else:
+                    resolved[record_id].append((info, field, value, action))
+            if missing:
+                raise Problem(f"以下样品的模板没有字段 {action['label']}：{'、'.join(missing[:10])}")
+        return resolved
+
     def bulk_update(self, payload):
         fields = {"precursor", "precursors", "temperature", "duration", "solvents", "status", "phases", "morphologies", "confirmation", "conclusion"}
         result_fields = {"phases", "morphologies", "confirmation", "conclusion"}
@@ -1517,7 +1678,25 @@ class Store:
                     type(item.get("revision")) is not int or item["id"] in ids):
                 raise Problem("批量编辑请求不正确。")
             ids.add(item["id"])
-        if not isinstance(changes, dict) or not changes or set(changes) - fields:
+        if not isinstance(changes, dict) or set(changes) - (fields | {"key_fields"}):
+            raise Problem("请至少选择一个可批量修改的字段。")
+        key_fields = changes.get("key_fields", [])
+        if not isinstance(key_fields, list) or len(key_fields) > 8:
+            raise Problem("批量编辑操作不正确。")
+        actions = {}
+        for entry in key_fields:
+            if (not isinstance(entry, dict) or set(entry) - {"section", "label", "mode", "value"}
+                    or entry.get("section") not in ("condition", "result") or not valid_settings_text(entry.get("label"), 80)
+                    or not entry["label"].strip() or entry.get("mode") not in ("set", "clear", "replace", "append")
+                    or (entry["mode"] != "clear" and "value" not in entry)):
+                raise Problem("批量编辑操作不正确。")
+            action = {**entry, "label": entry["label"].strip()}
+            identity = key_field_identity(action)
+            if identity in actions:
+                raise Problem("批量编辑操作不正确。")
+            actions[identity] = action
+        changes = {field: action for field, action in changes.items() if field != "key_fields"}
+        if not changes and not actions:
             raise Problem("请至少选择一个可批量修改的字段。")
         if {"precursor", "precursors"} <= changes.keys():
             raise Problem("批量编辑操作不正确。")
@@ -1542,10 +1721,12 @@ class Store:
                     row = db.execute("SELECT * FROM experiments WHERE id=?", (item["id"],)).fetchone()
                     if not row or row["archived"] or row["revision"] != item["revision"]:
                         raise Problem("记录已变化或已归档，未修改任何样品。请关闭批量编辑并刷新后重试。", 409)
-                    before = dict(row)
-                    before_rows[item["id"]] = dict(row)
-                    if is_dataset(before):
+                    if is_dataset(row):
                         raise Problem("批量编辑仅支持实验样品，请取消选择资料集。")
+                    before_rows[item["id"]] = row
+                resolved = self.resolve_bulk_key_fields(db, before_rows, actions) if actions else {}
+                for record_id, row in before_rows.items():
+                    before = dict(row)
                     for key in ("extra_conditions", "material_amounts", "result_summary"):
                         before[key] = json.loads(before[key])
                     before["result_summary"] = validate_result_summary(before["result_summary"])
@@ -1577,8 +1758,6 @@ class Store:
                         del after["precursors"]
                     clean = validate(after)
                     clean.setdefault("precursors", None)
-                    if "status" in columns:
-                        self.check_required_fields(db, row["project_id"], json.loads(row["lab_data"]), clean["status"])
                     json_fields = {"precursors", "solvents", "material_amounts", "result_summary"}
                     decoded = {key: json.loads(value) if key in json_fields and value is not None else value for key, value in clean.items()}
                     diff = []
@@ -1593,10 +1772,37 @@ class Store:
                             old, new = before[field], decoded[field]
                         if old != new:
                             diff.append({"field": field, "before": old, "after": new})
-                    rows.append({"id": item["id"], "revision": item["revision"], "sample_id": before["sample_id"],
+                    key_changes = resolved.get(record_id, [])
+                    if key_changes:
+                        details = json.loads(row["lab_data"])
+                        values = details.pop("values", {})
+                        for info, field, old, action in key_changes:
+                            mode = action["mode"]
+                            allowed = ("replace", "append", "clear") if field["type"] == "multi" else ("set", "clear")
+                            if mode not in allowed:
+                                raise Problem("批量编辑操作不正确。")
+                            value = None if mode == "clear" else validate_template_value(field, action["value"])
+                            if mode == "append":
+                                value = list(dict.fromkeys([*(old or []), *value]))
+                            if old == value:
+                                continue
+                            if value is None:
+                                values.pop(field["key"], None)
+                            else:
+                                values[field["key"]] = value
+                            diff.append({"field": key_field_name(info), "before": old, "after": value})
+                            columns.add("lab_data")
+                        if values:
+                            details["values"] = values
+                        if "lab_data" in columns:
+                            clean["lab_data"] = json.dumps(details, ensure_ascii=False)
+                    if "status" in columns or "lab_data" in columns:
+                        self.check_required_fields(db, row["project_id"],
+                                                   details if key_changes else json.loads(row["lab_data"]), clean["status"])
+                    rows.append({"id": record_id, "revision": row["revision"], "sample_id": before["sample_id"],
                                  "experiment_no": before["experiment_no"], "project_id": before["project_id"], "changes": diff})
                     if diff:
-                        updates.append((item["id"], {key: clean[key] for key in sorted(columns)}))
+                        updates.append((record_id, {key: clean[key] for key in sorted(columns)}))
                 if not preview:
                     now = timestamp()
                     for record_id, clean in updates:
@@ -2328,7 +2534,19 @@ class Store:
         return {"copied_files": len(pending), "copied_bytes": total_bytes}
 
 
-def export_csv(records, language="zh", *, include_template=False):
+def export_csv(records, language="zh", *, include_template=False, project_settings=None):
+    project_fields, key_columns = {}, {}
+    if project_settings:
+        records = list(records)
+        selected = {record["project_id"] for record in records}
+        for project, entry in project_settings.items():
+            if project in selected:
+                project_fields[project] = {}
+                for info in entry["fields"]:
+                    identity = key_field_identity(info)
+                    project_fields[project][identity] = info
+                    if identity not in key_columns or (info["available"] and not key_columns[identity]["available"]):
+                        key_columns[identity] = info
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     columns = [("sample_id", "样品编号"), ("series", "实验系列"), ("experiment_date", "实验日期"),
@@ -2341,7 +2559,6 @@ def export_csv(records, language="zh", *, include_template=False):
         "自定义条件 (JSON)", "附件 (JSON)", "添加量 (JSON)", "物相", "形貌", "结果确认", "结果结论", "结果摘要 (JSON)", "已归档", "溶剂 / 配体 (JSON)"]
     if include_template:
         headings += ["Sample details (JSON)", "Template (JSON)"] if english else ["样品扩展数据 (JSON)", "实验模板 (JSON)"]
-    writer.writerow(headings)
     statuses = dict(zip(STATUSES, ("Incomplete", "Recorded", "Awaiting analysis", "Complete")))
     confirmations = {"": "", "pending": "Pending confirmation" if english else "待确认", "confirmed": "Confirmed" if english else "已确认"}
 
@@ -2351,6 +2568,10 @@ def export_csv(records, language="zh", *, include_template=False):
             return "'" + value
         return value
 
+    for info in key_columns.values():
+        label, unit = info["label"], info["unit"]
+        headings.append(cell(f"{label} ({unit})" if unit else label))
+    writer.writerow(headings)
     for record in records:
         result = {**EMPTY_RESULT, **record.get("result_summary", {})}
         row = [cell(material_summary(record) if key == "solvent" else statuses.get(record[key], record[key]) if english and key == "status" else record[key]) for key, _ in columns] + [
@@ -2361,6 +2582,15 @@ def export_csv(records, language="zh", *, include_template=False):
             json.dumps(record_materials(record), ensure_ascii=False)]
         if include_template:
             row.extend(json.dumps(record.get(field, {}), ensure_ascii=False) for field in ("lab_data", "template"))
+        infos = project_fields.get(record.get("project_id"), {})
+        for identity, column in key_columns.items():
+            info = infos.get(identity)
+            field, value = resolve_key_field(record.get("template"), record.get("lab_data", {}), info)
+            if isinstance(value, list):
+                value = " / ".join(value)
+            elif value is not None and field["type"] == "number" and (field["unit"] != info["unit"] or field["unit"] != column["unit"]):
+                value = f"{value} {field['unit']}".rstrip()
+            row.append(cell(value))
         writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
 
@@ -2509,6 +2739,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Origin") not in {"http://" + host for host in self.allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
                 raise Problem("请从本机实验数据目录页面操作。", 403)
         query = parse_qs(self.url.query, keep_blank_values=self.command == "POST" and path.endswith("/files"))
+        settings_match = re.fullmatch(r"/api/projects/([^/]+)/settings", path)
+        if settings_match and self.command == "GET":
+            return self.send_json(store.get_project_settings(settings_match[1]))
+        if settings_match and self.command == "PUT":
+            return self.send_json(store.save_project_settings(settings_match[1], self.json_body()))
         if self.command == "GET":
             if path == "/":
                 if self.scoped:
@@ -2542,8 +2777,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_file(archive_path, "application/zip", PACKAGE_NAME + "-source.zip")
             if path == "/api/experiments":
                 with store.lock, store.connect() as db:
+                    conventions = store.conventions()
+                    project_settings = store.project_settings_map(db, conventions["phase_presets"])
+                    conventions["phase_presets"].update({project: entry["settings"]["phase_presets"]
+                                                         for project, entry in project_settings.items() if entry["revision"]})
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
-                              "translations": store.local_translations(), "conventions": store.conventions(),
+                              "translations": store.local_translations(), "conventions": conventions,
+                              "project_settings": project_settings,
                               "trash_count": store.trash_count(db), "category_counts": store.category_counts(db)}
                 return self.send_json(result)
             if path == "/api/trash":
@@ -2582,8 +2822,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem("附件文件缺失，请检查数据目录或备份。", 404)
             if path == "/api/export.csv":
                 selected = set(query.get("ids", [""])[0].split(","))
-                records = [record for record in store.list() if record["id"] in selected]
-                data = export_csv(records, query.get("lang", ["zh"])[0])
+                with store.lock, store.connect() as db:
+                    records = [record for record in store.list() if record["id"] in selected]
+                    project_settings = store.project_settings_map(db, {})
+                data = export_csv(records, query.get("lang", ["zh"])[0], project_settings=project_settings)
                 self.send_headers(200, "text/csv; charset=utf-8", len(data), "Experiment-data.csv")
                 return self.wfile.write(data)
             if path == "/api/experiments/share.zip":
