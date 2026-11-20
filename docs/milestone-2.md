@@ -115,3 +115,54 @@ comparison rows, bulk edit and the editor/detail emphasis.
 
 Renaming or deleting projects, per-project units for built-in numbers, moving built-in data into template fields,
 onboarding and imports (M3), packaging (M4).
+
+## 5. Review amendments (binding; supersede earlier text where they conflict)
+
+### 5.1 Identity and normalization (server and browser must agree)
+
+- Key-field and template-label matching uses `label.lower()` in Python and `label.toLowerCase()` in JS (no
+  `casefold`), so both sides resolve identically. `KeyFieldInfo` adds `"id": "key:{section}:{label.lower()}"`; the
+  front end uses this id for lookups, settings matching and comparison grouping. Review items for key fields use the
+  same lower-cased id in `field` (title keeps the template spelling).
+- Precursor-alias normalization on both sides: lower-case, then remove every character of the JS `\s` class
+  (`	
+`, space, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF). Validation
+  rejects two labels that normalize to the same alias.
+
+### 5.2 Disabled built-ins are never written by indirect paths
+
+- Shared-condition saves update only fields enabled for the project; defaults and per-sample overrides of disabled
+  fields are left exactly as they are.
+- Bulk edits that change a built-in field disabled in the project of any selected record → 400
+  `以下样品所在项目已关闭字段 {label}：{samples}` and nothing changes.
+
+### 5.3 Units in bulk numeric key-field edits
+
+- A number `set` must include `"unit"` (the unit shown, possibly `""`). Every target record's field unit must equal
+  it, else 400 `以下样品的单位与所填单位不同：{samples}` and nothing changes. Preview changes for number key fields
+  carry `"unit"` (the record's field unit).
+
+### 5.4 Notebook-prefix changes merge experiment groups safely
+
+- When a prefix change makes two experiment keys collapse into one, the merged group's shared defaults come from the
+  group that has stored defaults (if both do, keep the one updated most recently and keep per-sample overrides from
+  both), so no sample loses its override protection. Apply this both on `PUT /api/local-catalog` and when the running
+  service notices that the file changed on disk.
+
+### 5.5 Local catalog file robustness
+
+- If `local-catalog.json` exists but cannot be parsed, `GET /api/local-catalog` returns 200
+  `{"catalog": <empty>, "revision": <sha of bytes>, "error": "local-catalog.json 无法解析，请先修复文件或删除后再编辑。"}` and
+  `PUT` returns 409 with that message; the file is never replaced while unparsable.
+- `PUT` re-reads the bytes immediately before the atomic replace and returns 409
+  `本地约定已在其他窗口修改，请刷新后再保存。` if they changed after the revision check.
+- The running service re-reads the file when its bytes change (checked on `GET /api/experiments` and before any
+  grouping-dependent write), so translations **and** notebook prefixes follow hand edits.
+- A folder backup removes `data/local-catalog.json` from the mirror when the catalog has none.
+
+### 5.6 Review-queue stability
+
+- Switching a built-in off and on again, or a casing-only rename of a promoted template field, must not create new
+  pending items for issues that were already resolved or dismissed: fingerprints of built-in items do not include the
+  set of enabled fields, and key-field fingerprints use the lower-cased identity.
+- Key fields that are no longer available in the current template (`available: false`) generate no automatic items.
