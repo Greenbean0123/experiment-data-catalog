@@ -6,10 +6,10 @@
   <meta name="theme-color" content="#ffffff">
   <title>实验数据目录 · 实验管理</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%232f8ee5'/%3E%3Cpath d='M10 15h11l4 4h13v18H10z' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/newapi-theme.css">
-  <link rel="stylesheet" href="/style.css">
-  <script src="/i18n.js" defer></script>
-  <script src="/app.js" defer></script>
+  <link rel="stylesheet" href="newapi-theme.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="i18n.js" defer></script>
+  <script src="app.js" defer></script>
 </head>
 <body>
   <svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -37,7 +37,7 @@
   <a class="skip-link" href="#main-content" data-i18n="跳到实验列表">跳到实验列表</a>
   <header class="app-header">
     <button id="toggle-sidebar" class="icon-button" aria-controls="sidebar" aria-expanded="true" data-i18n-aria-label="折叠或展开侧栏" title="折叠或展开侧栏" data-i18n-title="折叠或展开侧栏"><svg class="icon"><use href="#i-panel"/></svg></button>
-    <a class="brand" href="/" data-i18n-aria-label="实验数据目录" data-i18n-title="实验数据目录"><svg class="brand-icon"><use href="#i-flask"/></svg><strong data-i18n="实验数据目录">实验数据目录</strong><span class="version">v0.4</span></a>
+    <a class="brand" href="./" data-i18n-aria-label="实验数据目录" data-i18n-title="实验数据目录"><svg class="brand-icon"><use href="#i-flask"/></svg><strong data-i18n="实验数据目录">实验数据目录</strong><span class="version">v0.4</span></a>
     <div class="global-search" role="search"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input id="global-search" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="global-results" aria-keyshortcuts="Control+k Meta+k" placeholder="搜索实验或样品…" data-i18n-placeholder="搜索实验或样品…" aria-label="跳转到实验" data-i18n-aria-label="跳转到实验"><kbd aria-hidden="true">Ctrl + K</kbd><div id="global-results" class="global-results" role="listbox" hidden></div></div>
     <div class="header-tools">
       <span class="local-chip"><span class="local-dot"></span><span data-i18n="本地存储">本地存储</span></span>
@@ -154,7 +154,7 @@
           </div>
         </div>
       </section>
-      <footer class="page-footer"><span><span data-i18n="实验数据目录">实验数据目录</span> <span class="footer-separator">·</span><span data-i18n="界面基于">界面基于</span> <a href="https://github.com/QuantumNous/new-api" target="_blank" rel="noreferrer">New API</a> <span class="footer-separator">·</span><a href="/notices.txt" target="_blank" rel="noreferrer">AGPL-3.0</a> <span class="footer-separator">·</span><a href="/api/source.zip" data-i18n="下载源码">下载源码</a></span><span id="sync-state" role="status" data-i18n="读取中">读取中</span></footer>
+      <footer class="page-footer"><span><span data-i18n="实验数据目录">实验数据目录</span> <span class="footer-separator">·</span><span data-i18n="界面基于">界面基于</span> <a href="https://github.com/QuantumNous/new-api" target="_blank" rel="noreferrer">New API</a> <span class="footer-separator">·</span><a href="notices.txt" target="_blank" rel="noreferrer">AGPL-3.0</a> <span class="footer-separator">·</span><a href="api/source.zip" data-i18n="下载源码">下载源码</a></span><span id="sync-state" role="status" data-i18n="读取中">读取中</span></footer>
     </div>
   </main>
   <dialog id="editor" class="editor-dialog" aria-labelledby="editor-title">
@@ -337,7 +337,7 @@
       <section class="backup-option">
         <h3 data-i18n="下载完整 ZIP">下载完整 ZIP</h3>
         <p class="field-help" data-i18n="生成单个 ZIP 文件后才开始下载，数据量大时需要等待数分钟，并占用约两倍数据量的临时空间。">生成单个 ZIP 文件后才开始下载，数据量大时需要等待数分钟，并占用约两倍数据量的临时空间。</p>
-        <a id="backup-zip" class="button" href="/api/backup.zip" download data-i18n="下载完整 ZIP">下载完整 ZIP</a>
+        <a id="backup-zip" class="button" href="api/backup.zip" download data-i18n="下载完整 ZIP">下载完整 ZIP</a>
       </section>
     </div>
     <div class="dialog-footer workflow-actions"><button id="backup-done" data-i18n="关闭">关闭</button><button id="start-backup" class="primary" data-i18n="开始备份">开始备份</button></div>

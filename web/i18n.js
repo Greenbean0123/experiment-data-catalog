@@ -2,6 +2,12 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "附件修改尚未保存，确定放弃吗？": "The attachment changes are not saved. Discard them?",
+    "附件已被移动、删除或样品已归档，请关闭窗口后核对。": "The attachment was moved, deleted or its sample archived. Close this window and check.",
+    "附件信息已在其他窗口更新，已显示最新内容并保留你的修改。请核对后再保存。": "The attachment was updated in another window. The latest details are shown and your edits are kept. Check them before saving.",
+    "其中 {count} 个在回收站，也会改为接收类别。": "{count} of them are in the trash and will move to the receiving category too.",
+    "另有 {size} 暂时无法从磁盘删除，下次启动时会重试。": "{size} could not be removed from disk yet and will be retried at the next start.",
+    "恢复用的新文件名尚未提交，确定放弃吗？": "The new file name for restoring is not submitted. Discard it?",
     "附件操作请求不正确。": "Invalid attachment request.",
     "请确认永久删除所选附件。": "Confirm permanent deletion of the selected attachments.",
     "回收站": "Trash",

@@ -359,7 +359,8 @@ function initialize() {
   let dashboardTab = "overview";
   let backupStatus = null, backupTimer = null, backupStarting = false;
   let trashCount = 0, trashItems = [], trashTotal = 0, trashBusy = false, trashSelected = new Set(), trashRenaming = "";
-  let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false;
+  let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false, categoryCounts = null;
+  let trashLoadVersion = 0, trashScope = null, trashDrafts = new Map();
   let listScrolledTo = "";
   try { $("experiment-order").value = localStorage.getItem("catalog-experiment-order") === "desc" ? "desc" : "asc"; } catch {}
   try { projectId = localStorage.getItem("catalog-project") ?? "default"; } catch {}
@@ -436,7 +437,7 @@ function initialize() {
     }
     const query = new URLSearchParams({ids: rows.map(row => row.id).join(","),
       revisions: rows.map(row => row.revision).join(","), lang: language});
-    link.href = "/api/experiments/share.zip?" + query;
+    link.href = "api/experiments/share.zip?" + query;
     link.textContent = t("导出实验包（{count} 条样品）", {count: rows.length});
     link.title = t("导出所选实验的全部同状态样品与附件");
   }
@@ -673,7 +674,7 @@ function initialize() {
     $("workspace-file").disabled = !filtered.length;
     const file = filtered.find(file => file.id === workspaceFile);
     $("workspace-download").hidden = !file;
-    if (file) $("workspace-download").href = `/api/files/${file.id}`; else $("workspace-download").removeAttribute("href");
+    if (file) $("workspace-download").href = `api/files/${file.id}`; else $("workspace-download").removeAttribute("href");
     $("workspace-file-meta").textContent = file ? `${file.sample} · ${sizeText(file.size)}${file.source ? " · " + t("来源副本：") + file.source : ""}` : "";
     $("workspace-notes").innerHTML = chosen.map(record => {
       const translated = recordLabel(record, "notes");
@@ -686,7 +687,7 @@ function initialize() {
 
   async function previewData(id) {
     if (previewCache.has(id)) return previewCache.get(id);
-    const data = await api(`/api/files/${id}/preview`);
+    const data = await api(`api/files/${id}/preview`);
     previewCache.set(id, data);
     if (previewCache.size > 16) previewCache.delete(previewCache.keys().next().value);
     return data;
@@ -790,7 +791,7 @@ function initialize() {
     activePlot = null; previewFile = file;
     area.innerHTML = "";
     if (!file) { area.textContent = t("尚未关联数据文件。"); return; }
-    const url = `/api/files/${file.id}/preview`;
+    const url = `api/files/${file.id}/preview`;
     if (/\.(png|jpe?g|gif|webp)$/i.test(file.name)) {
       const img = document.createElement("img");
       img.alt = file.name; img.src = url;
@@ -874,7 +875,7 @@ function initialize() {
   function sampleRow(record, dataset = false) {
     const conditions = [["前驱体", record.precursor], ["温度", record.temperature === null ? "" : `${record.temperature} °C`],
       ["时间", record.duration === null ? "" : `${record.duration} min`], ["溶剂 / 配体", materialSummary(record)]];
-    const files = record.files.slice(0, 2).map(file => `<a class="inline-file" href="/api/files/${file.id}" download title="${escape(file.name)}"><span class="data-tag">${kindText(file.kind)}</span><span>${escape(file.name)}</span><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg></a>`).join("");
+    const files = record.files.slice(0, 2).map(file => `<a class="inline-file" href="api/files/${file.id}" download title="${escape(file.name)}"><span class="data-tag">${kindText(file.kind)}</span><span>${escape(file.name)}</span><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg></a>`).join("");
     return `<tr class="${dataset ? "dataset-row" : "sample-row"} ${selected.has(record.id) ? "selected" : ""}">
       <td class="check-cell"><input type="checkbox" data-select="${record.id}" aria-label="${escape(t("选择 {sample}", {sample: recordLabel(record, "sample_id")}))}" ${selected.has(record.id) ? "checked" : ""}></td>
       <td><button class="sample-link" data-open="${record.id}" title="${escape(record.sample_id)}">${escape(recordLabel(record, "sample_id"))}</button><span class="subline">${dataset ? t("资料集") + " · " : ""}${escape(recordLabel(record, "series") || t("未分类"))}${record.experiment_date ? " · " + escape(record.experiment_date) : ""}</span></td>
@@ -888,7 +889,7 @@ function initialize() {
 
   async function load() {
     const version = ++loadVersion;
-    const result = await api("/api/experiments");
+    const result = await api("api/experiments");
     if (version !== loadVersion) return;
     records = result.experiments;
     projects = result.projects;
@@ -899,6 +900,7 @@ function initialize() {
     configureCatalog(result.conventions);
     if (result.backup && !backupTimer) { backupStatus = result.backup; renderBackupBadge(); }
     if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
+    categoryCounts = result.category_counts && typeof result.category_counts === "object" ? result.category_counts : null;
     if (projectId && !projects.some(project => project.id === projectId)) projectId = "default";
     loaded = true;
     loadError = null;
@@ -1006,13 +1008,13 @@ function initialize() {
       let saved;
       try {
         const payload = {records: [{id: record.id, revision: record.revision}], changes, preview: false};
-        const response = await api("/api/experiments/bulk", {method: "POST", body: JSON.stringify(payload)});
+        const response = await api("api/experiments/bulk", {method: "POST", body: JSON.stringify(payload)});
         saved = response.records?.find(item => item.id === record.id);
         if (!saved) throw new Error("暂未确认物相是否保存，请核对当前物相。");
       } catch (error) {
         if (error.status && error.status < 500) throw error;
         // Check for a committed write when its response was lost.
-        const latest = await api("/api/experiments").catch(() => null);
+        const latest = await api("api/experiments").catch(() => null);
         const candidate = latest?.experiments?.find(item => item.id === record.id);
         if (candidate?.revision !== record.revision + 1 ||
             JSON.stringify(resultSummary(candidate).phases) !== JSON.stringify(phases)) {
@@ -1089,7 +1091,7 @@ function initialize() {
     if (!result.confirmation) return metrics || `<p class="field-help">${text("尚未记录结果。")}</p>`;
     const tags = values => values.length ? values.map(value => `<span class="result-chip">${escape(value)}</span>`).join("") : display("");
     const evidence = record.files.filter(file => result.evidence_ids.includes(file.id));
-    return metrics + `<dl class="result-grid"><div><dt>${text("物相")}</dt><dd>${tags(result.phases)}</dd></div><div><dt>${text("形貌")}</dt><dd>${tags(result.morphologies)}</dd></div><div><dt>${text("结果确认")}</dt><dd><span class="status ${result.confirmation === "confirmed" ? "result-confirmed" : "pending"}">${escape(resultConfirmation(record, language))}</span></dd></div></dl>${result.conclusion ? `<p class="notes result-conclusion">${escape(result.conclusion)}</p>` : ""}<div class="result-evidence-links"><span class="field-help">${text("关联表征证据")}</span>${evidence.map(file => record.archived ? `<a class="button" href="/api/files/${file.id}" download>${escape(file.name)}</a>` : `<button type="button" class="result-evidence-link" data-result-file="${file.id}" data-result-record="${record.id}"><span class="data-tag">${kindText(file.kind)}</span><span>${escape(file.name)}</span></button>`).join("") || `<span class="muted">${text("未关联证据")}</span>`}</div>`;
+    return metrics + `<dl class="result-grid"><div><dt>${text("物相")}</dt><dd>${tags(result.phases)}</dd></div><div><dt>${text("形貌")}</dt><dd>${tags(result.morphologies)}</dd></div><div><dt>${text("结果确认")}</dt><dd><span class="status ${result.confirmation === "confirmed" ? "result-confirmed" : "pending"}">${escape(resultConfirmation(record, language))}</span></dd></div></dl>${result.conclusion ? `<p class="notes result-conclusion">${escape(result.conclusion)}</p>` : ""}<div class="result-evidence-links"><span class="field-help">${text("关联表征证据")}</span>${evidence.map(file => record.archived ? `<a class="button" href="api/files/${file.id}" download>${escape(file.name)}</a>` : `<button type="button" class="result-evidence-link" data-result-file="${file.id}" data-result-record="${record.id}"><span class="data-tag">${kindText(file.kind)}</span><span>${escape(file.name)}</span></button>`).join("") || `<span class="muted">${text("未关联证据")}</span>`}</div>`;
   }
 
   function templateValuesHtml(record, section) {
@@ -1183,7 +1185,7 @@ function initialize() {
     $(errorId).hidden = true;
     syncConditionActions();
     try {
-      await api("/api/condition-options", {method: "DELETE", body: JSON.stringify({field, name})});
+      await api("api/condition-options", {method: "DELETE", body: JSON.stringify({field, name})});
       loadVersion++;
       for (const key of field === "solvent" ? ["solvent", "ligand"] : [field]) conditionOptions[key] = (conditionOptions[key] || []).filter(value => (key === "temperature" || key === "duration" ? String(Number(value)) : value) !== name);
       if (field === "solvent") renderSolventChoices();
@@ -1210,7 +1212,7 @@ function initialize() {
       syncConditionActions();
       try {
         if (!conditionValues(field).includes(String(Number(name)))) {
-          try { await api("/api/condition-options", {method: "POST", body: JSON.stringify({field, name})}); }
+          try { await api("api/condition-options", {method: "POST", body: JSON.stringify({field, name})}); }
           catch (error) { if (error.message !== "该名称已存在，请直接选择或使用其他名称。") throw error; }
           (conditionOptions[field] ||= []).push(String(Number(name)));
           loadVersion++;
@@ -1309,13 +1311,13 @@ function initialize() {
       try {
         if (!existing) {
           try {
-            await api("/api/condition-options", {method: "POST", body: JSON.stringify({field, name})});
+            await api("api/condition-options", {method: "POST", body: JSON.stringify({field, name})});
           } catch (error) {
             if (error.message !== "该名称已存在，请直接选择或使用其他名称。") {
               if (error.status && error.status < 500) throw error;
               const controller = new AbortController();
               const check = setTimeout(() => controller.abort(), 3000);
-              const latest = await api("/api/condition-options", {signal: controller.signal}).catch(() => null);
+              const latest = await api("api/condition-options", {signal: controller.signal}).catch(() => null);
               clearTimeout(check);
               if (!latest?.condition_options?.[field]?.includes(name)) throw error;
             }
@@ -1385,7 +1387,9 @@ function initialize() {
     if (deletingCategory && isCategory) {
       const count = categoryCount(deletingCategory), value = $("category-replacement").value;
       $("category-delete-title").textContent = t("删除 {kind}", {kind: I18n.dataKind(deletingCategory, language)});
-      $("category-delete-help").textContent = count ? t("该类别在所有项目（含归档）中共有 {count} 个附件。选择接收类别后删除，文件保留。", {count}) : t("该类别没有附件，删除后将从筛选和上传选项中移除。");
+      const trashed = categoryTrashed(deletingCategory);
+      $("category-delete-help").textContent = (count ? t("该类别在所有项目（含归档）中共有 {count} 个附件。选择接收类别后删除，文件保留。", {count}) : t("该类别没有附件，删除后将从筛选和上传选项中移除。"))
+        + (trashed ? " " + t("其中 {count} 个在回收站，也会改为接收类别。", {count: trashed}) : "");
       $("category-replacement-label").hidden = !count;
       $("category-replacement").innerHTML = `<option value="">${t("请选择接收类别")}</option>` + kinds.filter(kind => kind !== deletingCategory).map(kind => `<option value="${escape(kind)}">${escape(I18n.dataKind(kind, language))}</option>`).join("");
       $("category-replacement").value = value !== deletingCategory && kinds.includes(value) ? value : "";
@@ -1393,7 +1397,13 @@ function initialize() {
     if (catalogSaving) for (const control of $("catalog-form").querySelectorAll("button,input,select")) control.disabled = true;
   }
 
+  // Server counts cover every project, archived records and the trash; the local fallback only sees active files.
+  function categoryTrashed(kind) {
+    return Number(categoryCounts?.[kind]?.trashed) || 0;
+  }
   function categoryCount(kind) {
+    const counted = categoryCounts?.[kind];
+    if (counted) return (Number(counted.active) || 0) + (Number(counted.trashed) || 0);
     return records.reduce((sum, record) => sum + record.files.filter(file => file.kind === kind).length, 0);
   }
 
@@ -1431,7 +1441,7 @@ function initialize() {
     renderCatalogDialog();
     try {
       const payload = {name: $("catalog-name").value};
-      const result = await api(`/api/${catalogType}`, {method: "POST", body: JSON.stringify(payload)});
+      const result = await api(`api/${catalogType}`, {method: "POST", body: JSON.stringify(payload)});
       if (result.project) projects.push(result.project); else kinds.push(result.kind);
       renderCatalogOptions();
       chooseCatalogItem(result.project?.id || result.kind);
@@ -1466,7 +1476,7 @@ function initialize() {
     $("catalog-error").hidden = true;
     renderCatalogDialog();
     try {
-      await api("/api/categories", {method: "DELETE", body: JSON.stringify({name: deletingCategory, replacement})});
+      await api("api/categories", {method: "DELETE", body: JSON.stringify({name: deletingCategory, replacement})});
       deletingCategory = "";
       await load();
       if ($("detail").open) $("detail-content").querySelector(".files-list").innerHTML = (record => fileListHtml(record.files, !record.archived))(records.find(record => record.id === detailId));
@@ -1591,7 +1601,7 @@ function initialize() {
   }
 
   function sharedConditionsUrl(project, number) {
-    return "/api/experiment-defaults?" + new URLSearchParams({project_id: project, experiment_no: number});
+    return "api/experiment-defaults?" + new URLSearchParams({project_id: project, experiment_no: number});
   }
 
   function editorSharedUrl() {
@@ -1739,7 +1749,7 @@ function initialize() {
 
   async function persistRecord(payload) {
     try {
-      const result = await api(editId ? `/api/experiments/${editId}` : "/api/experiments", {method: editId ? "PUT" : "POST", body: JSON.stringify(payload)});
+      const result = await api(editId ? `api/experiments/${editId}` : "api/experiments", {method: editId ? "PUT" : "POST", body: JSON.stringify(payload)});
       if (result.record) {
         if (result.condition_options) conditionOptions = result.condition_options;
         return result;
@@ -1749,7 +1759,7 @@ function initialize() {
       // A response can be lost after commit; confirm identical content without retrying the write.
       if (payload.shared_token && error.status && error.status < 500) throw error;
       try {
-        const latest = await api("/api/experiments");
+        const latest = await api("api/experiments");
         if (latest.templates) templates = latest.templates;
         const record = latest.experiments.find(row => editId ? row.id === editId : row.project_id === payload.project_id && row.sample_id.toLowerCase() === payload.sample_id.trim().toLowerCase());
         if (record && recordMatchesPayload(record, payload)) {
@@ -1940,7 +1950,7 @@ function initialize() {
       if (!Object.keys(changes).length) throw new Error("请至少选择一个可批量修改的字段。");
       bulkBusy = true; syncBulkControls();
       const plan = {records: bulkTargets, changes, preview: true};
-      const preview = await api("/api/experiments/bulk", {method: "POST", body: JSON.stringify(plan)});
+      const preview = await api("api/experiments/bulk", {method: "POST", body: JSON.stringify(plan)});
       bulkPlan = plan; bulkPreview = preview;
       renderBulkReview(); showBulkStep(true);
     } catch (error) { showError("bulk-error", error.message); }
@@ -1952,12 +1962,12 @@ function initialize() {
     try {
       let response;
       try {
-        response = await api("/api/experiments/bulk", {method: "POST", body: JSON.stringify({...bulkPlan, preview: false})});
+        response = await api("api/experiments/bulk", {method: "POST", body: JSON.stringify({...bulkPlan, preview: false})});
       } catch (error) {
         if (error.status && error.status < 500) throw error;
         // A lost response can follow a commit; read back without repeating the batch write.
         try {
-          const latest = await api("/api/experiments");
+          const latest = await api("api/experiments");
           const confirmed = bulkPreview.rows.every(row => {
             const record = latest.experiments.find(record => record.id === row.id);
             return record && record.revision === row.revision + (row.changes.length ? 1 : 0) && row.changes.every(change => {
@@ -2054,7 +2064,7 @@ function initialize() {
 
   async function loadHistory(more = false) {
     const offset = more ? historyOffset : 0;
-    const result = await api(`/api/history?record_id=${encodeURIComponent(historyRecord)}&project_id=${encodeURIComponent(historyRecord ? "" : projectId)}&offset=${offset}`);
+    const result = await api(`api/history?record_id=${encodeURIComponent(historyRecord)}&project_id=${encodeURIComponent(historyRecord ? "" : projectId)}&offset=${offset}`);
     historyBatches = more ? [...historyBatches, ...result.batches] : result.batches;
     if (!more) historyFileEvents = Array.isArray(result.file_events) ? result.file_events : [];
     historyOffset = historyBatches.length; historyMore = result.has_more;
@@ -2080,7 +2090,7 @@ function initialize() {
     if (!button || workflowBusy) return;
     workflowControls(true); $("history-error").hidden = true;
     try {
-      historyDetail = await api(`/api/history/${button.dataset.historyBatch}`);
+      historyDetail = await api(`api/history/${button.dataset.historyBatch}`);
       undoPreview = null; $("undo-scope").value = historyRecord ? "record" : "batch";
       renderHistory();
     } catch (error) { showError("history-error", error.message); }
@@ -2106,7 +2116,7 @@ function initialize() {
     try {
       const payload = {preview: true};
       if (historyRecord && $("undo-scope").value === "record") payload.record_ids = [historyRecord];
-      undoPreview = await api(`/api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
+      undoPreview = await api(`api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
       renderHistory();
     } catch (error) { showError("history-error", error.message); }
     finally { workflowControls(false); }
@@ -2116,7 +2126,7 @@ function initialize() {
     const payload = {preview: false, record_ids: undoPreview.rows.map(row => row.id), revisions: undoPreview.revisions};
     workflowControls(true); $("history-error").hidden = true;
     try {
-      await api(`/api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
+      await api(`api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
       await load(); historyDetail = null; undoPreview = null; await loadHistory();
       toast(t("修改已撤销。"));
     } catch (error) {
@@ -2166,7 +2176,7 @@ function initialize() {
     if (reviewItem.kind === "folder_import" && !record) $("review-edit-record").hidden = true;
     $("review-subtitle").textContent = `${reviewItem.sample_id} · ${t(reviewItem.title)}`;
     const current = record && reviewItem.field ? `<section class="workflow-row"><h3>${t("当前记录")} · ${t(workflowFields[reviewItem.field] || reviewItem.field)}</h3><pre class="workflow-value">${escape(reviewItem.field === "solvents" ? materialSummary(record) : workflowValue(reviewItem.field, record[reviewItem.field]))}</pre></section>` : "";
-    $("review-content").innerHTML = current + `<div class="review-source-grid">${reviewItem.sources.map((source, index) => `<figure class="review-source"><figcaption>${escape(t(source.label))}</figcaption>${source.source_id ? `<a href="/api/review-sources/${source.source_id}" target="_blank" rel="noopener"><img src="/api/review-sources/${source.source_id}" alt="${escape(source.label)}" loading="lazy"></a>` : ""}<p>${escape(workflowValue(reviewItem.field, source.value))}</p>${source.candidate && canApply ? `<button data-review-candidate="${index}">${t("采用此值")}</button>` : ""}</figure>`).join("")}</div>` + (record?.files.length ? `<details><summary>${t("当前附件")}</summary><ul class="files-list">${fileListHtml(record.files)}</ul></details>` : "") + (reviewItem.resolution ? `<p class="form-hint">${escape(reviewItem.resolution)}</p>` : "");
+    $("review-content").innerHTML = current + `<div class="review-source-grid">${reviewItem.sources.map((source, index) => `<figure class="review-source"><figcaption>${escape(t(source.label))}</figcaption>${source.source_id ? `<a href="api/review-sources/${source.source_id}" target="_blank" rel="noopener"><img src="api/review-sources/${source.source_id}" alt="${escape(source.label)}" loading="lazy"></a>` : ""}<p>${escape(workflowValue(reviewItem.field, source.value))}</p>${source.candidate && canApply ? `<button data-review-candidate="${index}">${t("采用此值")}</button>` : ""}</figure>`).join("")}</div>` + (record?.files.length ? `<details><summary>${t("当前附件")}</summary><ul class="files-list">${fileListHtml(record.files)}</ul></details>` : "") + (reviewItem.resolution ? `<p class="form-hint">${escape(reviewItem.resolution)}</p>` : "");
     $("review-edit-record").textContent = t(record ? "编辑样品" : "新建实验");
     if (reviewPlan) $("review-change-preview").innerHTML = changeTable(reviewPlan.preview.changes);
   }
@@ -2181,7 +2191,7 @@ function initialize() {
     $("review-content").textContent = t("正在读取…");
     if (!$("review-dialog").open) $("review-dialog").showModal();
     workflowControls(true);
-    try { reviewItems = (await api("/api/reviews")).items; renderReviews(); }
+    try { reviewItems = (await api("api/reviews")).items; renderReviews(); }
     catch (error) { showError("review-error", error.message); }
     finally { workflowControls(false); }
   }
@@ -2228,7 +2238,7 @@ function initialize() {
     event.preventDefault(); if (workflowBusy) return;
     workflowControls(true); $("review-error").hidden = true;
     try {
-      await api("/api/reviews", {method: "POST", body: JSON.stringify({record_id: reviewAddRecord, title: $("review-add-title").value, field: $("review-add-field").value, note: $("review-add-note").value})});
+      await api("api/reviews", {method: "POST", body: JSON.stringify({record_id: reviewAddRecord, title: $("review-add-title").value, field: $("review-add-field").value, note: $("review-add-note").value})});
       workflowDirty = false; workflowControls(false); await openReviews(); toast(t("已添加待核对项。"));
     } catch (error) { showError("review-error", error.message); }
     finally { workflowControls(false); }
@@ -2272,13 +2282,13 @@ function initialize() {
     workflowControls(true); $("review-error").hidden = true;
     try {
       if (reviewItem.generated) {
-        const stored = await api("/api/reviews", {method: "POST", body: JSON.stringify({issue_id: reviewItem.id})});
+        const stored = await api("api/reviews", {method: "POST", body: JSON.stringify({issue_id: reviewItem.id})});
         if (stored.revision !== 1) throw new Error("待核对项已变化，请刷新后再处理。");
         reviewItem = {...reviewItem, generated: false, revision: stored.revision};
       }
       const payload = reviewPlan?.payload || {revision: reviewItem.revision, record_revision: reviewItem.record_revision,
         record_id: reviewItem.record_id, status, note, apply_value: apply, value};
-      const result = await api(`/api/reviews/${reviewItem.id}/decide`, {method: "POST", body: JSON.stringify({...payload, preview})});
+      const result = await api(`api/reviews/${reviewItem.id}/decide`, {method: "POST", body: JSON.stringify({...payload, preview})});
       if (preview) {
         reviewPlan = {payload, preview: result};
         renderReviews();
@@ -2310,13 +2320,19 @@ function initialize() {
   }
 
   // Attachment changes answer with the authoritative records; merge them without reloading the catalog.
-  function applyRecords(changed) {
-    const replacements = new Map((Array.isArray(changed) ? changed : []).map(record => [record.id, record]));
-    if (!replacements.size) return;
-    records = records.map(record => replacements.get(record.id) || record);
-    for (const [id, record] of replacements) if (!records.some(item => item.id === id)) records.push(record);
-    render({keepWorkspaceControls: true});
-    if ($("detail").open && detailId) openDetail(detailId);
+  // A response without them (older or partial server) falls back to a full reload.
+  async function applyChangeResult(result) {
+    const changed = Array.isArray(result?.records) ? result.records.filter(record => record && typeof record.id === "string" && Array.isArray(record.files)) : [];
+    if (Number.isInteger(result?.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
+    if (!changed.length) {
+      await load();
+    } else {
+      const replacements = new Map(changed.map(record => [record.id, record]));
+      records = records.map(record => replacements.get(record.id) || record);
+      for (const [id, record] of replacements) if (!records.some(item => item.id === id)) records.push(record);
+      render({keepWorkspaceControls: true});
+    }
+    if ($("detail").open && detailId && records.some(record => record.id === detailId)) openDetail(detailId);
   }
 
   function renderTrashCount() {
@@ -2325,19 +2341,31 @@ function initialize() {
   }
 
   const sampleName = record => recordLabel(record, "sample_id");
+  // The dialog compares the draft with the values it was opened (or last refreshed) with, so a refresh after a
+  // conflict never turns an untouched field into an unintended change.
+  let fileOriginal = null;
+  const fileDraft = () => ({name: $("file-name").value.trim(), kind: $("file-kind").value, target: $("file-target").value});
+  const fileDirty = () => Boolean($("file-dialog").open && fileOriginal && Object.entries(fileDraft()).some(([key, value]) => value !== fileOriginal[key]));
+  function fillFileDialog(record, file, draft = null) {
+    const original = {name: file.name, kind: file.kind, target: record.id};
+    const keep = key => draft && fileOriginal && draft[key] !== fileOriginal[key];
+    $("file-dialog-subtitle").textContent = `${file.name} · ${sampleName(record)}`;
+    $("file-name").value = keep("name") ? draft.name : file.name;
+    $("file-kind").innerHTML = [...new Set([...kinds, file.kind])].map(kind => `<option value="${escape(kind)}" data-kind-label="${escape(kind)}">${escape(I18n.dataKind(kind, language))}</option>`).join("");
+    $("file-kind").value = keep("kind") && kinds.includes(draft.kind) ? draft.kind : file.kind;
+    const targets = records.filter(item => item.project_id === record.project_id && !item.archived)
+      .sort((a, b) => compareExperimentNo(sampleName(a), sampleName(b)));
+    $("file-target").innerHTML = targets.map(item => `<option value="${escape(item.id)}">${escape(sampleName(item))}${item.id === record.id ? " · " + escape(t("当前样品")) : ""}</option>`).join("");
+    $("file-target").value = keep("target") && targets.some(item => item.id === draft.target) ? draft.target : record.id;
+    fileOriginal = original;
+  }
   function openFileDialog(recordId, fileId) {
     const record = records.find(item => item.id === recordId), file = record?.files.find(item => item.id === fileId);
     if (!record || !file || record.archived) return;
     fileTarget = {recordId, fileId};
+    fileOriginal = null;
     $("file-error").hidden = true;
-    $("file-dialog-subtitle").textContent = `${file.name} · ${sampleName(record)}`;
-    $("file-name").value = file.name;
-    $("file-kind").innerHTML = [...new Set([...kinds, file.kind])].map(kind => `<option value="${escape(kind)}" data-kind-label="${escape(kind)}">${escape(I18n.dataKind(kind, language))}</option>`).join("");
-    $("file-kind").value = file.kind;
-    const targets = records.filter(item => item.project_id === record.project_id && !item.archived)
-      .sort((a, b) => compareExperimentNo(sampleName(a), sampleName(b)));
-    $("file-target").innerHTML = targets.map(item => `<option value="${escape(item.id)}">${escape(sampleName(item))}${item.id === record.id ? " · " + escape(t("当前样品")) : ""}</option>`).join("");
-    $("file-target").value = record.id;
+    fillFileDialog(record, file);
     setFileBusy(false);
     $("file-dialog").showModal();
     $("file-name").focus();
@@ -2346,14 +2374,27 @@ function initialize() {
     fileSaving = busy;
     for (const id of ["file-name", "file-kind", "file-target", "save-file", "delete-file", "cancel-file", "close-file-dialog"]) $(id).disabled = busy;
   }
-  function closeFileDialog() {
+  function closeFileDialog({force = false} = {}) {
     if (fileSaving) return;
-    fileTarget = null;
+    if (!force && fileDirty() && !confirm(t("附件修改尚未保存，确定放弃吗？"))) return;
+    fileTarget = null; fileOriginal = null;
     $("file-dialog").close();
   }
-  async function refreshAfterConflict(error) {
-    if (error.status !== 409) return;
-    try { await load(); } catch {}
+  // After a 409 the catalog is reloaded; the dialog shows the latest metadata and keeps only the user's own edits.
+  async function refreshFileDialogAfterConflict(error) {
+    if (error.status !== 409 || !fileTarget) return;
+    const draft = fileDraft();
+    try { await load(); } catch { return; }
+    const owner = records.find(record => record.files.some(file => file.id === fileTarget.fileId));
+    const file = owner?.files.find(item => item.id === fileTarget.fileId);
+    if (!owner || !file || owner.archived) {
+      showError("file-error", "附件已被移动、删除或样品已归档，请关闭窗口后核对。");
+      for (const id of ["save-file", "delete-file"]) $(id).disabled = true;
+      return;
+    }
+    fileTarget = {recordId: owner.id, fileId: file.id};
+    fillFileDialog(owner, file, draft);
+    showError("file-error", "附件信息已在其他窗口更新，已显示最新内容并保留你的修改。请核对后再保存。");
   }
   $("detail-content").addEventListener("click", event => {
     const button = event.target.closest("[data-manage-file]");
@@ -2362,138 +2403,166 @@ function initialize() {
   $("save-file").addEventListener("click", async () => {
     if (fileSaving || !fileTarget) return;
     const record = records.find(item => item.id === fileTarget.recordId), file = record?.files.find(item => item.id === fileTarget.fileId);
-    if (!record || !file) return closeFileDialog();
-    const name = $("file-name").value.trim(), kind = $("file-kind").value, target = $("file-target").value;
-    if (!name) return showError("file-error", "请填写文件名。");
+    if (!record || !file) return closeFileDialog({force: true});
+    const draft = fileDraft();
+    if (!draft.name) return showError("file-error", "请填写文件名。");
     const body = {record_revision: record.revision};
-    if (name !== file.name) body.name = name;
-    if (kind !== file.kind) body.kind = kind;
-    if (target !== record.id) {
-      const destination = records.find(item => item.id === target);
+    if (draft.name !== file.name) body.name = draft.name;
+    if (draft.kind !== file.kind) body.kind = draft.kind;
+    if (draft.target !== record.id) {
+      const destination = records.find(item => item.id === draft.target);
       if (!destination) return showError("file-error", "目标样品不存在，请刷新后重试。");
-      Object.assign(body, {target_record_id: target, target_revision: destination.revision});
+      Object.assign(body, {target_record_id: draft.target, target_revision: destination.revision});
     }
     if (Object.keys(body).length === 1) return showError("file-error", "没有需要保存的修改。");
     $("file-error").hidden = true;
     setFileBusy(true);
     try {
-      const result = await api(`/api/files/${encodeURIComponent(file.id)}/update`, {method: "POST", body: JSON.stringify(body)});
+      const result = await api(`api/files/${encodeURIComponent(file.id)}/update`, {method: "POST", body: JSON.stringify(body)});
       setFileBusy(false);
-      closeFileDialog();
-      applyRecords(result.records);
+      closeFileDialog({force: true});
+      await applyChangeResult(result);
       const moved = body.target_record_id && records.find(item => item.id === body.target_record_id);
       toast(moved ? t("附件已移到 {sample}。", {sample: sampleName(moved)}) : t("附件已更新。"));
     } catch (error) {
       setFileBusy(false);
       showError("file-error", error.message);
-      await refreshAfterConflict(error);
+      await refreshFileDialogAfterConflict(error);
     }
   });
   $("delete-file").addEventListener("click", async () => {
     if (fileSaving || !fileTarget) return;
     const record = records.find(item => item.id === fileTarget.recordId), file = record?.files.find(item => item.id === fileTarget.fileId);
-    if (!record || !file) return closeFileDialog();
+    if (!record || !file) return closeFileDialog({force: true});
     if (!confirm(t("把 {name} 移到回收站？附件会从样品中移除，可在“回收站”中恢复。", {name: file.name}))) return;
     setFileBusy(true);
     try {
-      const result = await api(`/api/files/${encodeURIComponent(file.id)}/delete`, {method: "POST", body: JSON.stringify({record_revision: record.revision})});
+      const result = await api(`api/files/${encodeURIComponent(file.id)}/delete`, {method: "POST", body: JSON.stringify({record_revision: record.revision})});
       setFileBusy(false);
-      closeFileDialog();
-      if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
-      applyRecords(result.records);
+      closeFileDialog({force: true});
+      await applyChangeResult(result);
       toast(t("{name} 已移到回收站。", {name: file.name}));
     } catch (error) {
       setFileBusy(false);
       showError("file-error", error.message);
-      await refreshAfterConflict(error);
+      await refreshFileDialogAfterConflict(error);
     }
   });
-  for (const id of ["close-file-dialog", "cancel-file"]) $(id).addEventListener("click", closeFileDialog);
+  for (const id of ["close-file-dialog", "cancel-file"]) $(id).addEventListener("click", () => closeFileDialog());
   $("file-dialog").addEventListener("cancel", event => { event.preventDefault(); closeFileDialog(); });
 
+  const trashScopeValue = () => $("trash-all-projects").checked ? "" : projectId || "";
   function renderTrash() {
     const locale = language === "en" ? "en-US" : "zh-CN";
-    const scope = $("trash-all-projects").checked ? t("全部项目") : projectId ? projectLabel(projectId) : t("全部项目");
-    $("trash-subtitle").textContent = t("{scope} · {count} 个附件 · {size}", {scope, count: trashItems.length, size: sizeText(trashTotal)});
+    const loading = trashScope === null;
+    const scope = trashScope === null ? "" : trashScope ? projectLabel(trashScope) : t("全部项目");
+    $("trash-subtitle").textContent = loading ? t("正在读取…") : t("{scope} · {count} 个附件 · {size}", {scope, count: trashItems.length, size: sizeText(trashTotal)});
     trashSelected = new Set([...trashSelected].filter(id => trashItems.some(item => item.id === id)));
-    $("trash-content").innerHTML = trashItems.length ? `<table class="workflow-table trash-table"><thead><tr><th><span class="sr-only">${t("选择")}</span></th><th>${t("文件")}</th><th>${t("样品")}</th><th>${t("移入时间")}</th><th>${t("大小")}</th><th>${t("操作")}</th></tr></thead><tbody>${trashItems.map(item => {
-      const renaming = trashRenaming === item.id;
-      const restore = item.record_archived ? `<span class="field-help">${t("样品已归档，请先恢复样品。")}</span>`
-        : renaming ? `<div class="trash-rename"><input data-trash-name="${escape(item.id)}" maxlength="240" value="${escape(item.name)}" aria-label="${escape(t("恢复后的文件名"))}"><button data-trash-restore="${escape(item.id)}" class="primary">${t("确认恢复")}</button><button data-trash-cancel="${escape(item.id)}">${t("取消")}</button></div>`
-        : `<button data-trash-restore="${escape(item.id)}">${t("恢复")}</button>${item.name_conflict ? `<small class="field-help">${t("原样品已有同名同类附件，恢复时需要改名。")}</small>` : ""}`;
-      return `<tr><td><input type="checkbox" data-trash-select="${escape(item.id)}" ${trashSelected.has(item.id) ? "checked" : ""} aria-label="${escape(t("选择 {name}", {name: item.name}))}"></td>
-        <td><span class="data-tag">${kindText(item.kind)}</span> <strong>${escape(item.name)}</strong></td><td>${escape(recordLabel(item, "sample_id"))}</td>
-        <td>${escape(new Date(item.deleted_at).toLocaleString(locale))}</td><td>${sizeText(item.size)}</td><td>${restore}</td></tr>`;
-    }).join("")}</tbody></table>` : `<p class="empty">${t("回收站是空的。")}</p>`;
-    $("purge-selected").disabled = trashBusy || !trashSelected.size;
-    $("purge-all").disabled = trashBusy || !trashItems.length;
+    if (loading) {
+      $("trash-content").textContent = t("正在读取…");
+    } else {
+      $("trash-content").innerHTML = trashItems.length ? `<table class="workflow-table trash-table"><thead><tr><th><span class="sr-only">${t("选择")}</span></th><th>${t("文件")}</th><th>${t("样品")}</th><th>${t("移入时间")}</th><th>${t("大小")}</th><th>${t("操作")}</th></tr></thead><tbody>${trashItems.map(item => {
+        const id = escape(item.id), renaming = trashRenaming === item.id;
+        const download = `<a class="button" href="api/files/${encodeURIComponent(item.id)}" download>${t("下载")}</a>`;
+        const restore = item.record_archived ? `<span class="field-help">${t("样品已归档，请先恢复样品。")}</span>`
+          : renaming ? `<div class="trash-rename"><input data-trash-name="${id}" maxlength="240" value="${escape(trashDrafts.get(item.id) ?? item.name)}" aria-label="${escape(t("恢复后的文件名"))}"><button data-trash-restore="${id}" class="primary">${t("确认恢复")}</button><button data-trash-cancel="${id}">${t("取消")}</button></div>`
+          : `<button data-trash-restore="${id}">${t("恢复")}</button>${item.name_conflict ? `<small class="field-help">${t("原样品已有同名同类附件，恢复时需要改名。")}</small>` : ""}`;
+        return `<tr><td><input type="checkbox" data-trash-select="${id}" ${trashSelected.has(item.id) ? "checked" : ""} aria-label="${escape(t("选择 {name}", {name: item.name}))}"></td>
+          <td><span class="data-tag">${kindText(item.kind)}</span> <strong>${escape(item.name)}</strong></td><td>${escape(recordLabel(item, "sample_id"))}</td>
+          <td>${escape(new Date(item.deleted_at).toLocaleString(locale))}</td><td>${sizeText(Number(item.size) || 0)}</td><td><div class="trash-actions">${restore}${download}</div></td></tr>`;
+      }).join("")}</tbody></table>` : `<p class="empty">${t("回收站是空的。")}</p>`;
+    }
+    // Purging is only offered for rows of the scope that is actually shown.
+    const ready = !trashBusy && !loading && trashScope === trashScopeValue();
+    $("purge-selected").disabled = !ready || !trashSelected.size;
+    $("purge-all").disabled = !ready || !trashItems.length;
     for (const control of $("trash-content").querySelectorAll("button,input")) control.disabled = trashBusy;
     $("trash-all-projects").disabled = trashBusy;
   }
   async function loadTrash() {
-    const scope = $("trash-all-projects").checked ? "" : projectId || "";
-    const result = await api(`/api/trash?project_id=${encodeURIComponent(scope)}`);
-    trashItems = Array.isArray(result.items) ? result.items : [];
+    const version = ++trashLoadVersion, scope = trashScopeValue();
+    trashScope = null; renderTrash();
+    const result = await api(`api/trash?project_id=${encodeURIComponent(scope)}`);
+    if (version !== trashLoadVersion) return;  // A newer scope was requested meanwhile.
+    trashItems = Array.isArray(result.items) ? result.items.filter(item => typeof item?.id === "string") : [];
     trashTotal = Number(result.total_bytes) || 0;
+    trashScope = scope;
     renderTrash();
   }
   async function trashAction(work) {
     if (trashBusy) return;
     trashBusy = true; $("trash-error").hidden = true; renderTrash();
     try { await work(); }
-    catch (error) { showError("trash-error", error.message); await refreshAfterConflict(error); }
+    catch (error) { showError("trash-error", error.message); if (error.status === 409) { try { await load(); } catch {} } }
     finally { trashBusy = false; try { await loadTrash(); } catch (error) { showError("trash-error", error.message); } }
   }
   async function openTrash() {
-    trashSelected = new Set(); trashRenaming = ""; trashItems = []; trashTotal = 0;
+    trashSelected = new Set(); trashRenaming = ""; trashDrafts = new Map(); trashItems = []; trashTotal = 0; trashScope = null;
     $("trash-error").hidden = true;
-    $("trash-content").textContent = t("正在读取…");
     $("trash-dialog").showModal();
     try { await loadTrash(); } catch (error) { showError("trash-error", error.message); }
   }
   async function restoreTrashItem(id) {
     const item = trashItems.find(entry => entry.id === id);
-    if (!item) return;
-    if (item.name_conflict && trashRenaming !== id) { trashRenaming = id; renderTrash(); $("trash-content").querySelector(`[data-trash-name="${id}"]`)?.focus(); return; }
-    const body = {record_revision: records.find(record => record.id === item.record_id)?.revision};
+    if (!item || trashBusy) return;
+    if (item.name_conflict && trashRenaming !== id) {
+      trashRenaming = id; renderTrash();
+      $("trash-content").querySelector(`[data-trash-name="${id}"]`)?.focus();
+      return;
+    }
+    const body = {};
     if (trashRenaming === id) {
-      const name = $("trash-content").querySelector(`[data-trash-name="${id}"]`).value.trim();
+      const input = $("trash-content").querySelector(`[data-trash-name="${id}"]`);
+      if (input) trashDrafts.set(id, input.value);
+      const name = (trashDrafts.get(id) ?? item.name).trim();
       if (!name) return showError("trash-error", "请填写文件名。");
       body.name = name;
     }
     await trashAction(async () => {
-      if (!Number.isInteger(body.record_revision)) { await load(); body.record_revision = records.find(record => record.id === item.record_id)?.revision; }
-      const result = await api(`/api/trash/${encodeURIComponent(id)}/restore`, {method: "POST", body: JSON.stringify(body)});
-      trashRenaming = "";
-      if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
-      applyRecords(result.records);
-      toast(t("{name} 已恢复到 {sample}。", {name: result.file?.name || item.name, sample: recordLabel(item, "sample_id")}));
+      const owner = () => records.find(record => record.id === item.record_id)?.revision;
+      if (!Number.isInteger(owner())) await load();
+      const result = await api(`api/trash/${encodeURIComponent(id)}/restore`, {method: "POST", body: JSON.stringify({record_revision: owner(), ...body})});
+      trashRenaming = ""; trashDrafts.delete(id);
+      await applyChangeResult(result);
+      toast(t("{name} 已恢复到 {sample}。", {name: result.file?.name || body.name || item.name, sample: recordLabel(item, "sample_id")}));
     });
   }
   async function purge(ids) {
     const chosen = trashItems.filter(item => ids.includes(item.id));
-    if (!chosen.length) return;
+    if (!chosen.length || trashScope === null || trashScope !== trashScopeValue()) return;
     const size = sizeText(chosen.reduce((sum, item) => sum + (Number(item.size) || 0), 0));
     if (!confirm(t("永久删除 {count} 个附件（{size}）？文件副本会从本机删除，此操作不能撤销。", {count: chosen.length, size}))) return;
+    const scope = trashScope;
     await trashAction(async () => {
-      const result = await api("/api/trash/purge", {method: "POST", body: JSON.stringify({file_ids: chosen.map(item => item.id), confirm: "purge"})});
+      const body = {file_ids: chosen.map(item => item.id), confirm: "purge", ...(scope ? {project_id: scope} : {})};
+      const result = await api("api/trash/purge", {method: "POST", body: JSON.stringify(body)});
       trashSelected.clear();
       if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
-      toast(t("已永久删除 {count} 个附件，释放 {size}。", {count: result.purged, size: sizeText(result.bytes || 0)}));
+      const pending = Number(result.pending_bytes) || 0;
+      toast(t("已永久删除 {count} 个附件，释放 {size}。", {count: result.purged, size: sizeText(Number(result.bytes) || 0)})
+        + (pending ? " " + t("另有 {size} 暂时无法从磁盘删除，下次启动时会重试。", {size: sizeText(pending)}) : ""));
     });
   }
   $("trash-view").addEventListener("click", openTrash);
-  $("trash-all-projects").addEventListener("change", () => trashAction(async () => {}));
+  $("trash-all-projects").addEventListener("change", () => {
+    trashSelected.clear();
+    loadTrash().catch(error => showError("trash-error", error.message));
+  });
   $("trash-content").addEventListener("change", event => {
     const box = event.target.closest("[data-trash-select]");
     if (!box) return;
     if (box.checked) trashSelected.add(box.dataset.trashSelect); else trashSelected.delete(box.dataset.trashSelect);
-    $("purge-selected").disabled = trashBusy || !trashSelected.size;
+    renderTrash();
+  });
+  $("trash-content").addEventListener("input", event => {
+    const input = event.target.closest("[data-trash-name]");
+    if (input) trashDrafts.set(input.dataset.trashName, input.value);
   });
   $("trash-content").addEventListener("click", event => {
     const restore = event.target.closest("[data-trash-restore]");
     if (restore) return restoreTrashItem(restore.dataset.trashRestore);
-    if (event.target.closest("[data-trash-cancel]")) { trashRenaming = ""; renderTrash(); }
+    const cancel = event.target.closest("[data-trash-cancel]");
+    if (cancel) { trashDrafts.delete(cancel.dataset.trashCancel); trashRenaming = ""; renderTrash(); }
   });
   $("trash-content").addEventListener("keydown", event => {
     const input = event.target.closest("[data-trash-name]");
@@ -2501,7 +2570,12 @@ function initialize() {
   });
   $("purge-selected").addEventListener("click", () => purge([...trashSelected]));
   $("purge-all").addEventListener("click", () => purge(trashItems.map(item => item.id)));
-  const closeTrash = () => { if (!trashBusy) $("trash-dialog").close(); };
+  const trashDirty = () => $("trash-dialog").open && [...trashDrafts.values()].some(Boolean);
+  const closeTrash = () => {
+    if (trashBusy || (trashDirty() && !confirm(t("恢复用的新文件名尚未提交，确定放弃吗？")))) return;
+    trashLoadVersion++; trashDrafts.clear(); trashRenaming = "";
+    $("trash-dialog").close();
+  };
   for (const id of ["close-trash", "trash-close"]) $(id).addEventListener("click", closeTrash);
   $("trash-dialog").addEventListener("cancel", event => { event.preventDefault(); closeTrash(); });
 
@@ -2540,7 +2614,7 @@ function initialize() {
   }
   async function pollBackup() {
     clearTimeout(backupTimer); backupTimer = null;
-    try { backupStatus = await api("/api/backup/status"); }
+    try { backupStatus = await api("api/backup/status"); }
     catch (error) { showError("backup-error", error.message); return; }
     renderBackup();
     if (backupStatus.state === "running") backupTimer = setTimeout(pollBackup, 800);
@@ -2560,7 +2634,7 @@ function initialize() {
     if (!path) return showError("backup-error", "请填写备份文件夹的完整路径。");
     $("backup-error").hidden = true; backupStarting = true; renderBackup();
     try {
-      backupStatus = await api("/api/backup/folder", {method: "POST", body: JSON.stringify({path, verify: $("backup-verify").checked})});
+      backupStatus = await api("api/backup/folder", {method: "POST", body: JSON.stringify({path, verify: $("backup-verify").checked})});
     } catch (error) {
       showError("backup-error", error.message);
     } finally { backupStarting = false; }
@@ -2581,7 +2655,7 @@ function initialize() {
   $("backup-dialog").addEventListener("cancel", event => { event.preventDefault(); closeBackup(); });
 
   function fileListHtml(files, manage = false) {
-    return files.map(file => `<li><span class="data-tag ${file.kind === "NMR" ? "nmr" : ""}">${kindText(file.kind)}</span><div class="file-meta"><strong>${escape(file.name)}</strong><small>${sizeText(file.size)} · SHA-256 ${escape(file.sha256.slice(0, 12))}…</small>${file.source ? `<small>${text("来源副本：")}${escape(file.source)}</small>` : ""}</div>${manage ? `<button type="button" class="quiet" data-manage-file="${escape(file.id)}">${text("管理")}</button>` : ""}<a class="button" href="/api/files/${file.id}" download>${text("下载")}</a></li>`).join("") || `<li class="muted">${text("尚未关联数据文件。")}</li>`;
+    return files.map(file => `<li><span class="data-tag ${file.kind === "NMR" ? "nmr" : ""}">${kindText(file.kind)}</span><div class="file-meta"><strong>${escape(file.name)}</strong><small>${sizeText(file.size)} · SHA-256 ${escape(file.sha256.slice(0, 12))}…</small>${file.source ? `<small>${text("来源副本：")}${escape(file.source)}</small>` : ""}</div>${manage ? `<button type="button" class="quiet" data-manage-file="${escape(file.id)}">${text("管理")}</button>` : ""}<a class="button" href="api/files/${file.id}" download>${text("下载")}</a></li>`).join("") || `<li class="muted">${text("尚未关联数据文件。")}</li>`;
   }
 
   function openDetail(id) {
@@ -2628,7 +2702,7 @@ function initialize() {
       for (const file of files) {
         $("upload-button").textContent = `${completed + errors.length + 1} / ${files.length}…`;
         try {
-          await api(`/api/experiments/${id}/files?${new URLSearchParams({name: file.name, kind})}`, {method: "POST", body: file, headers: {"Content-Type": "application/octet-stream"}});
+          await api(`api/experiments/${id}/files?${new URLSearchParams({name: file.name, kind})}`, {method: "POST", body: file, headers: {"Content-Type": "application/octet-stream"}});
           completed++;
         } catch (error) { errors.push(`${file.name}: ${I18n.translateError(error.message, language)}`); }
       }
@@ -2772,7 +2846,7 @@ function initialize() {
     controls.forEach(control => { control.disabled = true; });
     $("template-error").hidden = true;
     try {
-      templates[templateProject] = await api("/api/templates", {method: "PUT", body: JSON.stringify(payload)});
+      templates[templateProject] = await api("api/templates", {method: "PUT", body: JSON.stringify(payload)});
       templateDirty = false;
       $("template-dialog").close();
       toast(t("实验模板已保存。"));
@@ -2884,7 +2958,7 @@ function initialize() {
       experiment_no: $("import-experiment").value, excluded: [...folderSkipped], files};
     importing = true; folderPlan = null; $("import-error").hidden = true; importControls();
     try {
-      folderPlan = await api("/api/folder-import/preview", {method: "POST", body: JSON.stringify(payload)});
+      folderPlan = await api("api/folder-import/preview", {method: "POST", body: JSON.stringify(payload)});
     } catch (error) { showError("import-error", error.message); }
     finally { importing = false; renderImportRows(); }
   });
@@ -2905,9 +2979,9 @@ function initialize() {
         $("import-progress").textContent = t("正在复制 {file}", {file: row.path});
         let result;
         try {
-          result = await api("/api/folder-import/file?" + query, {method: "POST", body: folderFiles.get(row.path), headers: {"Content-Type": "application/octet-stream"}});
+          result = await api("api/folder-import/file?" + query, {method: "POST", body: folderFiles.get(row.path), headers: {"Content-Type": "application/octet-stream"}});
         } catch (error) {
-          if (!error.status) result = await api("/api/folder-import/receipts/" + receipt).catch(() => null);
+          if (!error.status) result = await api("api/folder-import/receipts/" + receipt).catch(() => null);
           if (!result) {
             issues.push({...row, reason: "failed"});
             if (!error.status) uncertain.add(key);
@@ -2926,7 +3000,7 @@ function initialize() {
       }
       folderPlan = null;
       if (issues.length) {
-        const result = await api("/api/folder-import/issues", {method: "POST", body: JSON.stringify({project_id: importProject, batch_id: importBatch, issues})});
+        const result = await api("api/folder-import/issues", {method: "POST", body: JSON.stringify({project_id: importProject, batch_id: importBatch, issues})});
         queued = result.pending;
       }
     } catch (error) { showError("import-error", t("待核对条目写入未确认。请重新预览。") + " " + error.message); }
@@ -3292,7 +3366,7 @@ function initialize() {
     syncWorkspaceStatus();
     let updated = false;
     try {
-      await api("/api/experiments/status", {method: "POST", body: JSON.stringify({status, records: chosen.map(record => ({id: record.id, revision: record.revision}))})});
+      await api("api/experiments/status", {method: "POST", body: JSON.stringify({status, records: chosen.map(record => ({id: record.id, revision: record.revision}))})});
       updated = true;
       await load();
       toast(t("样品状态已更新。"));
@@ -3461,7 +3535,7 @@ function initialize() {
     if (!record.archived && !confirm(t("归档这条实验？条件和附件会完整保留，可在“已归档”中恢复。"))) return;
     $("archive-record").disabled = true;
     try {
-      await api(`/api/experiments/${record.id}/archive`, {method: "POST", body: JSON.stringify({archived: !record.archived, revision: record.revision})});
+      await api(`api/experiments/${record.id}/archive`, {method: "POST", body: JSON.stringify({archived: !record.archived, revision: record.revision})});
       await load();
       $("detail").close();
       toast(t(record.archived ? "实验已恢复。" : "实验已归档，可以随时恢复。"));
@@ -3469,7 +3543,7 @@ function initialize() {
     finally { $("archive-record").disabled = false; }
   });
   $("export-csv").addEventListener("click", () => {
-    if (visible.length) window.location.assign(`/api/export.csv?lang=${language}&ids=${visible.map(record => record.id).join(",")}`);
+    if (visible.length) window.location.assign(`api/export.csv?lang=${language}&ids=${visible.map(record => record.id).join(",")}`);
   });
   $("compare").addEventListener("click", () => {
     if (selected.size < 2 || selected.size > 6) return;
@@ -3484,7 +3558,7 @@ function initialize() {
   $("comparison").addEventListener("close", clearComparisonXrd);
   const hasUnfinishedWork = () => dirty || saving || uploading || catalogSaving || materialSaving || presetSaving ||
     statusSaving || previewPhaseSaving || bulkBusy || bulkDirty || workflowBusy || workflowDirty || templateDirty || templateSaving || importing ||
-    backupStarting || backupStatus?.state === "running" || fileSaving || trashBusy;
+    backupStarting || backupStatus?.state === "running" || fileSaving || trashBusy || fileDirty() || trashDirty();
   window.addEventListener("beforeunload", event => {
     if (hasUnfinishedWork()) { event.preventDefault(); event.returnValue = ""; }
   });

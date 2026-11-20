@@ -40,6 +40,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
   if (savedProject !== undefined) w.localStorage.setItem("catalog-project", savedProject);
   if (unavailableStorage) Object.defineProperty(w, "localStorage", {get() {throw new Error("Unavailable");}});
   w.fetch = async (url, options = {}) => {
+    if (typeof url === "string" && url.startsWith("api/")) url = "/" + url;  // The page uses relative URLs under /s/{instance}/.
     if (offline) throw new Error("Offline");
     if (workflowHandler && (url.startsWith("/api/history") || url.startsWith("/api/reviews"))) return workflowHandler(url, options, rows);
     if (url.startsWith("/api/trash") || /^\/api\/files\/[^/?]+\/(update|delete)$/.test(url)) {
@@ -141,7 +142,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     $("record-form").elements.sample_id.dispatchEvent(new w.Event("input", {bubbles: true}));
     w.confirm = message => { assert.match(message, /unsaved changes/); return false; };
     assert.equal(w.confirmCatalogClose(), false);
-    const source = w.document.querySelector('a[href="/notices.txt"]');
+    const source = w.document.querySelector('a[href="notices.txt"]');
     source.addEventListener("click", event => event.preventDefault());
     source.click();
     assert.equal(source.target, "");
@@ -644,7 +645,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     $("project-select").value = ""; change("project-select");
     assert.equal($("records").querySelectorAll('[data-experiment="A"]').length, 2);
     w.document.querySelector('[data-expand="experiment:catalysis:a"]').click();
-    assert.equal(w.document.querySelector('.sample-panel .inline-file').getAttribute("href"), "/api/files/raman-file");
+    assert.equal(w.document.querySelector('.sample-panel .inline-file').getAttribute("href"), "api/files/raman-file");
     w.document.querySelector('[data-add-sample="A"][data-project="catalysis"]').click();
     assert.equal($("editor-project").value, "catalysis");
     $("record-form").elements.sample_id.value = "UNSAVED-SAMPLE";
@@ -1132,10 +1133,10 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     w.document.querySelector('[data-preview-mode="plot"]').click(); await flush();
     assert.equal($("preview-plot").hidden, false);
     assert.match($("workspace-preview").textContent, /angle|intensity/);
-    assert.equal($("workspace-download").getAttribute("href"), "/api/files/curve");
+    assert.equal($("workspace-download").getAttribute("href"), "api/files/curve");
     w.document.querySelector('[data-workspace-kind="TEM"]').click();
     assert.equal($("workspace-file").options.length, 2);
-    assert.equal($("workspace-preview").querySelector("img").getAttribute("src"), "/api/files/image/preview");
+    assert.equal($("workspace-preview").querySelector("img").getAttribute("src"), "api/files/image/preview");
     $("workspace-file").value = "zip"; change("workspace-file");
     assert.match($("workspace-preview").textContent, /appropriate software/);
     $("workspace-sample").value = "one"; change("workspace-sample");
@@ -1994,7 +1995,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       w.confirm = message => { confirmations.push(message); return true; };
       $("purge-selected").click(); await flush(); await flush(); await flush();
       assert.match(confirmations.at(-1), /Permanently delete 1 attachments.*cannot be undone/);
-      assert.deepEqual(calls.filter(call => call.url === "/api/trash/purge").at(-1).body, {file_ids: ["f1"], confirm: "purge"});
+      assert.deepEqual(calls.filter(call => call.url === "/api/trash/purge").at(-1).body, {file_ids: ["f1"], confirm: "purge", project_id: "default"}, "A project-scoped view sends its scope");
       assert.match($("toast").textContent, /Permanently deleted 1 attachments/);
       $("language-switch").click(); await flush();
       assert.match($("trash-content").textContent, /回收站是空的/);
@@ -2017,6 +2018,116 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal(expired.$("session-banner").hidden, false, "A 401 shows the session banner");
       assert.match(expired.$("session-banner").textContent, /session has ended/);
     } finally { expired.dom.window.close(); }
+  }
+  {
+    // Review fixes: stale trash scope, conflict refresh keeps only the user's edits, drafts, partial responses, counts.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
+    const calls = [], pending = [];
+    let updateMode = "normal", reads = 0;
+    const foreign = {id: "x1", name: "other-project.csv", kind: "XRD", size: 9, sha256: "0".repeat(64), deleted_at: "2026-11-20T09:00:00Z",
+      record_id: "Z", sample_id: "Z", experiment_no: "Z", project_id: "other-lab", record_archived: false, name_conflict: false};
+    const local = {...foreign, id: "l1", name: "local.csv", record_id: "A", sample_id: "A", experiment_no: "A", project_id: "default", name_conflict: true};
+    const env = await boot({savedLanguage: "en", extraProjects: [{id: "other-lab", name: "Other lab"}],
+      readHandler: catalog => { reads++; return reply(200, {...catalog, trash_count: 2, category_counts: {XRD: {active: 1, trashed: 0}, TEM: {active: 0, trashed: 3}}}); },
+      attachmentHandler: (url, options, rows) => {
+        const body = options.body ? JSON.parse(options.body) : {};
+        calls.push({url, body});
+        if (url.startsWith("/api/trash?")) {
+          const all = url.endsWith("project_id=");
+          const response = reply(200, {items: all ? [local, foreign] : [local], total_bytes: 18});
+          if (all) { const gate = deferred(); pending.push(gate); return gate.promise.then(() => response); }
+          return response;
+        }
+        if (url.endsWith("/restore")) return reply(409, {error: "同名同类附件已存在，请为恢复的附件输入新名称。"});
+        if (url === "/api/trash/purge") return reply(200, {purged: body.file_ids.length, bytes: 9, pending_bytes: 4, trash_count: 1});
+        if (url.endsWith("/update")) {
+          const row = rows.find(item => item.id === "A"), file = row.files[0];
+          if (updateMode === "conflict") {
+            updateMode = "normal";
+            file.kind = "NMR"; row.revision = 5;  // Another window recategorized the file meanwhile.
+            return reply(409, {error: "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"});
+          }
+          if (body.name) file.name = body.name;
+          if (body.kind) file.kind = body.kind;
+          row.revision++;
+          return reply(200, updateMode === "partial" ? {file} : {file, records: [row]});
+        }
+        throw new Error("Unhandled " + url);
+      }});
+    try {
+      const {$, w, confirmations} = env;
+      $("dashboard-records-tab").click();
+      w.document.querySelector('[data-expand="experiment:default:a"]').click();
+      w.document.querySelector('[data-open="A"]').click();
+      // 1. Conflict refresh: only the rename survives; the refreshed category is shown and not sent back.
+      $("detail-content").querySelector('[data-manage-file="f1"]').click();
+      $("file-name").value = "renamed.csv";
+      updateMode = "conflict";
+      $("save-file").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("file-dialog").open, true);
+      assert.equal($("file-kind").value, "NMR", "The dialog shows the category changed elsewhere");
+      assert.equal($("file-name").value, "renamed.csv", "The user's rename is kept");
+      assert.match($("file-error").textContent, /latest details are shown/);
+      $("save-file").click(); await flush(); await flush();
+      assert.deepEqual(calls.filter(call => call.url.endsWith("/update")).at(-1).body, {record_revision: 5, name: "renamed.csv"}, "No unintended recategorization");
+      // 2. A partial success response reloads and still shows the change.
+      $("detail-content").querySelector('[data-manage-file="f1"]').click();
+      $("file-name").value = "partial.csv";
+      updateMode = "partial";
+      const before = reads;
+      $("save-file").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.ok(reads > before, "Missing records trigger a reload");
+      assert.match($("detail-content").textContent, /partial\.csv/);
+      updateMode = "normal";
+      // 3. Unsaved attachment edits are guarded.
+      $("detail-content").querySelector('[data-manage-file="f1"]').click();
+      $("file-name").value = "draft.csv";
+      w.confirm = message => { confirmations.push(message); return false; };
+      $("cancel-file").click();
+      assert.equal($("file-dialog").open, true, "Declining keeps the dialog and the draft");
+      assert.match(confirmations.at(-1), /not saved/);
+      w.confirm = message => { confirmations.push(message); return true; };
+      $("cancel-file").click();
+      assert.equal($("file-dialog").open, false);
+      $("close-detail").click();
+      // 4. Category deletion counts trashed attachments from the server.
+      $("manage-categories").click();
+      w.document.querySelector('[data-delete-category="TEM"]').click();
+      assert.match($("category-delete-help").textContent, /3 of them are in the trash/);
+      assert.equal($("category-replacement-label").hidden, false, "A category used only in the trash needs a replacement");
+      $("cancel-delete-category").click();
+      $("close-catalog").click();
+      // 5. A late all-projects response cannot replace the current-project view, and purge waits for the shown scope.
+      $("trash-view").click(); await flush(); await flush();
+      assert.match($("trash-content").textContent, /local\.csv/);
+      $("trash-all-projects").checked = true; $("trash-all-projects").dispatchEvent(new w.Event("change", {bubbles: true}));
+      await flush();
+      assert.equal($("purge-all").disabled, true, "Purge is disabled while the new scope loads");
+      $("trash-all-projects").checked = false; $("trash-all-projects").dispatchEvent(new w.Event("change", {bubbles: true}));
+      await flush(); await flush();
+      pending.forEach(gate => gate.resolve()); await flush(); await flush();
+      assert.doesNotMatch($("trash-content").textContent, /other-project\.csv/, "The stale all-projects response is discarded");
+      assert.equal($("purge-all").disabled, false);
+      assert.ok($("trash-content").querySelector('a[href="api/files/l1"][download]'), "Trashed files can be downloaded");
+      $("purge-all").click(); await flush(); await flush(); await flush();
+      assert.deepEqual(calls.filter(call => call.url === "/api/trash/purge").at(-1).body, {file_ids: ["l1"], confirm: "purge", project_id: "default"});
+      assert.match($("toast").textContent, /could not be removed from disk yet/);
+      // 6. A rejected restore keeps the proposed name.
+      $("trash-content").querySelector('[data-trash-restore="l1"]')?.click(); await flush();
+      const input = $("trash-content").querySelector('[data-trash-name="l1"]');
+      assert.ok(input, "The conflicting item asks for a new name");
+      {
+        input.value = "kept.csv"; input.dispatchEvent(new w.Event("input", {bubbles: true}));
+        $("trash-content").querySelector('[data-trash-restore="l1"]').click(); for (let i = 0; i < 5; i++) await flush();
+        assert.equal($("trash-content").querySelector('[data-trash-name="l1"]').value, "kept.csv", "The draft survives the refresh after 409");
+        w.confirm = message => { confirmations.push(message); return false; };
+        $("trash-close").click();
+        assert.equal($("trash-dialog").open, true, "An unsubmitted restore name is guarded");
+        w.confirm = () => true;
+      }
+      $("trash-close").click();
+    } finally { env.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
