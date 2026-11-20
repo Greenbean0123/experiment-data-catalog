@@ -165,3 +165,36 @@ onboarding and imports (M3), packaging (M4).
   pending items for issues that were already resolved or dismissed: fingerprints of built-in items do not include the
   set of enabled fields, and key-field fingerprints use the lower-cased identity.
 - Key fields that are no longer available in the current template (`available: false`) generate no automatic items.
+
+## 6. Re-review amendments (binding; supersede §5.4 where they conflict)
+
+### 6.1 Notebook-prefix merges never overwrite a group's own defaults
+
+- A prefix change that would merge experiment keys whose stored shared defaults disagree on any field is rejected:
+  `PUT /api/local-catalog` → 409 `以下实验在新的编号前缀下会合并，但共用条件不一致：{experiments}。请先统一这些实验的共用条件，再修改前缀。`
+  (experiments joined by `、`, at most 10). Nothing changes.
+- When the running service detects such a change in a hand-edited file, it keeps the previous prefixes active and
+  `GET /api/local-catalog` reports the same message in `error` until the file is fixed.
+- Merges that are allowed (identical defaults, or only one group has stored defaults) never delete the original rows.
+  A shared save on a merged group writes only the fields that changed and are enabled, to the merged key and to every
+  original row it covers, so removing the prefix later leaves each original group consistent. Per-sample overrides keep
+  belonging to their own group. This replaces the "most recent wins" ordering of §5.4, which is no longer needed.
+
+### 6.2 Review dispositions created before §5.6
+
+- Automatic missing-condition items whose stored fingerprint covered a set of built-in fields (older format) are
+  matched by the fields they covered: an issue already resolved/dismissed for those fields stays closed, and a new
+  pending item is generated only for fields it did not cover.
+
+### 6.3 Local-catalog text
+
+- Precursor labels, aliases, notebook prefixes and translation map keys/values reject control characters, including
+  line breaks (400 `本地约定格式不正确：{detail}`).
+- Local `translations.en` adds English for catalog-specific terms only; it cannot replace the program's own wording
+  (which is also used inside HTML templates). This is intentional.
+
+### 6.4 Known residual race (documented, not fixed)
+
+- `PUT /api/local-catalog` compares the file bytes immediately before `os.replace`, but Windows offers no atomic
+  compare-and-replace, so a hand edit landing in that instant can be overwritten. Edit `local-catalog.json` by hand only
+  while the app is stopped (README says so).
