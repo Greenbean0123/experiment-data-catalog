@@ -102,3 +102,40 @@ Goal: other OS users or local programs that cannot read this user's data folder 
 
 Undo for attachment operations (trash restore covers delete), configurable core fields (M2), settings UI for
 `local-catalog.json` (M2), onboarding and imports (M3), packaging (M4).
+
+## 4. Review amendments (binding; supersede earlier text where they conflict)
+
+### 4.1 Instance-scoped session path (fixes cookie leakage across localhost ports and old tabs reaching a new instance)
+
+- Each start generates `instance = secrets.token_hex(8)` next to the token and writes it to `.catalog-session.json`.
+- The app lives under `/s/{instance}/`: `/s/{instance}/` serves `index.html`, `/s/{instance}/<static>` the same static files as
+  before, and `/s/{instance}/api/...` every API route. The front end uses **relative** URLs only (`api/...`, `app.js`).
+- Launch: `GET /?token=T[&other]` sets `catalog_session=T; HttpOnly; SameSite=Strict; Path=/s/{instance}/` and answers 303 to
+  `/s/{instance}/?other` (token removed). Browsers then send the cookie only under that path, never to `/` or other paths
+  on other localhost ports, and two instances never overwrite each other's cookie.
+- `/s/{other-instance}/...`, `/` without a valid token, and any HTML request without the cookie get `web/locked.html` (401);
+  API requests get the 401 JSON. An old tab of a previous instance therefore cannot read or write the new one.
+- Root `/api/*` remains for scripts with the `X-Catalog-Token` header only (no cookie is ever valid there). `--stop`,
+  `--open` and `desktop.py` use the launch URL / header as before. `/locked.css`, `/locked.html` stay public at the root.
+- The authentication gate runs before method dispatch, so unsupported verbs on API paths also get 401 (not 501).
+
+### 4.2 Other backend fixes
+
+- **Scoped purge**: `POST /api/trash/purge` accepts optional `"project_id"`; when present every ID must belong to that
+  project, else 409 `回收站内容已变化，请刷新后再清空。` and nothing is purged. The front end sends it for project-scoped views.
+- **Category counts**: `GET /api/experiments` returns `"category_counts": {kind: {"active": int, "trashed": int}}` over all
+  projects, archived records included. Deleting a category with any active or trashed attachment requires a replacement.
+  Category deletion is a catalog-wide operation and is allowed to recategorize attachments on archived records and in the
+  trash (an explicit exception to the archived-write rule); it logs a `recategorize` file event per changed attachment.
+- **Dormant evidence**: stored evidence IDs that are not active attachments of the record (trashed or moved away) are
+  preserved on writes and do not count towards the 100-link limit, which applies to the visible links only. Purging a file
+  removes it from every record's stored evidence in the same transaction.
+- **Storage reconciliation**: at startup, under the data-folder lock, files in `data/files/` with no DB row (and leftover
+  `.part-*` files) are moved to `data/orphaned/` (never deleted). Purge unlink failures are recorded and retried at the next
+  startup; the purge response reports `"bytes"` actually reclaimed and `"pending_bytes"` still awaiting removal.
+
+### 4.3 Decided not to change
+
+- Uploads (`POST .../files`) and folder-import copies do not require the owner's revision. Adding an attachment commutes
+  with field edits, the folder import already verifies the target's identity, and the upload bumps the revision so other
+  windows refresh. Requiring it would make concurrent edits fail uploads for no data-integrity gain.
