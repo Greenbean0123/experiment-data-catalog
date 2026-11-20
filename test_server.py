@@ -24,9 +24,6 @@ from urllib.parse import urlencode
 import server
 from server import Store, Problem, export_csv, make_server, validate, experiment_number
 
-server.NOTEBOOK_PREFIXES.add("XY")  # Synthetic notebook prefix used throughout these tests.
-
-
 def launch_request(service, **params):
     client = HTTPConnection("127.0.0.1", service.server_port, timeout=3)
     try:
@@ -57,6 +54,7 @@ def serving(service):
 
 class StoreTests(unittest.TestCase):
     def test_shared_conditions_preserve_overrides_and_aliquot_times(self):
+        self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["XY"]}})
         amount = [{"name": "ODE", "amount": 0.5, "unit": "g"}]
         fields = {"precursors": ["B", "A"], "temperature": 250, "solvents": ["ODE"], "material_amounts": amount}
         a = self.store.save({"sample_id": "XY-1-780_5", **fields, "duration": 5})
@@ -539,6 +537,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertIsNone(issue["record_id"])
 
     def test_share_package_scope_evidence_checksums_and_formula_safety(self):
+        self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["XY"]}})
         parent = self.store.save({"sample_id": "OUTSIDE-PARENT", "notes": "private"})
         child = self.store.save({"sample_id": "=SAMPLE", "experiment_no": "XY-1-279",
                                  "lab_data": {"parent_id": parent, "treatment": "Anneal"}})
@@ -2666,36 +2665,162 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(self.store.backup_status()["folder"], str(target.resolve()))
 
     def test_local_catalog_file_configures_labels_prefixes_and_travels_with_backups(self):
-        import server as module
         local = {"notebook_prefixes": ["qz", "bad prefix", 7], "translations": {"categories": {"系列": "Series"}},
                  "precursor_aliases": [{"label": " Compound A ", "aliases": ["CA", "", 3]}, {"label": ""}, "bad"],
                  "phase_presets": {"default": ["Phase-A", " ", None], "other": "not a list"}}
         (self.store.data / "local-catalog.json").write_text(json.dumps(local, ensure_ascii=False), encoding="utf-8")
-        before = set(module.NOTEBOOK_PREFIXES)
-        try:
-            store = Store(self.store.data)
-            self.assertEqual(store.notebook_prefixes(), ["QZ"], "Only plain letter prefixes are accepted")
-            self.assertEqual(store.local_translations(), local["translations"])
-            self.assertEqual(store.conventions(), {"precursor_aliases": [{"label": "Compound A", "aliases": ["CA"]}],
-                                                   "phase_presets": {"default": ["Phase-A"]},
-                                                   "notebook_prefixes": sorted(module.NOTEBOOK_PREFIXES)},
-                             "Invalid convention entries are dropped")
-            first =store.save({"sample_id": "QZ-1-005_a"})
-            second = store.save({"sample_id": "QZ-I-005_b"})
-            self.assertEqual(store.shared_defaults("default", "QZ-1-005")["count"], 2, "Configured prefixes merge book 1 and I")
-            self.assertEqual(module.experiment_key("default", "OTHER-1-005"), "other-1-005", "Unlisted prefixes stay separate")
-            backup = self.root / "local.zip"
-            store.backup(backup)
-            with zipfile.ZipFile(backup) as archive:
-                self.assertEqual(json.loads(archive.read("data/local-catalog.json")), local)
-            store.folder_backup(self.root / "mirror")
-            self.assertEqual(json.loads((self.root / "mirror" / "data" / "local-catalog.json").read_text(encoding="utf-8")), local)
-            self.assertTrue(first and second)
-        finally:
-            module.NOTEBOOK_PREFIXES.clear()
-            module.NOTEBOOK_PREFIXES.update(before)
+        store = Store(self.store.data)
+        self.assertEqual(store.notebook_prefixes(), ["QZ"], "Only plain letter prefixes are accepted")
+        self.assertEqual(store.local_translations(), local["translations"])
+        self.assertEqual(store.conventions(), {"precursor_aliases": [{"label": "Compound A", "aliases": ["CA"]}],
+                                               "phase_presets": {"default": ["Phase-A"]},
+                                               "notebook_prefixes": ["QZ"]},
+                         "Invalid convention entries are dropped")
+        first = store.save({"sample_id": "QZ-1-005_a"})
+        second = store.save({"sample_id": "QZ-I-005_b"})
+        self.assertEqual(store.shared_defaults("default", "QZ-1-005")["count"], 2, "Configured prefixes merge book 1 and I")
+        self.assertEqual(server.experiment_key("OTHER-1-005", store.grouping_prefixes), "other-1-005", "Unlisted prefixes stay separate")
+        backup = self.root / "local.zip"
+        store.backup(backup)
+        with zipfile.ZipFile(backup) as archive:
+            self.assertEqual(json.loads(archive.read("data/local-catalog.json")), local)
+        store.folder_backup(self.root / "mirror")
+        self.assertEqual(json.loads((self.root / "mirror" / "data" / "local-catalog.json").read_text(encoding="utf-8")), local)
+        self.assertTrue(first and second)
         (self.store.data / "local-catalog.json").write_text("not json", encoding="utf-8")
         self.assertEqual((self.store.local_translations(), self.store.notebook_prefixes()), ({}, []), "A damaged file is ignored")
+
+    def test_local_catalog_http_round_trip_preserves_legacy_data_and_replaces_prefixes(self):
+        path = self.store.data / "local-catalog.json"
+        with make_server(self.store.data, 0) as service, serving(service):
+            cookie = session_cookie(service)
+            address = f"http://127.0.0.1:{service.server_port}"
+
+            def request(route, payload=None, expected=200, **headers):
+                client = HTTPConnection("127.0.0.1", service.server_port, timeout=3)
+                try:
+                    client.request("PUT" if payload is not None else "GET", service.session_prefix + "api/" + route,
+                                   json.dumps(payload) if payload is not None else None,
+                                   {"Cookie": cookie, "Origin": address, "X-Catalog-Local": "1",
+                                    "Content-Type": "application/json", **headers})
+                    with client.getresponse() as response:
+                        body = json.loads(response.read())
+                        self.assertEqual(response.status, expected, body)
+                        return body
+                finally:
+                    client.close()
+
+            defaults = request("local-catalog")
+            self.assertEqual(defaults, {"revision": "", "catalog": {"notebook_prefixes": [], "precursor_aliases": [],
+                             "translations": {"en": {}, "categories": {}, "datasetTitles": {}, "noteLines": {}, "noteRules": []}}})
+            self.assertFalse(path.exists())
+            request("local-catalog", expected=401, Cookie="")
+            for prefix in ("XY", "QZ"):
+                for book in ("1", "I"):
+                    service.store.save({"sample_id": f"{prefix}-{book}-42"})
+
+            def count(prefix):
+                return request("experiment-defaults?" + urlencode({"project_id": "default", "experiment_no": prefix + "-I-42"}))["count"]
+
+            self.assertEqual((count("XY"), count("QZ")), (1, 1))
+            # Regex syntax is the client-side check. The backend validates the rule structure and flags.
+            translations = {"en": {"状态": "Status"}, "categories": {"薄膜": "Films"},
+                            "datasetTitles": {"资料": "Data"}, "noteLines": {"备注": "Note"},
+                            "noteRules": [{"pattern": "[", "flags": "imsu", "replacement": "Test"}]}
+            catalog = {"notebook_prefixes": ["xy"], "precursor_aliases": [{"label": "  Compound A  ", "aliases": [" CA "]}],
+                       "translations": translations}
+            payload = {"revision": "", "catalog": catalog}
+            request("local-catalog", payload, expected=403, Origin="https://example.com")
+            created = request("local-catalog", payload)
+            self.assertEqual(created, request("local-catalog"))
+            self.assertEqual(created["revision"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual((count("XY"), count("QZ")), (2, 1))
+            self.assertEqual(request("local-catalog", payload, expected=409),
+                             {"error": "本地约定已在其他窗口修改，请刷新后再保存。"})
+
+            legacy = {"about": {"text": "保留"}, "phase_presets": {"default": [" Legacy ", "legacy", "Phase II"]}}
+            raw = json.dumps({**created["catalog"], **legacy}, ensure_ascii=False).encode("utf-8")
+            path.write_bytes(raw)
+            self.assertEqual(request("local-catalog")["revision"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(request("projects/default/settings")["settings"]["phase_presets"], ["Legacy", "Phase II"])
+            replaced = request("local-catalog", {"revision": hashlib.sha256(raw).hexdigest(),
+                                               "catalog": {**catalog, "notebook_prefixes": ["QZ"]}})
+            self.assertEqual(replaced, request("local-catalog"))
+            self.assertEqual((count("XY"), count("QZ")), (1, 2))
+            saved = json.loads(path.read_bytes())
+            self.assertEqual({key: saved[key] for key in legacy}, legacy)
+            experiments = request("experiments")
+            self.assertEqual(experiments["translations"], translations)
+            self.assertEqual(experiments["conventions"], {"notebook_prefixes": ["QZ"],
+                             "precursor_aliases": [{"label": "Compound A", "aliases": ["CA"]}],
+                             "phase_presets": {"default": ["Legacy", "Phase II"]}})
+            self.assertEqual(experiments["project_settings"]["default"], request("projects/default/settings"))
+            request("projects/default/settings", {"revision": 0, "settings": {}})
+            self.assertEqual(request("experiments")["conventions"]["phase_presets"]["default"], [])
+
+            backup = self.root / "edited.zip"
+            service.store.backup(backup)
+            with zipfile.ZipFile(backup) as archive:
+                self.assertEqual(archive.read("data/local-catalog.json"), path.read_bytes())
+            mirror = self.root / "edited-mirror"
+            service.store.folder_backup(mirror)
+            self.assertEqual((mirror / "data" / "local-catalog.json").read_bytes(), path.read_bytes())
+        restored = Store(mirror / "data")
+        self.assertEqual(restored.shared_defaults("default", "QZ-I-42")["count"], 2)
+        self.assertEqual(restored.shared_defaults("default", "XY-I-42")["count"], 1)
+
+    def test_local_catalog_rejects_invalid_entries_without_changing_file(self):
+        valid = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        path = self.store.data / "local-catalog.json"
+        original = path.read_bytes()
+        alias = {"label": "Source A", "aliases": ["PA"]}
+        rule = {"pattern": "^A", "replacement": "B", "flags": "i"}
+        invalid = [
+            ("catalog object", []),
+            ("prefixes list", {"notebook_prefixes": "AB"}),
+            ("empty prefix", {"notebook_prefixes": [""]}),
+            ("prefix length", {"notebook_prefixes": ["a" * 21]}),
+            ("non-ASCII prefix", {"notebook_prefixes": ["ＡＢ"]}),
+            ("prefix count", {"notebook_prefixes": ["A"] * 51}),
+            ("alias list", {"precursor_aliases": {}}),
+            ("group count", {"precursor_aliases": [alias] * 201}),
+            ("label text", {"precursor_aliases": [{**alias, "label": 2}]}),
+            ("label length", {"precursor_aliases": [{**alias, "label": "a" * 251}]}),
+            ("alias text", {"precursor_aliases": [{**alias, "aliases": [2]}]}),
+            ("alias length", {"precursor_aliases": [{**alias, "aliases": ["a" * 251]}]}),
+            ("alias count", {"precursor_aliases": [{**alias, "aliases": ["a"] * 51}]}),
+            ("alias claim", {"precursor_aliases": [alias, {"label": "Source B", "aliases": [" p a "]}]}),
+            ("translations object", {"translations": []}),
+            ("map object", {"translations": {"en": []}}),
+            ("map string value", {"translations": {"categories": {"系列": 9}}}),
+            ("map key length", {"translations": {"datasetTitles": {"a" * 2001: "x"}}}),
+            ("map value length", {"translations": {"noteLines": {"a": "x" * 2001}}}),
+            ("map count", {"translations": {"en": {str(index): "x" for index in range(2001)}}}),
+            ("rules list", {"translations": {"noteRules": {}}}),
+            ("rule count", {"translations": {"noteRules": [rule] * 201}}),
+            ("rule type", {"translations": {"noteRules": ["^A"]}}),
+            ("pattern type", {"translations": {"noteRules": [{**rule, "pattern": 2}]}}),
+            ("replacement type", {"translations": {"noteRules": [{**rule, "replacement": []}]}}),
+            ("unrecognized flag", {"translations": {"noteRules": [{**rule, "flags": "g"}]}}),
+            ("duplicate flag", {"translations": {"noteRules": [{**rule, "flags": "ii"}]}}),
+        ]
+        for name, catalog in invalid:
+            with self.subTest(validation=name), self.assertRaises(Problem) as problem:
+                self.store.save_local_catalog({"revision": valid["revision"], "catalog": catalog})
+            self.assertEqual(problem.exception.status, 400)
+            self.assertTrue(str(problem.exception).startswith("本地约定格式不正确："))
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_local_catalog_failed_replace_preserves_file_and_active_prefixes(self):
+        old = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        path = self.store.data / "local-catalog.json"
+        content = path.read_bytes()
+        with patch.object(server.os, "replace", side_effect=PermissionError("file open")), self.assertRaises(PermissionError):
+            self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.store.get_local_catalog(), old)
+        self.assertEqual(self.store.conventions()["notebook_prefixes"], ["AB"])
+        self.assertEqual(list(self.store.data.glob(".part-local-catalog-*")), [])
 
     def test_interrupted_folder_backup_keeps_previous_consistent_snapshot(self):
         self.add("I-1", "a.csv", b"1,2\n")

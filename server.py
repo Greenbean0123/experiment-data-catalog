@@ -72,8 +72,9 @@ APP_ID = "experiment-data-catalog"
 # Lab-specific conventions (labels, precursor aliases, phase presets, ID prefixes) live in the data folder,
 # never in the program source. See README, "Lab conventions".
 LOCAL_CATALOG = "local-catalog.json"
-# Upper-case sample-ID prefixes whose notebook "1" is the same book as "I".
-NOTEBOOK_PREFIXES = set()
+CATALOG_TRANSLATION_MAPS = ("en", "categories", "datasetTitles", "noteLines")
+CATALOG_EDITOR_KEYS = {"notebook_prefixes", "precursor_aliases", "translations"}
+MAX_CATALOG_JSON = 512 * 1024 * 1024  # The translation maps can contain 32 million characters, even before JSON escaping.
 DB_HISTORY_KEEP = 30
 STALE_BACKUP_DAYS = 7
 
@@ -150,9 +151,9 @@ def experiment_number(sample_id):
     return match[1].upper() if match else sample_id
 
 
-def experiment_key(project_id, number):
+def experiment_key(number, notebook_prefixes):
     match = re.match(r"([A-Za-z]+)-1-(?=[0-9])", number, re.ASCII)
-    if match and match[1].upper() in NOTEBOOK_PREFIXES:
+    if match and match[1].upper() in notebook_prefixes:
         number = match[1] + "-I-" + number[match.end():]
     return number.lower()
 
@@ -553,6 +554,97 @@ def folder_entry(entry):
             "kind": lab_text(entry.get("kind", ""), 80)}
 
 
+def catalog_prefixes(value):
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and re.fullmatch(r"[A-Za-z]{1,20}", item)]
+
+
+def catalog_text(value, limit=None):
+    return (isinstance(value, str) and (limit is None or len(value) <= limit)
+            and not re.search(r"[\ud800-\udfff]", value))
+
+
+def validate_local_catalog(payload):
+    def invalid(detail):
+        return Problem("本地约定格式不正确：" + detail)
+
+    if not isinstance(payload, dict) or set(payload) - CATALOG_EDITOR_KEYS:
+        raise invalid("应为本地约定对象。")
+    prefixes = payload.get("notebook_prefixes", [])
+    if not isinstance(prefixes, list) or len(prefixes) > 50 or len(catalog_prefixes(prefixes)) != len(prefixes):
+        raise invalid("编号前缀最多 50 项，每项需为 1–20 个英文字母。")
+
+    aliases = payload.get("precursor_aliases", [])
+    if not isinstance(aliases, list) or len(aliases) > 200:
+        raise invalid("前驱体别名最多 200 组。")
+    entries, claimed = [], set()
+    for entry in aliases:
+        if not isinstance(entry, dict) or set(entry) != {"label", "aliases"}:
+            raise invalid("每组前驱体别名需包含显示名称与别名列表。")
+        label, names = entry["label"], entry["aliases"]
+        if not catalog_text(label, 250) or not label.strip():
+            raise invalid("前驱体名称需为 1–250 个字符。")
+        if (not isinstance(names, list) or len(names) > 50
+                or any(not catalog_text(name, 250) or not name.strip() for name in names)):
+            raise invalid("每组最多 50 个别名，每个别名需为 1–250 个字符。")
+        keys = {re.sub(r"\s+", "", name).lower() for name in [label, *names]}
+        if claimed & keys:
+            raise invalid("同一别名不能属于不同前驱体。")
+        claimed.update(keys)
+        entries.append({"label": label.strip(), "aliases": [name.strip() for name in names]})
+
+    translations = payload.get("translations", {})
+    if not isinstance(translations, dict) or set(translations) - {*CATALOG_TRANSLATION_MAPS, "noteRules"}:
+        raise invalid("译法应为包含受支持字段的对象。")
+    maps = {}
+    for key in CATALOG_TRANSLATION_MAPS:
+        mapping = translations.get(key, {})
+        if (not isinstance(mapping, dict) or len(mapping) > 2000
+                or any(not catalog_text(name, 2000) or not catalog_text(value, 2000) for name, value in mapping.items())):
+            raise invalid("每个译法表最多 2000 项，键和值均需为不超过 2000 个字符的文本。")
+        maps[key] = mapping
+    rules = translations.get("noteRules", [])
+    if not isinstance(rules, list) or len(rules) > 200:
+        raise invalid("备注规则最多 200 项。")
+    maps["noteRules"] = []
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) - {"pattern", "flags", "replacement"}:
+            raise invalid("备注规则需包含匹配式和替换文本。")
+        pattern, replacement, flags = rule.get("pattern"), rule.get("replacement"), rule.get("flags", "")
+        if not catalog_text(pattern) or not catalog_text(replacement):
+            raise invalid("备注规则的匹配式和替换内容需为文本。")
+        if not isinstance(flags, str) or not re.fullmatch(r"[imsu]{0,4}", flags) or len(set(flags)) != len(flags):
+            raise invalid("备注规则标记只能使用不重复的 i、m、s、u。")
+        maps["noteRules"].append({"pattern": pattern, "flags": flags, "replacement": replacement})
+    return {"notebook_prefixes": prefixes, "precursor_aliases": entries, "translations": maps}
+
+
+def decode_local_catalog(data):
+    try:
+        value = json.loads(data.decode("utf-8")) if data is not None else {}
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def local_catalog_revision(data):
+    return hashlib.sha256(data).hexdigest() if data is not None else ""
+
+
+def write_local_catalog(path, data):
+    target = tempfile.NamedTemporaryFile(dir=path.parent, prefix=".part-local-catalog-", delete=False)
+    part = Path(target.name)
+    try:
+        with target:
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(part, path)
+    finally:
+        part.unlink(missing_ok=True)
+
+
 class Store:
     def __init__(self, data_dir):
         self.data = Path(data_dir)
@@ -564,7 +656,7 @@ class Store:
         self.file_copy_lock = threading.Lock()
         self.backup_state_lock = threading.Lock()
         self.backup_progress = {"state": "idle"}
-        NOTEBOOK_PREFIXES.update(self.notebook_prefixes())  # One catalog per running service.
+        self.grouping_prefixes = frozenset(self.notebook_prefixes())
         self.check_schema_version()
         with self.connect() as db:
             new_categories = not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='categories'").fetchone()
@@ -740,24 +832,27 @@ class Store:
         finally:
             source.close()
 
+    def local_catalog_bytes(self):
+        with self.lock:
+            try:
+                return (self.data / LOCAL_CATALOG).read_bytes()
+            except FileNotFoundError:
+                return None
+
     def local_catalog(self):
-        """Read data/local-catalog.json: labels and ID conventions derived from this user's records."""
-        path = self.data / LOCAL_CATALOG
         try:
-            if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
-                return {}
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            return decode_local_catalog(self.local_catalog_bytes())
+        except OSError:
             return {}
+
+    def local_translations(self, local=None):
+        value = (self.local_catalog() if local is None else local).get("translations")
         return value if isinstance(value, dict) else {}
 
-    def local_translations(self):
-        value = self.local_catalog().get("translations")
-        return value if isinstance(value, dict) else {}
-
-    def conventions(self):
-        """Optional display conventions for the page; invalid entries are dropped."""
-        local = self.local_catalog()
+    def conventions(self, local=None):
+        """Optional display conventions for the page; invalid legacy entries are dropped."""
+        if local is None:
+            local = self.local_catalog()
         aliases = []
         for entry in local.get("precursor_aliases", []) if isinstance(local.get("precursor_aliases"), list) else []:
             if isinstance(entry, dict) and isinstance(entry.get("label"), str) and entry["label"].strip():
@@ -775,11 +870,40 @@ class Store:
                         if tag and valid_settings_text(tag, 80):
                             unique.setdefault(tag.casefold(), tag)
                 phases[project] = list(unique.values())[:20]
-        return {"precursor_aliases": aliases[:200], "phase_presets": phases, "notebook_prefixes": sorted(NOTEBOOK_PREFIXES)}
+        return {"precursor_aliases": aliases[:200], "phase_presets": phases, "notebook_prefixes": sorted(self.grouping_prefixes)}
 
     def notebook_prefixes(self):
-        value = self.local_catalog().get("notebook_prefixes")
-        return sorted({item.upper() for item in value if isinstance(item, str) and re.fullmatch(r"[A-Za-z]{1,20}", item)}) if isinstance(value, list) else []
+        return sorted({item.upper() for item in catalog_prefixes(self.local_catalog().get("notebook_prefixes"))})
+
+    def get_local_catalog(self):
+        data = self.local_catalog_bytes()
+        local = decode_local_catalog(data)
+        translations = self.local_translations(local)
+        maps = {}
+        for key in CATALOG_TRANSLATION_MAPS:
+            mapping = translations.get(key)
+            maps[key] = {name: value for name, value in mapping.items() if catalog_text(name) and catalog_text(value)} if isinstance(mapping, dict) else {}
+        rules = translations.get("noteRules")
+        maps["noteRules"] = [{"pattern": rule["pattern"], "replacement": rule["replacement"], "flags": rule.get("flags", "")}
+                             for rule in rules if isinstance(rule, dict) and catalog_text(rule.get("pattern"))
+                             and catalog_text(rule.get("replacement")) and catalog_text(rule.get("flags", ""))] if isinstance(rules, list) else []
+        catalog = {"notebook_prefixes": catalog_prefixes(local.get("notebook_prefixes")),
+                   "precursor_aliases": self.conventions(local)["precursor_aliases"], "translations": maps}
+        return {"catalog": catalog, "revision": local_catalog_revision(data)}
+
+    def save_local_catalog(self, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("revision"), str):
+            raise Problem("本地约定格式不正确：需提供版本号。")
+        with self.lock:
+            data = self.local_catalog_bytes()
+            if payload["revision"] != local_catalog_revision(data):
+                raise Problem("本地约定已在其他窗口修改，请刷新后再保存。", 409)
+            catalog = validate_local_catalog(payload.get("catalog"))
+            updated = {**decode_local_catalog(data), **catalog}
+            content = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8", errors="backslashreplace")
+            write_local_catalog(self.data / LOCAL_CATALOG, content)
+            self.grouping_prefixes = frozenset(item.upper() for item in catalog["notebook_prefixes"])
+            return {"catalog": catalog, "revision": local_catalog_revision(content)}
 
     def setting(self, db, key, default=None):
         row = db.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
@@ -847,9 +971,10 @@ class Store:
                     "condition_options": {field: [row["name"] for row in db.execute("SELECT name FROM condition_options WHERE field=? AND hidden=0 ORDER BY name", (field,))] for field in CONDITION_FIELDS}}
 
     def shared_group(self, db, project_id, number):
-        key = experiment_key(project_id, number)
+        prefixes = self.grouping_prefixes
+        key = experiment_key(number, prefixes)
         members = [row for row in db.execute("SELECT * FROM experiments WHERE project_id=? AND archived=0 ORDER BY id", (project_id,))
-                   if experiment_key(project_id, row["experiment_no"] or experiment_number(row["sample_id"])) == key
+                   if experiment_key(row["experiment_no"] or experiment_number(row["sample_id"]), prefixes) == key
                    and not is_dataset(row)]
         stored = db.execute("SELECT settings FROM experiment_defaults WHERE project_id=? AND experiment_key=?", (project_id, key)).fetchone()
         settings = json.loads(stored["settings"]) if stored else None
@@ -903,7 +1028,7 @@ class Store:
     def write_shared_defaults(self, db, project_id, number, values):
         db.execute("""INSERT INTO experiment_defaults VALUES (?,?,?)
                    ON CONFLICT(project_id, experiment_key) DO UPDATE SET settings=excluded.settings WHERE settings<>excluded.settings""",
-                   (project_id, experiment_key(project_id, number), json.dumps(values, ensure_ascii=False)))
+                   (project_id, experiment_key(number, self.grouping_prefixes), json.dumps(values, ensure_ascii=False)))
 
     def remember_shared_baseline(self, db, group, record_id, current, clean):
         members, settings, previous, _ = group
@@ -2260,8 +2385,10 @@ class Store:
             by_id = {record["id"]: record for record in records if not is_dataset(record)}
             if any(key not in by_id or by_id[key]["revision"] != version for key, version in zip(ids, revisions)):
                 raise Problem(stale, 409)
+            prefixes = self.grouping_prefixes
+
             def group(record):
-                return record["project_id"], experiment_key(record["project_id"], record["experiment_no"]), record["archived"]
+                return record["project_id"], experiment_key(record["experiment_no"], prefixes), record["archived"]
 
             groups = {group(by_id[key]) for key in ids}
             if {key for key, record in by_id.items() if group(record) in groups} != set(ids):
@@ -2316,12 +2443,13 @@ class Store:
                            "catalog_id": json.loads(target.execute("SELECT value FROM app_settings WHERE key='catalog_id'").fetchone()[0])}
             finally:
                 target.close()
-        return files, sources, summary
+            conventions = self.local_catalog_bytes()
+        return files, sources, summary, conventions
 
     def backup(self, destination):
         with self.file_copy_lock, tempfile.TemporaryDirectory() as folder:
             snapshot = Path(folder) / "experiments.sqlite3"
-            files, review_sources, summary = self.snapshot_database(snapshot)
+            files, review_sources, summary, conventions = self.snapshot_database(snapshot)
             # Prevent purge from removing snapshot files during compression without blocking other writes.
             with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                 archive.write(snapshot, "data/experiments.sqlite3")
@@ -2332,8 +2460,8 @@ class Store:
                 for source in review_sources:
                     archive.write(self.data / "review-sources" / source["id"], "data/review-sources/" + source["id"],
                                   compress_type=zipfile.ZIP_STORED)
-                if (self.data / LOCAL_CATALOG).is_file():
-                    archive.write(self.data / LOCAL_CATALOG, "data/" + LOCAL_CATALOG)
+                if conventions is not None:
+                    archive.writestr("data/" + LOCAL_CATALOG, conventions)
                 archive.writestr("RESTORE.txt", "Experiment Data Catalog backup\nStop the app before restoring. Keep the existing data folder as a separate backup. Extract this archive into a fresh copy of the app folder (never merge two data folders), then start the app. The data folder includes all records, archived records, and attachments. CSV exports alone are not full backups.\n")
         return {"records": summary["records"], "files": len(files), "bytes": sum(item["size"] for item in files)}
 
@@ -2471,7 +2599,7 @@ class Store:
         snapshot.unlink(missing_ok=True)
         try:
             with self.file_copy_lock:
-                files, sources, summary = self.snapshot_database(snapshot)
+                files, sources, summary, conventions = self.snapshot_database(snapshot)
                 check = sqlite3.connect(snapshot)
                 try:
                     if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
@@ -2507,11 +2635,11 @@ class Store:
                     self.copy_verified(source, destination, expected, advance)
                     self.set_backup_progress(done_files=len(entries) - len(pending) + index, copied_files=index)
             self.set_backup_progress(phase="database")
-            if (self.data / LOCAL_CATALOG).is_file():
-                shutil.copy2(self.data / LOCAL_CATALOG, mirror / LOCAL_CATALOG)
             shutil.copy2(snapshot,target / "db-history" / f"experiments-{stamp}.sqlite3")
             for old in sorted((target / "db-history").glob("experiments-*.sqlite3"))[:-DB_HISTORY_KEEP]:
                 old.unlink(missing_ok=True)
+            if conventions is not None:
+                write_local_catalog(mirror / LOCAL_CATALOG, conventions)
             os.replace(snapshot, mirror / "experiments.sqlite3")
         finally:
             snapshot.unlink(missing_ok=True)
@@ -2649,11 +2777,11 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem("请求过大或长度无效。", 413)
         return size
 
-    def json_body(self):
+    def json_body(self, maximum=1024 * 1024):
         if self.headers.get_content_type() != "application/json":
             raise Problem("请求必须为 JSON。", 415)
         try:
-            return json.loads(self.rfile.read(self.body_length(1024 * 1024)))
+            return json.loads(self.rfile.read(self.body_length(maximum)))
         except (ValueError, UnicodeError):
             raise Problem("JSON 格式不正确。")
 
@@ -2666,9 +2794,10 @@ class Handler(BaseHTTPRequestHandler):
             result = {"id": saved_id, "record": record, "condition_options": store.catalog()["condition_options"]}
             if "shared_token" in payload:
                 project = record["project_id"]
-                key = experiment_key(project, record["experiment_no"])
+                prefixes = store.grouping_prefixes
+                key = experiment_key(record["experiment_no"], prefixes)
                 result["records"] = [row for row in records if row["project_id"] == project
-                                     and experiment_key(project, row["experiment_no"]) == key and not row["archived"] and not is_dataset(row)]
+                                     and experiment_key(row["experiment_no"], prefixes) == key and not row["archived"] and not is_dataset(row)]
         return self.send_json(result, 200 if record_id else 201)
 
     def valid_token(self, value):
@@ -2739,6 +2868,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Origin") not in {"http://" + host for host in self.allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
                 raise Problem("请从本机实验数据目录页面操作。", 403)
         query = parse_qs(self.url.query, keep_blank_values=self.command == "POST" and path.endswith("/files"))
+        if path == "/api/local-catalog" and self.command == "GET":
+            return self.send_json(store.get_local_catalog())
+        if path == "/api/local-catalog" and self.command == "PUT":
+            return self.send_json(store.save_local_catalog(self.json_body(MAX_CATALOG_JSON)))
         settings_match = re.fullmatch(r"/api/projects/([^/]+)/settings", path)
         if settings_match and self.command == "GET":
             return self.send_json(store.get_project_settings(settings_match[1]))
@@ -2777,12 +2910,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_file(archive_path, "application/zip", PACKAGE_NAME + "-source.zip")
             if path == "/api/experiments":
                 with store.lock, store.connect() as db:
-                    conventions = store.conventions()
+                    local = store.local_catalog()
+                    conventions = store.conventions(local)
                     project_settings = store.project_settings_map(db, conventions["phase_presets"])
                     conventions["phase_presets"].update({project: entry["settings"]["phase_presets"]
                                                          for project, entry in project_settings.items() if entry["revision"]})
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
-                              "translations": store.local_translations(), "conventions": conventions,
+                              "translations": store.local_translations(local), "conventions": conventions,
                               "project_settings": project_settings,
                               "trash_count": store.trash_count(db), "category_counts": store.category_counts(db)}
                 return self.send_json(result)
