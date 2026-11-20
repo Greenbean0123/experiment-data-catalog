@@ -121,6 +121,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(rows()[blank]["temperature"], 270)
         self.assertEqual(Store(self.store.data).shared_defaults("default", "XY-1-780")["conditions"]["temperature"], 300)
 
+    def test_shared_save_leaves_disabled_conditions_untouched(self):
+        initial = {"experiment_no": "Disabled shared", "temperature": 240, "duration": 7,
+                   "precursor": "Old", "solvents": ["ODE"], "material_amounts": [{"name": "ODE", "amount": 1, "unit": "g"}]}
+        a, b, fixed = [self.store.save({**initial, "sample_id": f"Sample {letter}"}) for letter in "ABC"]
+
+        def rows():
+            return {row["id"]: row for row in self.store.list()}
+
+        def defaults():
+            return self.store.shared_defaults("default", initial["experiment_no"])
+
+        self.store.save({**rows()[a], "shared_token": defaults()["token"]}, a)
+        self.store.save({**rows()[a], "temperature": 260}, a)
+        self.store.save({**rows()[fixed], "temperature": None}, fixed)
+        self.store.save_project_settings("default", {"revision": 0, "settings": {
+            "builtin": {field: {"enabled": False} for field in ("temperature", "duration", "materials")}}})
+        submitted = dict(rows()[a])
+        for field in ("duration", "solvents", "solvent", "ligand", "material_amounts"):
+            del submitted[field]
+        self.store.save({**submitted, "precursor": "New", "shared_token": defaults()["token"]}, a)
+        saved = rows()
+        self.assertEqual([saved[key]["temperature"] for key in (a, b, fixed)], [260, 240, None])
+        self.assertEqual(defaults()["conditions"]["temperature"], 240)
+        for row in saved.values():
+            self.assertEqual((row["precursor"], row["duration"], row["solvents"], row["material_amounts"]),
+                             ("New", 7, initial["solvents"], initial["material_amounts"]))
+
+        self.store.save_project_settings("default", {"revision": 1, "settings": {}})
+        self.store.save({**rows()[a], "temperature": 270, "shared_token": defaults()["token"]}, a)
+        self.assertEqual([rows()[key]["temperature"] for key in (a, b, fixed)], [270, 270, None])
+
     def test_individual_save_retains_agreed_defaults_and_explicit_blanks(self):
         group = {"experiment_no": "Test run", "precursors": ["Ni source"], "temperature": 0}
         base = self.store.save({**group, "sample_id": "First"})
@@ -285,17 +316,88 @@ class StoreTests(unittest.TestCase):
                           and item["kind"] == "missing_conditions" and not item["field"]], [["precursor", "temperature"]])
         for record_id in waived:
             self.assertEqual([item["field"] for item in items if item["record_id"] == record_id and item["field"]],
-                             ["key:condition:Substrate"])
+                             ["key:condition:substrate"])
         self.assertFalse(any(item["record_id"] == filled and item["field"] for item in items))
         measured = [item for item in items if item["record_id"] == empty and item["field"]]
         self.assertEqual([(item["field"], item["title"], item["missing"]) for item in measured], [
-            ("key:condition:Substrate", "缺少关键字段：Substrate", ["Substrate"]),
-            ("key:result:Thickness", "缺少关键字段：Thickness", ["Thickness"]),
+            ("key:condition:substrate", "缺少关键字段：Substrate", ["Substrate"]),
+            ("key:result:thickness", "缺少关键字段：Thickness", ["Thickness"]),
         ])
         self.store.add_review({"issue_id": measured[1]["id"]})
         stored = next(item for item in self.store.review_list()["items"] if item["id"] == measured[1]["id"])
         self.assertEqual((stored["generated"], stored["field"], stored["title"]),
                          (False, measured[1]["field"], measured[1]["title"]))
+
+    def test_builtin_review_disposition_survives_field_toggles(self):
+        record = self.store.save({"sample_id": "Legacy", "duration": 5, "solvent": "Water"})
+
+        def issues():
+            return [item for item in self.store.review_list()["items"] if item["record_id"] == record
+                    and item["kind"] == "missing_conditions"]
+
+        original, = issues()
+        self.assertEqual(original["missing"], ["precursor", "temperature"])
+        revision = self.store.add_review({"issue_id": original["id"]})["revision"]
+        self.store.decide_review(original["id"], {"preview": False, "status": "resolved", "revision": revision,
+                                 "record_revision": original["record_revision"]})
+        for revision, enabled in enumerate((False, True)):
+            with self.subTest(enabled=enabled):
+                self.store.save_project_settings("default", {"revision": revision, "settings": {
+                    "builtin": {"temperature": {"enabled": enabled}}}})
+                self.assertEqual([(item["id"], item["status"]) for item in issues()], [(original["id"], "resolved")])
+
+    def test_key_field_review_disposition_survives_casing_only_rename(self):
+        field = dict(section="condition", label="Substrate", type="text")
+        template = dict(project_id="default", name="Film", revision=0, fields=[field])
+        self.store.save_template(template)
+        key = {"section": "condition", "label": "Substrate", "check_missing": True}
+        self.store.save_project_settings("default", {"revision": 0, "settings": {"key_fields": [key]}})
+        record = self.store.save({"sample_id": "Film"})
+
+        def issues():
+            return [item for item in self.store.review_list()["items"] if item["record_id"] == record and item["field"]]
+
+        original, = issues()
+        revision = self.store.add_review({"issue_id": original["id"]})["revision"]
+        self.store.decide_review(original["id"], {"preview": False, "status": "dismissed", "revision": revision,
+                                 "record_revision": original["record_revision"], "note": "Checked notebook"})
+        self.store.save_template({**template, "revision": 1, "fields": [{**field, "label": "SUBSTRATE"}]})
+        saved = self.store.save_project_settings("default", {"revision": 1, "settings": {"key_fields": [key]}})
+        self.assertEqual([(item["id"], item["status"]) for item in issues()], [(original["id"], "dismissed")])
+        self.assertEqual(saved["fields"][0]["id"], original["field"])
+        pending = self.store.save({"sample_id": "Another film"})
+        renamed = next(item for item in self.store.review_list()["items"] if item["record_id"] == pending and item["field"])
+        self.assertEqual((renamed["field"], renamed["title"]), ("key:condition:substrate", "缺少关键字段：SUBSTRATE"))
+
+    def test_unavailable_key_field_has_no_automatic_missing_item(self):
+        template = dict(project_id="default", name="Film", revision=0,
+                        fields=[dict(section="condition", label="Substrate", type="text")])
+        self.store.save_template(template)
+        key = {"section": "condition", "label": "Substrate", "check_missing": True}
+        self.store.save_project_settings("default", {"revision": 0, "settings": {"key_fields": [key]}})
+        record = self.store.save({"sample_id": "Film"})
+        item = next(item for item in self.store.review_list()["items"] if item["record_id"] == record and item["field"])
+        self.store.add_review({"issue_id": item["id"]})
+        self.store.save_template({**template, "revision": 1, "fields": [{**template["fields"][0], "label": "Wafer"}]})
+        self.assertFalse(any(item["field"] for item in self.store.review_list()["items"] if item["record_id"] == record))
+
+    def test_key_fields_match_lowercase_without_unicode_casefolding(self):
+        field = dict(section="condition", label="Straße", type="text")
+        template = dict(project_id="default", name="Film", revision=0, fields=[field])
+        self.store.save_template(template)
+        record = self.store.save({"sample_id": "Original spelling", "lab_data": {"values": {"0": "Si"}}})
+        key = {"section": "condition", "label": "STRASSE"}
+        with self.subTest(check="settings"):
+            with self.assertRaises(Problem) as problem:
+                self.store.save_project_settings("default", {"revision": 0, "settings": {"key_fields": [key]}})
+            self.assertEqual((problem.exception.status, str(problem.exception)), (400, "关键字段必须来自当前实验模板。"))
+        with self.subTest(check="template labels"):
+            self.store.save_template({**template, "revision": 1, "fields": [field, {**field, "label": "STRASSE"}]})
+            saved = self.store.save_project_settings("default", {"revision": 0, "settings": {
+                "key_fields": [{**key, "label": "STRAßE", "check_missing": True}, {**key, "check_missing": True}]}})
+            self.assertEqual([info["id"] for info in saved["fields"]], ["key:condition:straße", "key:condition:strasse"])
+            fields = [item["field"] for item in self.store.review_list()["items"] if item["record_id"] == record and item["field"]]
+            self.assertEqual(fields, ["key:condition:strasse"])
 
     def test_bulk_key_fields_edit_saved_versions_and_undo(self):
         fields = [dict(section="condition", label="Substrate", type="text"),
@@ -307,7 +409,7 @@ class StoreTests(unittest.TestCase):
         self.store.save_template(template)
         original = {"0": "Si", "1": 0, "2": "Cold", "3": ["A"], "4": "Keep"}
         old = self.store.save({"sample_id": "Old", "lab_data": {"values": original, "outcome": "measured"}})
-        latest = [{**fields[1], "unit": "µm"}, fields[3], fields[0], {**fields[2], "options": ["Cold", "Hot", "Warm"]}, fields[4]]
+        latest = [fields[1], fields[3], fields[0], {**fields[2], "options": ["Cold", "Hot", "Warm"]}, fields[4]]
         self.store.save_template({**template, "revision": 1, "fields": latest})
         new = self.store.save({"sample_id": "New", "lab_data": {"values": {str(index): original[str(previous)]
                                for index, previous in enumerate((1, 3, 0, 2, 4))}}})
@@ -322,13 +424,14 @@ class StoreTests(unittest.TestCase):
         edits = [{**key, "mode": mode, "value": value} for key, mode, value in
                  zip(keys, ("set", "set", "set", "replace"), ("  Glass  ", 3.5, "Hot", ["B"]))]
         edits[0]["label"] = "SUBSTRATE"
+        edits[1]["unit"] = "nm"
         results = bulk(edits, preview=True, duration={"mode": "set", "value": 15})
         self.assertEqual(results["updated"], 2)
         for preview in results["rows"]:
             self.assertEqual(preview["changes"], [
                 {"field": "duration", "before": None, "after": 15},
                 {"field": "key:condition:Substrate", "before": "Si", "after": "Glass"},
-                {"field": "key:result:Thickness", "before": 0, "after": 3.5},
+                {"field": "key:result:Thickness", "before": 0, "after": 3.5, "unit": "nm"},
                 {"field": "key:condition:Process", "before": "Cold", "after": "Hot"},
                 {"field": "key:condition:Dopants", "before": ["A"], "after": ["B"]},
             ])
@@ -390,6 +493,58 @@ class StoreTests(unittest.TestCase):
                              (400, "以下样品的模板没有字段 Power：" + "、".join(samples[:10])))
             self.assertEqual(self.store.list(), before)
             self.assertEqual(self.store.history(), history)
+
+    def test_bulk_number_set_requires_matching_units_in_every_template(self):
+        template = dict(project_id="default", name="Film", revision=0,
+                        fields=[dict(section="result", label="Thickness", type="number", unit="nm")])
+        self.store.save_template(template)
+        old = self.store.save({"sample_id": "Old film", "lab_data": {"values": {"0": 20}}})
+        self.store.save_template({**template, "revision": 1, "fields": [{**template["fields"][0], "unit": "µm"}]})
+        new = self.store.save({"sample_id": "New film", "lab_data": {"values": {"0": 2}}})
+        key = {"section": "result", "label": "Thickness"}
+        self.store.save_project_settings("default", {"revision": 0, "settings": {"key_fields": [key]}})
+        before, history = self.store.list(), self.store.history()
+        records = [{"id": record, "revision": 1} for record in (new, old)]
+        action = {**key, "mode": "set", "value": 3.5}
+        for fields, samples in (({}, "New film、Old film"), ({"unit": "µm"}, "Old film"), ({"unit": "nm"}, "New film")):
+            for preview in (True, False):
+                with self.subTest(fields=fields, preview=preview):
+                    with self.assertRaises(Problem) as problem:
+                        self.store.bulk_update({"preview": preview, "records": records,
+                                                "changes": {"key_fields": [{**action, **fields}]}})
+                    self.assertEqual((problem.exception.status, str(problem.exception)),
+                                     (400, f"以下样品的单位与所填单位不同：{samples}"))
+                    self.assertEqual(self.store.list(), before)
+                    self.assertEqual(self.store.history(), history)
+        preview = self.store.bulk_update({"preview": True, "records": records[:1],
+                                          "changes": {"key_fields": [{**action, "unit": "µm"}]}})
+        self.assertEqual(preview["rows"][0]["changes"], [
+            {"field": "key:result:Thickness", "before": 2, "after": 3.5, "unit": "µm"}])
+        cleared = self.store.bulk_update({"preview": True, "records": records,
+                                          "changes": {"key_fields": [{**key, "mode": "clear"}]}})
+        self.assertEqual([(change["after"], change["unit"]) for row in cleared["rows"] for change in row["changes"]],
+                         [(None, "µm"), (None, "nm")])
+
+    def test_bulk_refuses_disabled_builtins_in_any_selected_project(self):
+        disabled = self.store.add_catalog_item("projects", {"name": "Disabled conditions"})["project"]["id"]
+        self.store.save_project_settings(disabled, {"revision": 0, "settings": {"builtin": {
+            field: {"enabled": False} for field in ("precursor", "temperature", "duration", "materials")}}})
+        first = self.store.save({"sample_id": "Allowed", "temperature": 200})
+        second = self.store.save({"sample_id": "Disabled", "project_id": disabled, "temperature": 200})
+        before, history = self.store.list(), self.store.history()
+        cases = (("temperature", 225, "温度"), ("duration", 5, "反应/取样时间"),
+                 ("precursor", "A", "前驱体"), ("precursors", ["A"], "前驱体"), ("solvents", ["A"], "溶剂 / 配体"))
+        for field, value, label in cases:
+            for preview in (True, False):
+                with self.subTest(field=field, preview=preview):
+                    with self.assertRaises(Problem) as problem:
+                        self.store.bulk_update({"preview": preview, "records": [{"id": first, "revision": 1},
+                                                {"id": second, "revision": 1}],
+                                                "changes": {field: {"mode": "set", "value": value}}})
+                    self.assertEqual((problem.exception.status, str(problem.exception)),
+                                     (400, f"以下样品所在项目已关闭字段 {label}：Disabled"))
+                    self.assertEqual(self.store.list(), before)
+                    self.assertEqual(self.store.history(), history)
 
     def test_sample_lineage_refuses_cycles_and_cross_project_links(self):
         parent = self.store.save({"sample_id": "BATCH"})
@@ -1805,7 +1960,7 @@ class HTTPTests(unittest.TestCase):
         fields += [dict(section="condition", label=f"Field {index}", type="text") for index in range(8)]
         template = dict(project_id=project, name="Settings test", revision=0, fields=fields)
         store.save_template(template)
-        key = {"section": "condition", "label": "  STRASSE ", "check_missing": True}
+        key = {"section": "condition", "label": "  STRAßE ", "check_missing": True}
         payload = {"revision": 0, "settings": {"builtin": {"temperature": {"enabled": False, "label": {"en": "  Heater "}},
                                                            "materials": {"label": {"zh": "材料"}}},
                                              "phase_presets": ["  Phase I ", "Phase II"], "key_fields": [key]}}
@@ -1817,7 +1972,8 @@ class HTTPTests(unittest.TestCase):
         expected["key_fields"] = [{"section": "condition", "label": "Straße", "check_missing": True}]
         expected["phase_presets"] = ["Phase I", "Phase II"]
         self.assertEqual(saved, {"settings": expected, "revision": 1,
-                                 "fields": [{**expected["key_fields"][0], "available": True, "type": "single",
+                                 "fields": [{**expected["key_fields"][0], "id": "key:condition:straße",
+                                             "available": True, "type": "single",
                                              "unit": "", "options": ["A", "B"]}]})
         self.assertEqual(request(payload, expected=409), {"error": "项目设置已在其他窗口修改，请刷新后再保存。"})
         invalid_settings = [
@@ -1836,7 +1992,8 @@ class HTTPTests(unittest.TestCase):
                              {"error": "关键字段必须来自当前实验模板。"})
         store.save_template({**template, "revision": 1, "fields": fields[1:]})
         unavailable = request()
-        self.assertEqual(unavailable["fields"], [{**expected["key_fields"][0], "available": False, "type": "",
+        self.assertEqual(unavailable["fields"], [{**expected["key_fields"][0], "id": "key:condition:straße",
+                                                  "available": False, "type": "",
                                                   "unit": "", "options": []}])
         self.assertEqual(unavailable["revision"], 1)
         experiments = json.loads(self.request("/api/experiments")[1])
@@ -1844,6 +2001,48 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(experiments["project_settings"][project], unavailable)
         self.assertEqual(experiments["conventions"]["phase_presets"][project], ["Phase I", "Phase II"])
         self.assertEqual(store.history(project_id=project)["batches"], [])
+
+    def test_experiments_and_grouping_writes_reload_hand_edited_catalog(self):
+        store = self.server.store
+        path = store.data / "local-catalog.json"
+        self.addCleanup(path.unlink, missing_ok=True)
+        a = store.save({"sample_id": "HOT-1-42_a"})
+        b = store.save({"sample_id": "HOT-I-42_b"})
+        self.assertEqual(store.shared_defaults("default", "HOT-I-42")["count"], 1)
+        translations = {"categories": {"其他": "Other data"}}
+        path.write_text(json.dumps({"notebook_prefixes": ["HOT"], "translations": translations}), encoding="utf-8")
+        with self.subTest(check="experiments"):
+            experiments = self.request_json("/api/experiments")
+            self.assertEqual(experiments["translations"], translations)
+            self.assertEqual(experiments["conventions"]["notebook_prefixes"], ["HOT"])
+            self.assertEqual(store.shared_defaults("default", "HOT-I-42")["count"], 2)
+
+        # A second hand edit happens after reading a token, with no list refresh before saving.
+        token = store.shared_defaults("default", "HOT-I-42")["token"]
+        path.write_text(json.dumps({"translations": {"en": {"其他": "Misc."}}}), encoding="utf-8")
+        row = next(row for row in store.list() if row["id"] == b)
+        with self.subTest(check="shared write"):
+            with self.assertRaises(Problem) as problem:
+                store.save({**row, "temperature": 200, "shared_token": token}, b)
+            self.assertEqual(problem.exception.status, 409)
+            self.assertEqual([row["temperature"] for row in store.list() if row["id"] in (a, b)], [None, None])
+
+    def test_unparsable_local_catalog_is_reported_and_preserved(self):
+        path = self.server.store.data / "local-catalog.json"
+        self.addCleanup(path.unlink, missing_ok=True)
+        original = b'{"about": "keep", "phase_presets": {"default": ["Film"]},}'
+        path.write_bytes(original)
+        revision = hashlib.sha256(original).hexdigest()
+        message = "local-catalog.json 无法解析，请先修复文件或删除后再编辑。"
+        with self.subTest(method="GET"):
+            self.assertEqual(self.request_json("/api/local-catalog"), {
+                "catalog": {"notebook_prefixes": [], "precursor_aliases": [], "translations": {
+                    "en": {}, "categories": {}, "datasetTitles": {}, "noteLines": {}, "noteRules": []}},
+                "revision": revision, "error": message})
+        with self.subTest(method="PUT"):
+            self.assertEqual(self.request_json("/api/local-catalog", {"catalog": {}, "revision": revision}, "PUT", 409),
+                             {"error": message})
+            self.assertEqual(path.read_bytes(), original)
 
     def test_csv_key_fields_use_each_samples_template_version_and_project(self):
         store = self.server.store
@@ -2771,6 +2970,112 @@ class DataSafetyTests(unittest.TestCase):
         restored = Store(mirror / "data")
         self.assertEqual(restored.shared_defaults("default", "QZ-I-42")["count"], 2)
         self.assertEqual(restored.shared_defaults("default", "XY-I-42")["count"], 1)
+
+    def test_prefix_merge_keeps_latest_defaults_and_both_override_sets(self):
+        def edit_shared(record, number, **changes):
+            row = next(row for row in self.store.list() if row["id"] == record)
+            token = self.store.shared_defaults("default", number)["token"]
+            self.store.save({**row, **changes, "shared_token": token}, record)
+
+        def build_group(number, temperature):
+            anchor = self.store.save({"sample_id": number + "_a", "temperature": 90})
+            fixed = self.store.save({"sample_id": number + "_b", "temperature": 90})
+            edit_shared(anchor, number, temperature=90)
+            row = next(row for row in self.store.list() if row["id"] == fixed)
+            self.store.save({**row, "temperature": 100}, fixed)
+            edit_shared(anchor, number, temperature=temperature)
+            return anchor, fixed
+
+        revision = ""
+        for prefix, later, edit_on_disk in (("AB", "I", False), ("CD", "1", True)):
+            with self.subTest(later=later, edit_on_disk=edit_on_disk):
+                earlier = "1" if later == "I" else "I"
+                other, other_fixed = build_group(f"{prefix}-{earlier}-42", 130)
+                anchor, fixed = build_group(f"{prefix}-{later}-42", 100)
+                if edit_on_disk:
+                    # Earlier builds recorded shared saves in history but did not timestamp default rows.
+                    with self.store.connect() as db:
+                        for row in db.execute("SELECT experiment_key,settings FROM experiment_defaults WHERE experiment_key LIKE 'cd-%'").fetchall():
+                            settings = json.loads(row["settings"])
+                            del settings["updated_at"]
+                            db.execute("UPDATE experiment_defaults SET settings=? WHERE project_id='default' AND experiment_key=?",
+                                       (json.dumps(settings), row["experiment_key"]))
+                old_token = self.store.shared_defaults("default", f"{prefix}-I-42")["token"]
+                if edit_on_disk:
+                    (self.store.data / "local-catalog.json").write_text(json.dumps({"notebook_prefixes": [prefix]}), encoding="utf-8")
+                else:
+                    revision = self.store.save_local_catalog({"revision": revision,
+                                  "catalog": {"notebook_prefixes": [prefix]}})["revision"]
+                merged = self.store.shared_defaults("default", f"{prefix}-I-42")
+                self.assertEqual((merged["count"], merged["conditions"]["temperature"]), (4, 100))
+                self.assertNotEqual(merged["token"], old_token)
+                edit_shared(anchor, f"{prefix}-I-42", temperature=110)
+                rows = {row["id"]: row["temperature"] for row in self.store.list()}
+                self.assertEqual([rows[key] for key in (anchor, fixed, other, other_fixed)], [110, 100, 130, 100])
+                if not edit_on_disk:
+                    edit_shared(anchor, f"{prefix}-I-42", temperature=100)
+                    revision = self.store.save_local_catalog({"revision": revision, "catalog": {}})["revision"]
+                    edit_shared(other, f"{prefix}-{earlier}-42", temperature=120)
+                    restored = next(row for row in self.store.list() if row["id"] == other_fixed)
+                    self.assertEqual(restored["temperature"], 100)
+
+    def test_folder_import_reloads_prefix_and_uses_the_only_stored_defaults(self):
+        numeric = self.store.save({"sample_id": "AB-1-42_a"})
+        token = self.store.shared_defaults("default", "AB-1-42")["token"]
+        self.store.save({"sample_id": "AB-1-42_a", "temperature": 200, "revision": 1, "shared_token": token}, numeric)
+        # The Roman-numeral group has recorded values but no saved shared defaults.
+        self.store.save({"sample_id": "AB-I-42_a", "temperature": 100})
+        (self.store.data / "local-catalog.json").write_text('{"notebook_prefixes": ["AB"]}', encoding="utf-8")
+        imported = self.store.add_file("", "trace.csv", "XRD", io.BytesIO(b"1,2"), 3,
+                                       folder_target=("default", "AB-I-42_b", "AB-I-42"))["record_id"]
+        self.assertEqual(next(row for row in self.store.list() if row["id"] == imported)["temperature"], 200)
+
+    def test_folder_backup_removes_deleted_local_catalog_from_mirror(self):
+        self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        mirror = self.root / "mirror"
+        self.store.folder_backup(mirror)
+        self.assertTrue((mirror / "data" / "local-catalog.json").is_file())
+        (self.store.data / "local-catalog.json").unlink()
+        restarted = Store(self.store.data)
+        with patch.object(server.os, "replace", side_effect=PermissionError("database open")), self.assertRaises(PermissionError):
+            restarted.folder_backup(mirror)
+        self.assertTrue((mirror / "data" / "local-catalog.json").is_file())
+        restarted.folder_backup(mirror)
+        self.assertFalse((mirror / "data" / "local-catalog.json").exists())
+        self.assertEqual(Store(mirror / "data").notebook_prefixes(), [])
+
+    def test_local_catalog_rechecks_bytes_after_preparing_replacement(self):
+        old = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        path = self.store.data / "local-catalog.json"
+        external = b'{"notebook_prefixes": ["AB"], "about": "Hand edit"}'
+        fsync = server.os.fsync
+
+        def hand_edit(fd):
+            fsync(fd)
+            path.write_bytes(external)
+
+        with patch.object(server.os, "fsync", side_effect=hand_edit), self.assertRaises(Problem) as problem:
+            self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+        self.assertEqual((problem.exception.status, str(problem.exception)),
+                         (409, "本地约定已在其他窗口修改，请刷新后再保存。"))
+        self.assertEqual(path.read_bytes(), external)
+        self.assertEqual(list(self.store.data.glob(".part-local-catalog-*")), [])
+
+    def test_precursor_aliases_use_exact_javascript_whitespace(self):
+        alias = {"label": "AB", "aliases": []}
+        whitespace = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+        for char in whitespace:
+            with self.subTest(char=repr(char)):
+                label = {"label": f"A{char}b", "aliases": []}
+                with self.assertRaises(Problem) as problem:
+                    self.store.save_local_catalog({"revision": "", "catalog": {"precursor_aliases": [alias, label]}})
+                self.assertEqual((problem.exception.status, str(problem.exception)),
+                                 (400, "本地约定格式不正确：同一别名不能属于不同前驱体。"))
+                self.assertFalse((self.store.data / "local-catalog.json").exists())
+        # Python's regex whitespace class includes these extra control characters.
+        with self.subTest(char="Python-only whitespace"):
+            self.store.save_local_catalog({"revision": "", "catalog": {"precursor_aliases": [
+                alias, {"label": "A\u0085B", "aliases": ["\u001cC\u001f"]}]}})
 
     def test_local_catalog_rejects_invalid_entries_without_changing_file(self):
         valid = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
