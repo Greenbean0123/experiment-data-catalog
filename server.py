@@ -86,13 +86,19 @@ class CatalogUnavailable(RuntimeError):
     """The data folder cannot be opened safely by this process."""
 
 
+class DataDirInUse(CatalogUnavailable):
+    """Another process holds the data folder lock."""
+
+
 class DataDirLock:
     """Exclusive lock so only one running program writes a data folder at a time."""
+
+    FILENAME = ".catalog.lock"
 
     def __init__(self, data_dir):
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
-        self.path = data_dir / ".catalog.lock"
+        self.path = data_dir / self.FILENAME
         try:
             self.handle = open(self.path, "a+b")
         except OSError as exc:
@@ -108,7 +114,7 @@ class DataDirLock:
         except OSError:
             self.handle.close()
             self.handle = None
-            raise CatalogUnavailable(
+            raise DataDirInUse(
                 "此数据目录已被另一个实验数据目录程序（浏览器版或桌面版）打开。请先关闭它再启动。\n"
                 f"This data folder is already open in another Experiment Data Catalog window or service. Close it first.\n{data_dir}")
 
@@ -909,7 +915,8 @@ class Store:
         for record_id, before in before_rows.items():
             row = db.execute("SELECT * FROM experiments WHERE id=?", (record_id,)).fetchone()
             old, new = history_state(before), history_state(row)
-            if old != new:
+            # The only field change being undone may have been an evidence link already removed by purge.
+            if old != new or action == "undo":
                 entries.append((record_id, json.dumps(old, ensure_ascii=False) if old is not None else None,
                                 json.dumps(new, ensure_ascii=False), row["revision"]))
         if not entries:
@@ -998,17 +1005,24 @@ class Store:
                                     {item["id"] for item in revisions} != ids):
                     raise Problem("请先预览撤销内容。")
                 versions = {item["id"]: item["revision"] for item in revisions} if not preview else {}
+                file_ids = {row["id"] for row in db.execute("SELECT id FROM files")}
                 for entry in entries:
                     before, after = history_state(json.loads(entry["before_state"])), history_state(json.loads(entry["after_state"]))
                     current = db.execute("SELECT * FROM experiments WHERE id=?", (entry["record_id"],)).fetchone()
+                    state = history_state(current)
+                    if before["result_summary"] != after["result_summary"]:
+                        for version in (before, after, state):
+                            result = validate_result_summary(json.loads(version["result_summary"]))
+                            result["evidence_ids"] = [file_id for file_id in result["evidence_ids"] if file_id in file_ids]
+                            version["result_summary"] = json.dumps(result, ensure_ascii=False)
                     changed = {key: before[key] for key in HISTORY_FIELDS if key != "lab_data" and before[key] != after[key]}
                     if changed.keys() & {"precursor", "precursors"}:
                         changed.update(precursor=before["precursor"], precursors=before["precursors"])
-                    if (not preview and current["revision"] != versions[entry["record_id"]]) or any(current[key] != after[key] for key in changed):
+                    if (not preview and current["revision"] != versions[entry["record_id"]]) or any(state[key] != after[key] for key in changed):
                         raise Problem("相关字段已有后续修改，未撤销任何记录。请刷新后核对。", 409)
                     if before["lab_data"] != after["lab_data"]:
                         changed["lab_data"] = restore_lab_fields(before["lab_data"], after["lab_data"], current["lab_data"])
-                    restored = {**history_state(current), **changed}
+                    restored = {**state, **changed}
                     if restored["project_id"] != current["project_id"] and json.loads(restored["lab_data"]).get("template_revision"):
                         raise Problem("此样品使用当前项目的模板，无法撤销到其他项目。", 409)
                     try:
@@ -1016,7 +1030,7 @@ class Store:
                     except Problem:
                         raise Problem("原值与当前数据约束冲突，未撤销任何记录。请手动核对。", 409)
                     rows.append({"id": entry["record_id"], "sample_id": current["sample_id"], "project_id": current["project_id"],
-                                 "revision": current["revision"], "changes": history_changes(history_state(current), restored)})
+                                 "revision": current["revision"], "changes": history_changes(state, restored)})
                     updates.append((dict(current), changed))
                 if batch["review_id"]:
                     review = db.execute("SELECT * FROM review_items WHERE id=?", (batch["review_id"],)).fetchone()
@@ -1025,8 +1039,9 @@ class Store:
                 if not preview:
                     now = timestamp()
                     for current, changed in updates:
-                        db.execute("UPDATE experiments SET " + ",".join(key + "=?" for key in changed) + ",revision=revision+1,updated_at=? WHERE id=?",
-                                   (*changed.values(), now, current["id"]))
+                        if changed:
+                            db.execute("UPDATE experiments SET " + ",".join(key + "=?" for key in changed) + ",revision=revision+1,updated_at=? WHERE id=?",
+                                       (*changed.values(), now, current["id"]))
                     undo_id = self.log_history(db, {current["id"]: current for current, _ in updates}, "undo")
                     db.executemany("UPDATE history_entries SET reverted_by=? WHERE batch_id=? AND record_id=?", ((undo_id, batch_id, record_id) for record_id in ids))
                     if batch["review_id"]:
@@ -1748,7 +1763,8 @@ class Store:
         db.executemany("UPDATE experiments SET updated_at=?,revision=revision+1 WHERE id=?",
                        ((now, record_id) for record_id in record_ids))
 
-    def add_file(self, record_id, name, kind, stream, size, source="", folder_target=None, receipt=""):
+    def add_file(self, record_id, name, kind, stream, size, source="", folder_target=None, receipt="",
+                 *, project_id=None, sample_id=None):
         validate_file_name(name)
         if not 0 < size <= MAX_FILE:
             raise Problem("请选择非空文件；单个文件上限为 256 MB。", 413)
@@ -1795,9 +1811,12 @@ class Store:
                             record_id = self.insert_record(db, clean, timestamp())
                             created = True
                     else:
-                        row = db.execute("SELECT archived FROM experiments WHERE id=?", (record_id,)).fetchone()
+                        row = db.execute("SELECT archived, project_id, sample_id FROM experiments WHERE id=?", (record_id,)).fetchone()
                         if not row:
                             raise Problem("请先保存实验，再添加文件。", 404)
+                        if ((project_id is not None and project_id != row["project_id"]) or
+                                (sample_id is not None and sample_id != row["sample_id"])):
+                            raise Problem("目标样品已变化，请刷新后再上传。", 409)
                         if row["archived"]:
                             raise Problem(ARCHIVED_ATTACHMENTS, 409)
                     self.check_file_slot(db, record_id, name, kind, file_id)
@@ -1989,7 +2008,7 @@ class Store:
 
     def reconcile_storage(self):
         with self.connect() as db:
-            referenced = {row["id"] for row in db.execute("SELECT id FROM files")}
+            referenced = {row["id"].lower() for row in db.execute("SELECT id FROM files")}
             pending = {}
             for row in db.execute("SELECT key, value FROM app_settings WHERE key GLOB ?", (PENDING_PURGE_PREFIX + "*",)):
                 file_id = row["key"][len(PENDING_PURGE_PREFIX):]
@@ -1998,7 +2017,12 @@ class Store:
         self.unlink_purged_files(pending)
         orphaned = self.data / "orphaned"
         for path in self.files.iterdir():
-            if path.name in referenced or path.name in pending or not (path.is_symlink() or path.is_file()):
+            name = path.name
+            if name.lower() in referenced or name in pending:
+                continue
+            if not (name.startswith(".part-") or re.fullmatch(r"[a-f0-9]{32}", name)):
+                continue
+            if not (path.is_symlink() or path.is_file()):
                 continue
             try:
                 orphaned.mkdir(exist_ok=True)
@@ -2136,8 +2160,21 @@ class Store:
             raise Problem("备份文件夹不能是当前实验库的数据目录或其子目录，请选择另一个位置（最好是另一块磁盘）。")
         if target.exists() and not target.is_dir():
             raise Problem("备份路径已存在且不是文件夹。")
-        if (mirror / ".catalog.lock").exists():
-            raise Problem("目标文件夹是一个正在使用的实验库，不是备份位置。")
+        if (mirror / DataDirLock.FILENAME).exists():
+            self.lock_backup_destination(mirror).release()
+        self.check_backup_catalog(target)
+        return target
+
+    @staticmethod
+    def lock_backup_destination(mirror):
+        try:
+            return DataDirLock(mirror)
+        except DataDirInUse as exc:
+            raise Problem("目标文件夹是一个正在使用的实验库，不是备份位置。") from exc
+        except CatalogUnavailable as exc:
+            raise Problem(str(exc)) from exc
+
+    def check_backup_catalog(self, target):
         marker = target / BACKUP_MARKER
         if marker.exists():
             try:
@@ -2148,16 +2185,15 @@ class Store:
                 catalog_id = self.setting(db, "catalog_id")
             if info.get("catalog_id") != catalog_id:
                 raise Problem("目标文件夹保存的是另一个实验库的备份，请换一个文件夹。", 409)
-        elif (mirror / "experiments.sqlite3").exists():
+        elif (target / "data" / "experiments.sqlite3").exists():
             raise Problem("目标文件夹已有实验库文件，但不是本程序生成的备份。请换一个空文件夹。", 409)
-        return target
 
     def start_folder_backup(self, payload):
-        target = self.backup_target(payload.get("path") if isinstance(payload, dict) else None)
-        verify = bool(payload.get("verify"))
         if not self.backup_guard.acquire(blocking=False):
             raise Problem("已有备份正在进行，请等待完成。", 409)
         try:
+            target = self.backup_target(payload.get("path") if isinstance(payload, dict) else None)
+            verify = bool(payload.get("verify"))
             self.set_backup_progress(state="running", phase="prepare", target=str(target), verify=verify, error="",
                                      started_at=timestamp(), finished_at="", total_files=0, done_files=0,
                                      copied_files=0, total_bytes=0, done_bytes=0, copied_bytes=0)
@@ -2209,6 +2245,14 @@ class Store:
         return digest.hexdigest()
 
     def folder_backup(self, target, verify=False):
+        lock = self.lock_backup_destination(target / "data")
+        try:
+            self.check_backup_catalog(target)
+            return self.write_folder_backup(target, verify)
+        finally:
+            lock.release()
+
+    def write_folder_backup(self, target, verify):
         """Mirror the catalog into target/data. Attachments are immutable, so only new files are copied.
 
         The database snapshot is published last: an interrupted run leaves the previous backup consistent.
@@ -2329,9 +2373,16 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(60)
 
     def log_request(self, code="-", size="-"):
-        # The launch URL contains a credential until its first redirect.
-        path = getattr(self, "path", "").partition("?")[0]
+        # The parsed route omits launch parameters and the instance prefix.
+        path = quote(getattr(self, "route", "[redacted]"), safe="/[]")
         self.log_message('"%s %s %s" %s %s', self.command, path, self.request_version, code, size)
+
+    def log_message(self, format, *args):
+        # Malformed request lines can also appear in parser errors.
+        message = format % args
+        for credential in (self.server.session_token, self.server.instance):
+            message = message.replace(credential, "[redacted]")
+        super().log_message("%s", message)
 
     def send_headers(self, status, content_type, length, filename=None, *, headers=()):
         self.send_response(status)
@@ -2457,7 +2508,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "GET":
             if self.headers.get("Origin") not in {"http://" + host for host in self.allowed_hosts} or self.headers.get("X-Catalog-Local") != "1":
                 raise Problem("请从本机实验数据目录页面操作。", 403)
-        query = parse_qs(self.url.query)
+        query = parse_qs(self.url.query, keep_blank_values=self.command == "POST" and path.endswith("/files"))
         if self.command == "GET":
             if path == "/":
                 if self.scoped:
@@ -2626,7 +2677,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if self.command == "POST" and action == "/files":
                 file_id = store.add_file(record_id, query.get("name", [""])[0], query.get("kind", [""])[0],
-                                         self.rfile, self.body_length(MAX_FILE))
+                                         self.rfile, self.body_length(MAX_FILE),
+                                         project_id=query.get("project_id", [None])[0], sample_id=query.get("sample_id", [None])[0])
                 return self.send_json({"id": file_id}, 201)
         raise Problem("找不到该页面或操作。", 404)
 
@@ -2676,7 +2728,7 @@ def make_server(data_dir, port=8765, *, server_type=LocalHTTPServer):
         server.store = Store(data_dir)
         server.store.reconcile_storage()
         server.session_token = secrets.token_urlsafe(32)
-        server.instance = secrets.token_hex(8)
+        server.instance = secrets.token_hex(16)
         server.session_prefix = f"/s/{server.instance}/"
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=session_path.parent,
                                          prefix=".part-catalog-session-", delete=False) as output:

@@ -733,6 +733,23 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.store.save({**saved, "result_summary": {}}, first)
         self.assertEqual(next(record for record in self.store.list() if record["id"] == first)["result_summary"]["confirmation"], "")
 
+    def test_upload_checks_sample_identity_after_reading_the_body(self):
+        record_id = self.store.save({"sample_id": "Before upload"})
+        stream = io.BytesIO(b"1")
+        read = stream.read
+
+        def rename_during_upload(size):
+            self.store.save({"sample_id": "Renamed during upload", "revision": 1}, record_id)
+            return read(size)
+
+        with patch.object(stream, "read", side_effect=rename_during_upload):
+            with self.assertRaisesRegex(Problem, "目标样品已变化，请刷新后再上传。") as stale:
+                self.store.add_file(record_id, "data.csv", "XRD", stream, 1, sample_id="Before upload")
+        self.assertEqual(stale.exception.status, 409)
+        row = self.store.list()[0]
+        self.assertEqual((row["sample_id"], row["revision"], row["files"]), ("Renamed during upload", 2, []))
+        self.assertEqual(list(self.store.files.iterdir()), [])
+
     def test_evidence_survives_move_and_unrelated_save_and_undo(self):
         owner = self.store.save({"sample_id": "Evidence owner"})
         target = self.store.save({"sample_id": "Evidence destination"})
@@ -798,7 +815,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
                         for row in db.execute("SELECT id, result_summary FROM experiments")}
         self.assertEqual(evidence, {owner: visible, target: []})
 
-    def test_undo_of_result_restores_a_purged_evidence_id(self):
+    def test_undo_of_result_does_not_restore_a_purged_evidence_id(self):
         record_id = self.store.save({"sample_id": "Purged result"})
         file_id = self.store.add_file(record_id, "evidence.csv", "XRD", io.BytesIO(b"1,2"), 3)
         row = self.store.list()[0]
@@ -815,9 +832,52 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertEqual((undone["result_summary"]["conclusion"], undone["result_summary"]["evidence_ids"]), ("Measured", []))
         with self.store.connect() as db:
             stored = json.loads(db.execute("SELECT result_summary FROM experiments WHERE id=?", (record_id,)).fetchone()[0])
-        self.assertEqual(stored["evidence_ids"], [file_id])
-        self.store.save({**undone, "result_summary": result, "notes": "Saved after purge"}, record_id)
-        self.assertEqual(self.store.list()[0]["notes"], "Saved after purge")
+        self.assertEqual(stored["evidence_ids"], [])
+        with self.assertRaisesRegex(Problem, "结果证据只能选择本样品已有的附件"):
+            self.store.save({**undone, "result_summary": result}, record_id)
+
+    def test_undo_conclusion_after_purge_preserves_active_and_trashed_evidence(self):
+        record_id = self.store.save({"sample_id": "Conclusion with evidence"})
+        evidence = [self.store.add_file(record_id, name, "XRD", io.BytesIO(b"1"), 1)
+                    for name in ("active.csv", "trashed.csv", "purged.csv")]
+        active, trashed, purged = evidence
+        before = {"conclusion": "Original conclusion", "evidence_ids": evidence}
+        self.store.save({**self.store.list()[0], "result_summary": before}, record_id)
+        self.store.save({**self.store.list()[0], "result_summary": {**before, "conclusion": "Revised conclusion"}}, record_id)
+        batch_id = self.store.history()["batches"][0]["id"]
+        for file_id in (trashed, purged):
+            self.store.change_file(file_id, "delete", {"record_revision": self.store.list()[0]["revision"]})
+        self.store.purge_trash({"file_ids": [purged], "confirm": "purge"})
+
+        preview = self.store.undo_history(batch_id, {"preview": True})
+        change, = preview["rows"][0]["changes"]
+        self.assertEqual(change["field"], "result_summary")
+        self.assertEqual(change["before"]["evidence_ids"], [active, trashed])
+        self.assertEqual(change["after"]["evidence_ids"], [active, trashed])
+        result = self.store.undo_history(batch_id, {"preview": False, "revisions": preview["revisions"]})
+        row = result["records"][0]
+        self.assertEqual(row["result_summary"]["conclusion"], "Original conclusion")
+        self.assertEqual(row["result_summary"]["evidence_ids"], [active])
+        restored = self.store.change_file(trashed, "restore", {"record_revision": row["revision"]})["records"][0]
+        self.assertEqual(restored["result_summary"]["evidence_ids"], [active, trashed])
+
+    def test_undo_purged_evidence_only_edit_preserves_a_later_conclusion(self):
+        record_id = self.store.save({"sample_id": "Evidence-only edit", "result_summary": {"conclusion": "Original"}})
+        file_id = self.store.add_file(record_id, "evidence.csv", "XRD", io.BytesIO(b"1"), 1)
+        row = self.store.list()[0]
+        self.store.save({"sample_id": row["sample_id"], "revision": row["revision"],
+                         "result_summary": {**row["result_summary"], "evidence_ids": [file_id]}}, record_id)
+        batch_id = self.store.history()["batches"][0]["id"]
+        self.store.change_file(file_id, "delete", {"record_revision": self.store.list()[0]["revision"]})
+        self.store.purge_trash({"file_ids": [file_id], "confirm": "purge"})
+        self.store.save({**self.store.list()[0], "result_summary": {"conclusion": "Later conclusion"}}, record_id)
+        row = self.store.list()[0]
+
+        preview = self.store.undo_history(batch_id, {"preview": True})
+        self.assertEqual(preview["rows"][0]["changes"], [])
+        result = self.store.undo_history(batch_id, {"preview": False, "revisions": preview["revisions"]})
+        self.assertEqual(result["records"][0], row)
+        self.assertTrue(self.store.history_detail(batch_id)["rows"][0]["reverted_by"])
 
     def test_multiple_solvents_roundtrip_legacy_options_and_backup(self):
         legacy = self.store.save({"sample_id": "legacy mixture", "solvent": "ODE + octadecane"})
@@ -1704,6 +1764,26 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/experiments", headers=legacy_cookie)[0], 200)
         self.assertEqual(self.request("/api/experiments", headers=legacy_cookie, scoped=False)[0], 401)
 
+    def test_request_logs_redact_the_token_and_instance(self):
+        token, instance = self.server.session_token, self.server.instance
+        with patch("sys.stderr", new_callable=io.StringIO) as logs:
+            self.assertEqual(launch_request(self.server, token=token)[0], 303)
+            self.assertEqual(self.request("/api/health?token=" + token)[0], 200)
+            client = HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+            try:
+                malformed = f"GET /s/{instance}/?token={token} extra HTTP/1.1\r\n\r\n"
+                client.send(malformed.encode("ascii"))
+                with client.sock.makefile("rb") as response:
+                    self.assertIn(b"400", response.readline())
+            finally:
+                client.close()
+        log = logs.getvalue()
+        self.assertFalse(token in log, "The launch token appeared in the log")
+        self.assertFalse(instance in log, "The session instance appeared in the log")
+        self.assertIn('"GET / HTTP/1.1" 303', log)
+        self.assertIn('"GET /api/health HTTP/1.1" 200', log)
+        self.assertIn("Bad request syntax", log)
+
     def test_browser_cookies_are_isolated_across_ports(self):
         with tempfile.TemporaryDirectory() as folder, make_server(Path(folder), 0) as other, serving(other):
             other_address = f"http://127.0.0.1:{other.server_port}"
@@ -1808,6 +1888,36 @@ class HTTPTests(unittest.TestCase):
         catalog = json.loads(self.request("/api/experiments")[1])
         self.assertIn("UV-Vis", catalog["kinds"])
         self.assertTrue(any(p["name"] == "HTTP project" for p in catalog["projects"]))
+
+    def test_upload_checks_optional_project_and_sample_identity(self):
+        store = self.server.store
+        original_name = "HTTP upload + original"
+        record_id = store.save({"sample_id": original_name})
+        project_id = store.add_catalog_item("projects", {"name": "Upload destination"})["project"]["id"]
+        path = f"/api/experiments/{record_id}/files?"
+        content = b"1,2"
+
+        def upload(**identity):
+            query = urlencode({"name": "guarded.csv", "kind": "XRD", **identity})
+            status, body, _ = self.request(path + query, content, "POST")
+            return status, json.loads(body)
+
+        stale = (409, {"error": "目标样品已变化，请刷新后再上传。"})
+        store.save({"revision": 1, "sample_id": original_name, "project_id": project_id}, record_id)
+        self.assertEqual(upload(project_id="default", sample_id=original_name), stale)
+        store.save({"revision": 2, "sample_id": "HTTP upload + renamed"}, record_id)
+        self.assertEqual(upload(project_id=project_id, sample_id=original_name), stale)
+        self.assertEqual(upload(project_id=""), stale)
+        self.assertEqual(upload(sample_id=""), stale)
+        row = next(row for row in store.list() if row["id"] == record_id)
+        self.assertEqual((row["revision"], row["files"]), (3, []))
+        self.assertEqual(store.history(record_id=record_id)["file_events"], [])
+
+        status, body = upload(project_id=project_id, sample_id=row["sample_id"])
+        self.assertEqual(status, 201)
+        row = next(row for row in store.list() if row["id"] == record_id)
+        self.assertEqual((row["revision"], row["files"][0]["id"]), (4, body["id"]))
+        self.assertEqual(store.file(body["id"])[0].read_bytes(), content)
 
     def test_condition_options_and_status_http_boundaries(self):
         payload = {"field": "precursor", "name": "HTTP precursor"}
@@ -2100,7 +2210,7 @@ class DataSafetyTests(unittest.TestCase):
             self.assertEqual(set(session), {"port", "token", "instance", "pid", "started_at"})
             self.assertEqual((session["port"], session["pid"]), (first.server_port, os.getpid()))
             self.assertRegex(session["token"], r"^[A-Za-z0-9_-]{43}$")
-            self.assertRegex(session["instance"], r"^[0-9a-f]{16}$")
+            self.assertRegex(session["instance"], r"^[0-9a-f]{32}$")
             self.assertEqual(session["instance"], first.instance)
             self.assertTrue(session["started_at"])
             self.assertEqual(session["token"], first.session_token)
@@ -2183,21 +2293,40 @@ class DataSafetyTests(unittest.TestCase):
             result = self.store.purge_trash({"file_ids": [pending], "confirm": "purge"})
         self.assertEqual(result, {"purged": 1, "bytes": 0, "pending_bytes": 4, "trash_count": 0})
         self.assertTrue((self.store.files / pending).exists())
-        orphan, partial = "unreferenced", ".part-interrupted"
+        orphan, partial = "a" * 32, ".part-interrupted"
         (self.store.files / orphan).write_bytes(b"orphan")
         (self.store.files / partial).write_bytes(b"partial")
+        ignored = ("notes.txt", "B" * 32, "c" * 31, "d" * 32 + ".csv", ".part")
+        for name in ignored:
+            (self.store.files / name).write_bytes(b"keep")
         orphaned = self.store.data / "orphaned"
         orphaned.mkdir()
         (orphaned / orphan).write_bytes(b"previous orphan")
         with make_server(self.store.data, 0) as restarted:
             self.assertEqual(restarted.store.trash()["items"], [])
-            self.assertEqual([path.name for path in restarted.store.files.iterdir()], [active])
+            self.assertCountEqual([path.name for path in restarted.store.files.iterdir()], [active, *ignored])
             self.assertEqual((orphaned / orphan).read_bytes(), b"previous orphan")
             self.assertEqual((orphaned / partial).read_bytes(), b"partial")
             self.assertCountEqual([path.read_bytes() for path in orphaned.iterdir()], [b"orphan", b"partial", b"previous orphan"])
             self.assertEqual(restarted.store.history(record_id=owner)["file_events"][0]["action"], "purge")
             with restarted.store.connect() as db:
                 self.assertIsNone(restarted.store.setting(db, server.PENDING_PURGE_PREFIX + pending))
+
+    def test_startup_keeps_case_variants_of_referenced_ids(self):
+        record_id = self.store.save({"sample_id": "Case-variant attachments"})
+        upper_on_disk, upper_in_db = "a1" * 16, "b2" * 16
+        for file_id in (upper_on_disk, upper_in_db):
+            with patch.object(server.uuid, "uuid4", return_value=server.uuid.UUID(hex=file_id)):
+                self.store.add_file(record_id, file_id + ".csv", "XRD", io.BytesIO(b"1"), 1)
+        # An intermediate rename changes the directory entry even on a case-insensitive filesystem.
+        files = self.store.files
+        (files / upper_on_disk).rename(files / "rename-fixture").rename(files / upper_on_disk.upper())
+        with self.store.connect() as db:
+            db.execute("UPDATE files SET id=? WHERE id=?", (upper_in_db.upper(), upper_in_db))
+        with make_server(self.store.data, 0) as restarted:
+            self.assertCountEqual([path.name for path in restarted.store.files.iterdir()],
+                                  [upper_on_disk.upper(), upper_in_db])
+            self.assertFalse((restarted.store.data / "orphaned").exists())
 
     def test_zip_backup_stores_compressed_attachments_without_recompressing(self):
         self.add("Z-1", "raw.zip", b"PK" + b"x" * 500)
@@ -2210,6 +2339,50 @@ class DataSafetyTests(unittest.TestCase):
             self.assertIsNone(archive.testzip())
             types = {names[info.filename.rsplit("/", 1)[-1]]: info.compress_type for info in archive.infolist() if info.filename.startswith("data/files/")}
         self.assertEqual(types, {"raw.zip": zipfile.ZIP_STORED, "trace.csv": zipfile.ZIP_DEFLATED})
+
+    def test_folder_backup_blocks_reconciliation_in_another_process(self):
+        self.add("Previous snapshot", "first.csv", b"1,2")
+        target = self.root / "mirror"
+        self.store.folder_backup(target)
+        target = self.store.backup_target(str(target))
+        content = b"3,4"
+        _, file_id = self.add("New since previous snapshot", "second.csv", content)
+        mirror = target / "data"
+        ready, resume = threading.Event(), threading.Event()
+        original_copy = Store.copy_verified
+
+        def pause_after_copy(*args):
+            original_copy(*args)
+            ready.set()
+            if not resume.wait(15):
+                raise TimeoutError("Backup fixture did not resume")
+
+        open_catalog = "import sys\nfrom server import make_server\nwith make_server(sys.argv[1], 0): pass"
+        with patch.object(Store, "copy_verified", side_effect=pause_after_copy):
+            self.assertEqual(self.store.start_folder_backup({"path": str(target)})["state"], "running")
+            try:
+                self.assertTrue(ready.wait(5))
+                self.assertEqual((mirror / "files" / file_id).read_bytes(), content)
+                started = subprocess.run([sys.executable, "-X", "utf8", "-B", "-c", open_catalog, str(mirror)],
+                                         cwd=server.ROOT, capture_output=True, encoding="utf-8", timeout=8)
+                self.assertNotEqual(started.returncode, 0)
+                self.assertIn("This data folder is already open", started.stderr)
+                with self.assertRaisesRegex(Problem, "目标文件夹是一个正在使用的实验库"):
+                    self.store.backup_target(str(target))
+                with self.assertRaisesRegex(Problem, "已有备份正在进行") as busy:
+                    self.store.start_folder_backup({"path": str(target)})
+                self.assertEqual(busy.exception.status, 409)
+            finally:
+                resume.set()
+                self.assertTrue(self.store.backup_guard.acquire(timeout=5))
+                self.store.backup_guard.release()
+            progress = self.store.backup_status()
+            self.assertEqual((progress["state"], progress["copied_files"]), ("done", 1), progress["error"])
+        with make_server(mirror, 0) as restored:
+            self.assertEqual(restored.store.list(), self.store.list())
+            self.assertEqual(restored.store.file(file_id)[0].read_bytes(), content)
+            self.assertFalse((mirror / "orphaned").exists())
+        self.assertEqual(self.store.folder_backup(self.store.backup_target(str(target)))["copied_files"], 0)
 
     def test_folder_backup_is_incremental_verified_and_restorable(self):
         _, first = self.add("F-1", "a.csv", b"1,2\n")
