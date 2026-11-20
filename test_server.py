@@ -320,6 +320,30 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.list()), 2)
         self.assertNotEqual(imported["record_id"], sample_id)
 
+    def test_folder_import_and_rename_can_reuse_trashed_names(self):
+        sample = "Replace a folder attachment"
+        record_id = self.store.save({"sample_id": sample})
+        original = self.store.add_file(record_id, "same.csv", "NMR", io.BytesIO(b"old"), 3)
+        self.store.change_file(original, "delete", {"record_revision": self.store.list()[0]["revision"]})
+        path = "folder/same.csv"
+        payload = {"project_id": "default", "create": False,
+                   "files": [{"path": path, "sample_id": sample, "kind": "NMR", "size": 3}]}
+        plan = self.store.preview_folder(payload)["rows"][0]
+        self.assertEqual((plan["action"], plan["reason"]), ("attach", ""))
+        imported = self.store.add_file(record_id, plan["name"], plan["kind"], io.BytesIO(b"new"), 3,
+                                       source=path, folder_target=("default", sample, plan["experiment_no"]),
+                                       receipt="a" * 32)
+        plan = self.store.preview_folder(payload)["rows"][0]
+        self.assertEqual((plan["action"], plan["reason"]), ("review", "duplicate"))
+        self.store.change_file(imported["id"], "delete", {"record_revision": self.store.list()[0]["revision"]})
+        other = self.store.add_file(record_id, "other.csv", "NMR", io.BytesIO(b"csv"), 3)
+        renamed = self.store.change_file(other, "update",
+                                         {"record_revision": self.store.list()[0]["revision"], "name": "same.csv"})
+        self.assertEqual(renamed["records"][0]["files"], [renamed["file"]])
+        self.assertEqual(renamed["file"]["name"], "same.csv")
+        self.assertEqual({(item["id"], item["name"], item["name_conflict"]) for item in self.store.trash()["items"]},
+                         {(original, "same.csv", True), (imported["id"], "same.csv", True)})
+
     def test_folder_import_groups_ascii_case_variants_of_a_new_sample(self):
         payload = {"project_id": "default", "create": True, "files": [
             {"path": "run/A01-XRD.csv", "size": 3, "sample_id": "A01", "kind": "XRD"},
@@ -1120,6 +1144,17 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         with self.assertRaises(Problem):
             empty.delete_category({"name": empty.catalog()["kinds"][0]})
 
+    def test_category_deletion_can_reassign_a_trashed_file_to_an_active_name(self):
+        record_id = self.store.save({"sample_id": "Category merge with trash"})
+        self.store.add_file(record_id, "spectrum.csv", "XRD", io.BytesIO(b"new"), 3)
+        file_id = self.store.add_file(record_id, "spectrum.csv", "NMR", io.BytesIO(b"old"), 3)
+        before = self.store.change_file(file_id, "delete", {"record_revision": self.store.list()[0]["revision"]})
+        trashed, = self.store.trash()["items"]
+        self.assertEqual(self.store.delete_category({"name": "NMR", "replacement": "XRD"}), {"ok": True, "moved": 1})
+        self.assertNotIn("NMR", self.store.catalog()["kinds"])
+        self.assertEqual(self.store.list()[0]["files"], before["records"][0]["files"])
+        self.assertEqual(self.store.trash()["items"], [dict(trashed, kind="XRD", name_conflict=True)])
+
     def test_bounded_csv_and_safe_image_previews(self):
         record = self.store.save({"sample_id": "Preview"})
         def preview(name, content):
@@ -1344,17 +1379,24 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(locked["error"], "已归档的记录不能修改附件，请先恢复记录。")
         self.assertIs(self.request_json("/api/trash")["items"][0]["record_archived"], True)
         store.archive(record_id, {"archived": False, "revision": latest})
-        with self.assertRaises(Problem) as reserved:
-            store.add_file(record_id, "trace.csv", "XRD", io.BytesIO(content), len(content))
-        self.assertEqual(reserved.exception.status, 409, "Even a trashed name remains reserved")
-        store.add_file(record_id, "occupied.csv", "XRD", io.BytesIO(content), len(content))
-        current = {"record_revision": latest + 2}
+        occupied = store.add_file(record_id, "occupied.csv", "XRD", io.BytesIO(content), len(content))
+        upload = f"/api/experiments/{record_id}/files?" + urlencode({"name": "trace.csv", "kind": "XRD"})
+        status, data, _ = self.request(upload, b"5,6\n", "POST", headers={"Content-Type": "application/octet-stream"})
+        self.assertEqual(status, 201, data.decode())
+        replacement = json.loads(data)["id"]
+        item = next(item for item in self.request_json("/api/trash")["items"] if item["id"] == file_id)
+        self.assertIs(item["name_conflict"], True)
+        current = {"record_revision": latest + 3}
+        self.assertEqual(self.request_json(restore, current, "POST", 409),
+                         {"error": "同名同类附件已存在，请为恢复的附件输入新名称。"})
         self.assertEqual(self.request_json(restore, {**current, "name": "occupied.csv"}, "POST", 409)["error"],
                          "同类型附件 occupied.csv 已存在，未覆盖。请重命名后再上传。")
         restored = self.request_json(restore, {**current, "name": "recovered.csv"}, "POST")
         self.assertEqual(restored["trash_count"], base_count)
         self.assertEqual(restored["file"], dict(original_file, name="recovered.csv"))
         active = restored["records"][0]
+        self.assertEqual({item["id"]: item["name"] for item in active["files"]},
+                         {replacement: "trace.csv", file_id: "recovered.csv", occupied: "occupied.csv"})
         self.assertEqual(active["revision"], current["record_revision"] + 1)
         self.assertEqual(active["result_summary"]["evidence_ids"], [file_id])
         events = self.request_json(f"/api/history?record_id={record_id}")["file_events"]
@@ -1514,7 +1556,7 @@ class HTTPTests(unittest.TestCase):
         if authenticate:
             request_headers["Cookie"] = self.cookie
         request_headers.update(headers or {})
-        data = json.dumps(body).encode() if body is not None else None
+        data = json.dumps(body).encode() if body is not None and not isinstance(body, bytes) else body
         request = Request(self.address + path, data=data, headers=request_headers, method=method)
         try:
             with urlopen(request, timeout=3) as response:
@@ -1780,47 +1822,74 @@ class DataSafetyTests(unittest.TestCase):
             Store(self.store.data)
         self.assertEqual(database.read_bytes(), before, "A newer catalog is left untouched")
 
-    def test_schema_one_attachment_migration_keeps_files_and_receipts(self):
+    def test_legacy_attachment_migration_keeps_files_and_receipts(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.check_attachment_migration(version)
+
+    def check_attachment_migration(self, version):
+        original = Store(self.root / f"schema-{version}")
         content = b"old contents"
         receipt = "d" * 32
-        imported = self.store.add_file("", "spectrum.csv", "XRD", io.BytesIO(content), len(content), receipt=receipt,
-                                       folder_target=("default", "Version one", "Version one"))
-        expected = self.store.list()
-        # Recreate the attachment table and version marker written by schema 1.
-        with self.store.connect() as db:
-            db.executescript("""PRAGMA foreign_keys=OFF;
+        target = ("default", "Legacy sample", "Legacy sample")
+        imported = original.add_file("", "spectrum.csv", "XRD", io.BytesIO(content), len(content),
+                                     source="old/spectrum.csv", folder_target=target, receipt=receipt)
+        columns = ",".join(server.FILE_FIELDS)
+        deleted_column = ""
+        if version == 2:
+            trashed = original.add_file(imported["record_id"], "trashed.csv", "XRD", io.BytesIO(b"old"), 3,
+                                        source="old/trashed.csv", folder_target=target, receipt="e" * 32)
+            original.change_file(trashed["id"], "delete", {"record_revision": original.list()[0]["revision"]})
+            columns += ",deleted_at"
+            deleted_column = "deleted_at TEXT,"
+        expected_records = original.list()
+        expected_trash = original.trash()
+        expected_events = original.history()["file_events"] if version == 2 else []
+        # Recreate the files table written by the original schema 1 or early schema 2.
+        with original.connect() as db:
+            expected_files = [tuple(row) for row in db.execute("SELECT rowid,* FROM files ORDER BY rowid")]
+            expected_receipts = [tuple(row) for row in db.execute("SELECT * FROM folder_import_receipts ORDER BY id")]
+            db.executescript(f"""PRAGMA foreign_keys=OFF;
                 BEGIN IMMEDIATE;
-                CREATE TABLE files_v1 (
+                CREATE TABLE files_legacy (
                     id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
                     name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
                     sha256 TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(experiment_id, name, kind)
+                    {deleted_column} UNIQUE(experiment_id, name, kind)
                 );
-                INSERT INTO files_v1 SELECT id,experiment_id,name,kind,size,sha256,source,created_at FROM files;
+                INSERT INTO files_legacy (rowid,{columns}) SELECT rowid,{columns} FROM files;
                 DROP TABLE files;
-                ALTER TABLE files_v1 RENAME TO files;
-                DROP TABLE file_events;
-                PRAGMA user_version=1;
-                COMMIT;
-                PRAGMA foreign_keys=ON;
+                ALTER TABLE files_legacy RENAME TO files;
+                PRAGMA user_version={version};
             """)
-        migrated = Store(self.store.data)
-        snapshot, = (migrated.data / "migration-backups").glob("experiments-schema1-*.sqlite3")
-        self.assertEqual(self.version(snapshot), 1)
+            if version == 1:
+                db.execute("DROP TABLE file_events")
+        migrated = Store(original.data)
+        snapshot, = (migrated.data / "migration-backups").glob(f"experiments-schema{version}-*.sqlite3")
+        self.assertEqual(self.version(snapshot), version)
         copy = sqlite3.connect(snapshot)
         try:
-            self.assertNotIn("deleted_at", {column[1] for column in copy.execute("PRAGMA table_info(files)")})
+            self.assertEqual("deleted_at" in {column[1] for column in copy.execute("PRAGMA table_info(files)")}, version == 2)
+            self.assertIn("u", {index[3] for index in copy.execute("PRAGMA index_list(files)")})
             self.assertEqual(copy.execute("SELECT id, sha256 FROM files").fetchone(),
                              (imported["id"], hashlib.sha256(content).hexdigest()))
         finally:
             copy.close()
         self.assertEqual(self.version(migrated.db), 2)
-        self.assertEqual(migrated.list(), expected)
+        self.assertEqual(migrated.list(), expected_records)
+        self.assertEqual(migrated.trash(), expected_trash)
         self.assertEqual(migrated.folder_receipt(receipt), imported)
         self.assertEqual(migrated.file(imported["id"])[0].read_bytes(), content)
-        self.assertEqual(migrated.history()["file_events"], [])
+        self.assertEqual(migrated.history()["file_events"], expected_events)
         with migrated.connect() as db:
-            self.assertIsNone(db.execute("SELECT deleted_at FROM files").fetchone()[0])
+            self.assertEqual([tuple(row) for row in db.execute("SELECT rowid,* FROM files ORDER BY rowid")], expected_files)
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM folder_import_receipts ORDER BY id")],
+                             expected_receipts)
+            indexes = {row["name"]: (row["origin"], row["unique"], row["partial"]) for row in db.execute("PRAGMA index_list(files)")}
+            self.assertNotIn("u", {origin for origin, _, _ in indexes.values()})
+            self.assertEqual(indexes["files_active_name"], ("c", 1, 1))
+            self.assertEqual([row["name"] for row in db.execute("PRAGMA index_info(files_active_name)")],
+                             ["experiment_id", "name", "kind"])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_full_backups_include_trashed_files_and_events(self):

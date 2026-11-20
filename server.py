@@ -493,14 +493,13 @@ class Store:
                 db.execute("INSERT INTO condition_options(field,name) SELECT field,name FROM condition_options_v1")
                 db.execute("DROP TABLE condition_options_v1")
             db.execute(experiment_schema)
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS files (
-                    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
-                    name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
-                    deleted_at TEXT, UNIQUE(experiment_id, name, kind)
-                );
-            """)
+            files_schema = """CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
+                deleted_at TEXT
+            )"""
+            db.execute(files_schema)
             if "experiment_no" not in {row["name"] for row in db.execute("PRAGMA table_info(experiments)")}:
                 db.execute("ALTER TABLE experiments ADD COLUMN experiment_no TEXT NOT NULL DEFAULT ''")
             if "project_id" not in {row["name"] for row in db.execute("PRAGMA table_info(experiments)")}:
@@ -578,9 +577,21 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS history_record ON history_entries(record_id);
             """)
+            rebuild_files = self.has_legacy_file_constraint(db)
+            if rebuild_files:
+                db.execute("PRAGMA foreign_keys=OFF")
             db.execute("BEGIN IMMEDIATE")
-            if "deleted_at" not in {row["name"] for row in db.execute("PRAGMA table_info(files)")}:
-                db.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT")
+            if rebuild_files:
+                # Preserve rowids used to order attachments with the same deletion time.
+                columns = "rowid," + ",".join(row["name"] for row in db.execute("PRAGMA table_info(files)"))
+                db.execute(files_schema.replace("files (", "files_v2 (", 1))
+                db.execute(f"INSERT INTO files_v2 ({columns}) SELECT {columns} FROM files")
+                db.execute("DROP TABLE files")
+                db.execute("ALTER TABLE files_v2 RENAME TO files")
+                if db.execute("PRAGMA foreign_key_check").fetchone():
+                    raise RuntimeError("Attachment migration failed its reference check")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS files_active_name
+                          ON files(experiment_id, name, kind) WHERE deleted_at IS NULL""")
             db.execute("""CREATE TABLE IF NOT EXISTS file_events (
                 id TEXT PRIMARY KEY, file_id TEXT NOT NULL, record_id TEXT NOT NULL, action TEXT NOT NULL,
                 before TEXT, after TEXT, created_at TEXT NOT NULL
@@ -590,9 +601,16 @@ class Store:
             db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT OR IGNORE INTO app_settings VALUES ('catalog_id', ?)", (json.dumps(uuid.uuid4().hex),))
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            if rebuild_files:
+                db.commit()
+                db.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def has_legacy_file_constraint(db):
+        return db.execute("SELECT 1 FROM pragma_index_list('files') WHERE origin='u'").fetchone() is not None
 
     def check_schema_version(self):
-        """Refuse catalogs from newer programs; snapshot older ones before their first migration."""
+        """Refuse catalogs from newer programs and snapshot databases before migration."""
         if not self.db.exists():
             return
         source = sqlite3.connect(self.db, timeout=15)
@@ -604,7 +622,7 @@ class Store:
                     f"This catalog was written by a newer program (schema {version}; this program supports {SCHEMA_VERSION}). "
                     "Open it with the newer program. Nothing was changed.")
             populated = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiments'").fetchone()
-            if populated and version < SCHEMA_VERSION:
+            if populated and (version < SCHEMA_VERSION or self.has_legacy_file_constraint(source)):
                 folder = self.data / "migration-backups"
                 folder.mkdir(exist_ok=True)
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1630,7 +1648,8 @@ class Store:
                     reason = "archived"
                 elif kind not in kinds:
                     reason = "category"
-                elif row and db.execute("SELECT 1 FROM files WHERE experiment_id=? AND name=? AND kind=?", (record_id, name, kind)).fetchone():
+                elif row and db.execute("SELECT 1 FROM files WHERE experiment_id=? AND name=? AND kind=? AND deleted_at IS NULL",
+                                        (record_id, name, kind)).fetchone():
                     reason = "duplicate"
                 if row:
                     sample = row["sample_id"]
@@ -1696,10 +1715,10 @@ class Store:
 
     @staticmethod
     def check_file_slot(db, record_id, name, kind, file_id, restoring_original=False):
-        conflict = db.execute("""SELECT deleted_at FROM files WHERE experiment_id=? AND name=? AND kind=? AND id<>?
-                               ORDER BY deleted_at LIMIT 1""", (record_id, name, kind, file_id)).fetchone()
+        conflict = db.execute("""SELECT 1 FROM files WHERE experiment_id=? AND name=? AND kind=?
+                                 AND deleted_at IS NULL AND id<>?""", (record_id, name, kind, file_id)).fetchone()
         if conflict:
-            if restoring_original and conflict["deleted_at"] is None:
+            if restoring_original:
                 raise Problem("同名同类附件已存在，请为恢复的附件输入新名称。", 409)
             raise Problem(f"同类型附件 {name} 已存在，未覆盖。请重命名后再上传。", 409)
 
