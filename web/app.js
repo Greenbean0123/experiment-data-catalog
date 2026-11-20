@@ -1462,6 +1462,8 @@ function initialize() {
       $("catalog-error").hidden = true;
       renderCatalogDialog();
       (categoryCount(deletingCategory) ? $("category-replacement") : $("confirm-delete-category")).focus();
+      const chosen = deletingCategory;
+      load().then(() => { if (deletingCategory === chosen && $("catalog-dialog").open) renderCatalogDialog(); }).catch(() => {});
       return;
     }
     const button = event.target.closest("[data-catalog-value]");
@@ -2321,10 +2323,11 @@ function initialize() {
 
   // Attachment changes answer with the authoritative records; merge them without reloading the catalog.
   // A response without them (older or partial server) falls back to a full reload.
-  async function applyChangeResult(result) {
+  async function applyChangeResult(result, expected = []) {
     const changed = Array.isArray(result?.records) ? result.records.filter(record => record && typeof record.id === "string" && Array.isArray(record.files)) : [];
     if (Number.isInteger(result?.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
-    if (!changed.length) {
+    // Every record whose file list changed (both sides of a move) must be present, otherwise reconcile by reloading.
+    if (!changed.length || expected.some(id => !changed.some(record => record.id === id))) {
       await load();
     } else {
       const replacements = new Map(changed.map(record => [record.id, record]));
@@ -2341,13 +2344,14 @@ function initialize() {
   }
 
   const sampleName = record => recordLabel(record, "sample_id");
-  // The dialog compares the draft with the values it was opened (or last refreshed) with, so a refresh after a
-  // conflict never turns an untouched field into an unintended change.
-  let fileOriginal = null;
+  // The dialog compares the draft with the values it showed when it was opened (or last refreshed) and submits the
+  // revisions captured at that moment. A catalog refresh in the background therefore never turns an untouched field
+  // into a change; if the record moved on, the server answers 409 and the dialog refreshes explicitly.
+  let fileOriginal = null, fileSession = 0;
   const fileDraft = () => ({name: $("file-name").value.trim(), kind: $("file-kind").value, target: $("file-target").value});
-  const fileDirty = () => Boolean($("file-dialog").open && fileOriginal && Object.entries(fileDraft()).some(([key, value]) => value !== fileOriginal[key]));
+  const fileDirty = () => Boolean($("file-dialog").open && fileOriginal && ["name", "kind", "target"].some(key => fileDraft()[key] !== fileOriginal[key]));
   function fillFileDialog(record, file, draft = null) {
-    const original = {name: file.name, kind: file.kind, target: record.id};
+    const original = {name: file.name, kind: file.kind, target: record.id, revisions: new Map()};
     const keep = key => draft && fileOriginal && draft[key] !== fileOriginal[key];
     $("file-dialog-subtitle").textContent = `${file.name} · ${sampleName(record)}`;
     $("file-name").value = keep("name") ? draft.name : file.name;
@@ -2357,11 +2361,13 @@ function initialize() {
       .sort((a, b) => compareExperimentNo(sampleName(a), sampleName(b)));
     $("file-target").innerHTML = targets.map(item => `<option value="${escape(item.id)}">${escape(sampleName(item))}${item.id === record.id ? " · " + escape(t("当前样品")) : ""}</option>`).join("");
     $("file-target").value = keep("target") && targets.some(item => item.id === draft.target) ? draft.target : record.id;
+    for (const item of targets) original.revisions.set(item.id, item.revision);
     fileOriginal = original;
   }
   function openFileDialog(recordId, fileId) {
     const record = records.find(item => item.id === recordId), file = record?.files.find(item => item.id === fileId);
     if (!record || !file || record.archived) return;
+    fileSession++;
     fileTarget = {recordId, fileId};
     fileOriginal = null;
     $("file-error").hidden = true;
@@ -2377,14 +2383,19 @@ function initialize() {
   function closeFileDialog({force = false} = {}) {
     if (fileSaving) return;
     if (!force && fileDirty() && !confirm(t("附件修改尚未保存，确定放弃吗？"))) return;
+    fileSession++;
     fileTarget = null; fileOriginal = null;
     $("file-dialog").close();
   }
   // After a 409 the catalog is reloaded; the dialog shows the latest metadata and keeps only the user's own edits.
+  // The dialog stays busy meanwhile, and a refresh that finishes after the dialog was closed or reopened is ignored.
   async function refreshFileDialogAfterConflict(error) {
     if (error.status !== 409 || !fileTarget) return;
-    const draft = fileDraft();
-    try { await load(); } catch { return; }
+    const draft = fileDraft(), session = fileSession;
+    setFileBusy(true);
+    try { await load(); } catch { if (session === fileSession) setFileBusy(false); return; }
+    if (session !== fileSession) return;
+    setFileBusy(false);
     const owner = records.find(record => record.files.some(file => file.id === fileTarget.fileId));
     const file = owner?.files.find(item => item.id === fileTarget.fileId);
     if (!owner || !file || owner.archived) {
@@ -2404,15 +2415,14 @@ function initialize() {
     if (fileSaving || !fileTarget) return;
     const record = records.find(item => item.id === fileTarget.recordId), file = record?.files.find(item => item.id === fileTarget.fileId);
     if (!record || !file) return closeFileDialog({force: true});
-    const draft = fileDraft();
+    const draft = fileDraft(), shown = fileOriginal;
     if (!draft.name) return showError("file-error", "请填写文件名。");
-    const body = {record_revision: record.revision};
-    if (draft.name !== file.name) body.name = draft.name;
-    if (draft.kind !== file.kind) body.kind = draft.kind;
-    if (draft.target !== record.id) {
-      const destination = records.find(item => item.id === draft.target);
-      if (!destination) return showError("file-error", "目标样品不存在，请刷新后重试。");
-      Object.assign(body, {target_record_id: draft.target, target_revision: destination.revision});
+    const body = {record_revision: shown.revisions.get(shown.target)};
+    if (draft.name !== shown.name) body.name = draft.name;
+    if (draft.kind !== shown.kind) body.kind = draft.kind;
+    if (draft.target !== shown.target) {
+      if (!shown.revisions.has(draft.target)) return showError("file-error", "目标样品不存在，请刷新后重试。");
+      Object.assign(body, {target_record_id: draft.target, target_revision: shown.revisions.get(draft.target)});
     }
     if (Object.keys(body).length === 1) return showError("file-error", "没有需要保存的修改。");
     $("file-error").hidden = true;
@@ -2421,7 +2431,7 @@ function initialize() {
       const result = await api(`api/files/${encodeURIComponent(file.id)}/update`, {method: "POST", body: JSON.stringify(body)});
       setFileBusy(false);
       closeFileDialog({force: true});
-      await applyChangeResult(result);
+      await applyChangeResult(result, [shown.target, ...(body.target_record_id ? [body.target_record_id] : [])]);
       const moved = body.target_record_id && records.find(item => item.id === body.target_record_id);
       toast(moved ? t("附件已移到 {sample}。", {sample: sampleName(moved)}) : t("附件已更新。"));
     } catch (error) {
@@ -2437,10 +2447,11 @@ function initialize() {
     if (!confirm(t("把 {name} 移到回收站？附件会从样品中移除，可在“回收站”中恢复。", {name: file.name}))) return;
     setFileBusy(true);
     try {
-      const result = await api(`api/files/${encodeURIComponent(file.id)}/delete`, {method: "POST", body: JSON.stringify({record_revision: record.revision})});
+      const shown = fileOriginal;
+      const result = await api(`api/files/${encodeURIComponent(file.id)}/delete`, {method: "POST", body: JSON.stringify({record_revision: shown.revisions.get(shown.target)})});
       setFileBusy(false);
       closeFileDialog({force: true});
-      await applyChangeResult(result);
+      await applyChangeResult(result, [shown.target]);
       toast(t("{name} 已移到回收站。", {name: file.name}));
     } catch (error) {
       setFileBusy(false);
@@ -2482,7 +2493,9 @@ function initialize() {
   async function loadTrash() {
     const version = ++trashLoadVersion, scope = trashScopeValue();
     trashScope = null; renderTrash();
-    const result = await api(`api/trash?project_id=${encodeURIComponent(scope)}`);
+    let result;
+    try { result = await api(`api/trash?project_id=${encodeURIComponent(scope)}`); }
+    catch (error) { if (version === trashLoadVersion) throw error; return; }
     if (version !== trashLoadVersion) return;  // A newer scope was requested meanwhile.
     trashItems = Array.isArray(result.items) ? result.items.filter(item => typeof item?.id === "string") : [];
     trashTotal = Number(result.total_bytes) || 0;
@@ -2692,6 +2705,8 @@ function initialize() {
     if (!files.length) return showError("upload-error", "请先选择数据文件。");
     if (files.some(file => file.size === 0 || file.size > 256 * 1024 * 1024)) return showError("upload-error", "请选择非空文件，且每个文件不超过 256 MB。");
     const id = detailId, kind = $("upload-kind").value;
+    const shownRecord = records.find(record => record.id === id);
+    const identity = shownRecord ? {project_id: shownRecord.project_id, sample_id: shownRecord.sample_id} : {};
     uploading = true;
     for (const key of ["upload-button", "upload-files", "upload-kind", "add-upload-kind", "choose-files", "language-switch"]) $(key).disabled = true;
     $("upload-error").hidden = true;
@@ -2702,7 +2717,7 @@ function initialize() {
       for (const file of files) {
         $("upload-button").textContent = `${completed + errors.length + 1} / ${files.length}…`;
         try {
-          await api(`api/experiments/${id}/files?${new URLSearchParams({name: file.name, kind})}`, {method: "POST", body: file, headers: {"Content-Type": "application/octet-stream"}});
+          await api(`api/experiments/${id}/files?${new URLSearchParams({name: file.name, kind, ...identity})}`, {method: "POST", body: file, headers: {"Content-Type": "application/octet-stream"}});
           completed++;
         } catch (error) { errors.push(`${file.name}: ${I18n.translateError(error.message, language)}`); }
       }
@@ -3563,6 +3578,7 @@ function initialize() {
     if (hasUnfinishedWork()) { event.preventDefault(); event.returnValue = ""; }
   });
   if (new URLSearchParams(location.search).get("desktop") === "1") {
+    document.querySelector(".brand")?.setAttribute("href", "./?desktop=1");
     window.confirmCatalogClose = () => !hasUnfinishedWork() || confirm(t("有未保存的修改或正在处理的操作。确定关闭窗口吗？"));
     document.addEventListener("click", event => {
       const link = event.target.closest('a[target="_blank"]');

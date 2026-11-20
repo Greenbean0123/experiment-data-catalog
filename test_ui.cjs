@@ -2129,5 +2129,97 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("trash-close").click();
     } finally { env.dom.window.close(); }
   }
+  {
+    // Re-review fixes: dialog sessions, opened-with revisions, partial move responses, stale trash failures, identity.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const deferred = () => { let resolve, reject; const promise = new Promise((done, fail) => { resolve = done; reject = fail; }); return {promise, resolve, reject}; };
+    let readGate = null, trashGate = null;
+    const calls = [];
+    const env = await boot({savedLanguage: "en", desktop: true, extraRows: [sample("B", {files: []})],
+      readHandler: catalog => { const response = reply(200, {...catalog, trash_count: 0}); return readGate ? readGate.promise.then(() => response) : response; },
+      attachmentHandler: (url, options, rows) => {
+        const body = options.body ? JSON.parse(options.body) : {};
+        calls.push({url, body});
+        if (url.startsWith("/api/trash?")) {
+          if (url.endsWith("project_id=") && trashGate) return trashGate.promise;
+          return reply(200, {items: [], total_bytes: 0});
+        }
+        const row = rows.find(item => item.id === "A");
+        if (body.record_revision !== row.revision) return reply(409, {error: "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"});
+        if (body.target_record_id) {
+          const file = row.files[0], target = rows.find(item => item.id === body.target_record_id);
+          row.files = []; target.files.push(file); row.revision++; target.revision++;
+          return reply(200, {file, records: [row]});  // Partial: the destination record is missing.
+        }
+        if (body.name) row.files[0].name = body.name;
+        row.revision++;
+        return reply(200, {file: row.files[0], records: [row]});
+      }});
+    try {
+      const {$, w, rows, writes} = env;
+      assert.equal(w.document.querySelector(".brand").getAttribute("href"), "./?desktop=1", "The desktop shell keeps its parameter");
+      $("dashboard-records-tab").click();
+      w.document.querySelector('[data-expand="experiment:default:a"]').click();
+      w.document.querySelector('[data-open="A"]').click();
+      const manage = () => $("detail-content").querySelector('[data-manage-file="f1"]');
+      // 1. A catalog read that resolves after the dialog opened must not turn the untouched category into a change.
+      $("close-detail").click();
+      const shownRevision = rows.find(row => row.id === "A").revision;
+      rows.find(row => row.id === "A").files[0].kind = "NMR";  // Another window recategorized meanwhile.
+      rows.find(row => row.id === "A").revision++;
+      readGate = deferred();
+      const reads = calls.length;
+      const pendingLoad = w.dispatchEvent(new w.Event("focus"));  // The refresh request is in flight...
+      w.document.querySelector('[data-open="A"]').click();      // ...while the user opens the attachment dialog.
+      manage().click();
+      assert.equal($("file-kind").value, "XRD", "The dialog shows the values loaded before the refresh");
+      readGate.resolve(); readGate = null; for (let i = 0; i < 4; i++) await flush();
+      assert.equal(env.rows.find(row => row.id === "A").files[0].kind, "NMR");
+      assert.equal(calls.length, reads);
+      $("file-name").value = "renamed.csv";
+      $("save-file").click(); for (let i = 0; i < 4; i++) await flush();
+      const first = calls.filter(call => call.url.endsWith("/update"))[0];
+      assert.deepEqual(first.body, {record_revision: shownRevision, name: "renamed.csv"}, "Changes and revision come from the values the dialog showed");
+      assert.equal($("file-kind").value, "NMR", "The 409 refresh then shows the newer category");
+      assert.equal($("file-name").value, "renamed.csv");
+      // 2. The dialog stays busy while a conflict refresh runs, and a late refresh cannot reach a reopened dialog.
+      rows.find(row => row.id === "A").revision++;
+      readGate = deferred();
+      $("save-file").click(); await flush(); await flush();
+      assert.equal($("cancel-file").disabled, true, "Busy during the refresh");
+      $("cancel-file").click();
+      assert.equal($("file-dialog").open, true, "Cannot be closed mid-refresh");
+      readGate.resolve(); readGate = null; for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("cancel-file").disabled, false);
+      $("save-file").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("file-dialog").open, false, "The retry with the refreshed revision succeeds");
+      // 3. A move response without the destination record reloads before showing the result.
+      manage().click();
+      $("file-target").value = "B";
+      $("save-file").click(); for (let i = 0; i < 6; i++) await flush();
+      $("close-detail").click();
+      w.document.querySelector('[data-expand="experiment:default:b"]').click();
+      w.document.querySelector('[data-open="B"]').click();
+      assert.ok($("detail-content").querySelector('[data-manage-file="f1"]'), "The destination shows the moved file after the reload");
+      // 4. Uploads carry the identity the detail dialog showed.
+      const upload = $("upload-files");
+      Object.defineProperty(upload, "files", {value: [new w.File(["1,2"], "extra.csv")], configurable: true});
+      $("upload-button").click(); for (let i = 0; i < 4; i++) await flush();
+      const sent = new URL(writes.filter(write => write.url.includes("/files?")).at(-1).url, "http://127.0.0.1/");
+      assert.equal(sent.searchParams.get("sample_id"), "B");
+      assert.equal(sent.searchParams.get("project_id"), "default");
+      $("close-detail").click();
+      // 5. A stale all-projects failure does not show an error over the current list.
+      trashGate = deferred();
+      $("trash-view").click(); await flush(); await flush();
+      $("trash-all-projects").checked = true; $("trash-all-projects").dispatchEvent(new w.Event("change", {bubbles: true})); await flush();
+      $("trash-all-projects").checked = false; $("trash-all-projects").dispatchEvent(new w.Event("change", {bubbles: true})); await flush(); await flush();
+      trashGate.reject(new Error("network down")); trashGate = null; for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("trash-error").hidden, true, "The stale failure is ignored");
+      assert.match($("trash-content").textContent, /The trash is empty/);
+      $("trash-close").click();
+      assert.ok(pendingLoad !== undefined);
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
