@@ -18,7 +18,11 @@ style (Chinese user-facing error strings in the server, translated by `web/i18n.
   Actions: `upload`, `rename`, `recategorize`, `move`, `delete`, `restore`, `purge`. Log `upload` for new uploads
   (single and folder import) from now on. One event per changed aspect is fine; a combined update may log
   one event per action in the same transaction.
-- `UNIQUE(experiment_id, name, kind)` stays. Trashed rows still occupy their name/kind; see restore.
+- Name/kind uniqueness applies to **active** files only: the v2 migration rebuilds `files` without the table-level
+  `UNIQUE(experiment_id, name, kind)` and adds `CREATE UNIQUE INDEX files_active_name ON files(experiment_id, name, kind)
+  WHERE deleted_at IS NULL`. Trashed rows do not occupy their name/kind, so a user can trash a wrong file and upload
+  the corrected one under the same name; restoring then reports `name_conflict` (see restore). Every duplicate check
+  (upload, folder-import preview, rename, recategorize, move, restore, category deletion) considers active files only.
 
 ### Visibility rules
 
