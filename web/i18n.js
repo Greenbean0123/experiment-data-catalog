@@ -2,6 +2,63 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "{field} 最低": "{field} minimum",
+    "{field} 最高": "{field} maximum",
+    "包含…": "Contains…",
+    "全部": "All",
+    "使用": "Use",
+    "中文名称": "Chinese name",
+    "英文名称": "English name",
+    "使用 {field}": "Use {field}",
+    "{field} 中文名称": "{field} Chinese name",
+    "{field} 英文名称": "{field} English name",
+    "关键字段": "Key fields",
+    "模板字段": "Template field",
+    "区域": "Section",
+    "缺少时提示": "Flag when missing",
+    "设为关键字段：{field}": "Use as key field: {field}",
+    "缺少时提示：{field}": "Flag when missing: {field}",
+    "这个项目还没有实验模板。先在“实验模板”中添加字段，再回来选择关键字段。": "This project has no experiment template yet. Add fields under Experiment template first, then choose key fields here.",
+    "以下关键字段已不在当前模板中，保存时会移除：{fields}": "These key fields are no longer in the current template and will be removed on save: {fields}",
+    "项目设置尚未保存，确定放弃吗？": "The project settings are not saved. Discard them?",
+    "物相预设最多 20 个。": "Up to 20 phase presets.",
+    "关键字段最多 8 个。": "Up to 8 key fields.",
+    "项目设置已保存。": "Project settings saved.",
+    "项目设置已在其他窗口修改，已显示最新设置。请重新修改后保存。": "The project settings were changed in another window. The latest settings are shown; make your changes again and save.",
+    "第 {line} 行缺少显示名称。": "Line {line} has no display name.",
+    "编号前缀只能包含 1–20 个英文字母：{prefix}": "ID prefixes may contain only 1–20 letters: {prefix}",
+    "英文标签与备注译法不是有效的 JSON。": "The English labels and note rules are not valid JSON.",
+    "英文标签与备注译法应为 JSON 对象。": "The English labels and note rules must be a JSON object.",
+    "备注规则不是有效的正则表达式：{pattern}": "A note rule is not a valid regular expression: {pattern}",
+    "本地约定尚未保存，确定放弃吗？": "The catalog conventions are not saved. Discard them?",
+    "本地约定已保存。": "Catalog conventions saved.",
+    "项目设置": "Project settings",
+    "本地约定": "Catalog conventions",
+    "关键字段筛选": "Key field filters",
+    "决定这个项目使用哪些条件字段、如何称呼它们，以及哪些模板字段作为关键字段。": "Choose which condition fields this project uses, what they are called, and which template fields act as key fields.",
+    "内置条件字段": "Built-in condition fields",
+    "关闭后，这个项目的筛选、表格、编辑器、对比和缺条件提示都不再显示该字段；已保存的数据保持不变。名称留空时使用默认名称。": "A field that is switched off disappears from this project's filters, tables, editor, comparisons and missing-condition checks; saved data stays unchanged. Leave a name blank to use the default.",
+    "从当前实验模板中选择最多 8 个字段。关键字段会出现在筛选、条件分布、列表、对比、CSV 和批量编辑中。": "Choose up to 8 fields of the current experiment template. Key fields appear in filters, the condition distribution, the list, comparisons, CSV and bulk edit.",
+    "物相预设": "Phase presets",
+    "每行一个，最多 20 个；在结果摘要中作为物相按钮出现。": "One per line, up to 20; shown as phase buttons in result summaries.",
+    "保存设置": "Save settings",
+    "只适用于这个实验库的约定，保存在数据目录的 local-catalog.json，并随完整备份保存。": "Conventions for this catalog only. They are stored in local-catalog.json in the data folder and included in full backups.",
+    "编号前缀": "ID prefixes",
+    "这些前缀的编号中，实验本第 1 册写作 1 或 I 都视为同一册，例如 AB-1-079 与 AB-I-079。多个前缀用逗号或空格分隔。": "For IDs with these prefixes, notebook 1 written as 1 or I is the same book, e.g. AB-1-079 and AB-I-079. Separate prefixes with commas or spaces.",
+    "前驱体别名": "Precursor aliases",
+    "每行一个：显示名称 = 别名 1, 别名 2。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。": "One per line: display name = alias 1, alias 2. Affects display, filtering and sort order (as listed) only; stored values stay unchanged.",
+    "英文标签与备注译法（高级）": "English labels and note rules (advanced)",
+    "JSON 格式，包含 en、categories、datasetTitles、noteLines 和 noteRules。备注规则使用 JavaScript 正则表达式，保存前会检查。": "JSON with en, categories, datasetTitles, noteLines and noteRules. Note rules use JavaScript regular expressions and are checked before saving.",
+    "保存约定": "Save conventions",
+    "全部{label}": "All {label}",
+    "{label}（可多选）": "{label} (select multiple)",
+    "新增{label}": "Add {label}",
+    "{label}名称": "{label} name",
+    "请填写有效的数值。": "Enter a valid number.",
+    "关键字段必须来自当前实验模板。": "Key fields must come from the current experiment template.",
+    "项目设置已在其他窗口修改，请刷新后再保存。": "The project settings were changed in another window. Refresh before saving.",
+    "找不到该项目。": "Project not found.",
+    "本地约定已在其他窗口修改，请刷新后再保存。": "The catalog conventions were changed in another window. Refresh before saving.",
     "附件修改尚未保存，确定放弃吗？": "The attachment changes are not saved. Discard them?",
     "附件已被移动、删除或样品已归档，请关闭窗口后核对。": "The attachment was moved, deleted or its sample archived. Close this window and check.",
     "附件信息已在其他窗口更新，已显示最新内容并保留你的修改。请核对后再保存。": "The attachment was updated in another window. The latest details are shown and your edits are kept. Check them before saving.",
@@ -583,6 +640,10 @@ const CatalogI18n = (() => {
     for (const prefix of ["以下附件在实验库中缺失，备份未完成：", "附件校验值不一致，备份未完成：", "备份未完成："]) {
       if (message.startsWith(prefix)) return en[prefix] + message.slice(prefix.length).replace(/、/g, ", ").replace(/ 等$/, ", …");
     }
+    let keyMatch = message.match(/^以下样品的模板没有字段 (.+)：(.+)$/);
+    if (keyMatch) return `These samples' templates have no field ${keyMatch[1]}: ${keyMatch[2].replace(/、/g, ", ")}`;
+    keyMatch = message.match(/^本地约定格式不正确：(.+)$/);
+    if (keyMatch) return `Invalid catalog conventions: ${keyMatch[1]}`;
     let match = message.match(/^备份磁盘空间不足：还需要约 (.+) GB，可用 (.+) GB。$/);
     if (match) return `Not enough space on the backup disk: about ${match[1]} GB needed, ${match[2]} GB available.`;
     match =message.match(/^(.+) 格式不正确或内容过长。$/);

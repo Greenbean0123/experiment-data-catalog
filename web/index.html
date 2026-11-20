@@ -58,6 +58,8 @@
       <div id="category-nav"></div>
       <p class="nav-label" data-i18n="数据管理">数据管理</p>
       <button class="nav-item" id="manage-template"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="实验模板">实验模板</span></button>
+      <button class="nav-item" id="project-settings-view"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="项目设置">项目设置</span></button>
+      <button class="nav-item" id="conventions-view"><svg class="icon" aria-hidden="true"><use href="#i-language"/></svg><span data-i18n="本地约定">本地约定</span></button>
       <button class="nav-item" id="folder-import"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="导入文件夹">导入文件夹</span></button>
       <button class="nav-item" id="manage-categories"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="数据类别">数据类别</span></button>
       <button class="nav-item" id="trash-view"><svg class="icon" aria-hidden="true"><use href="#i-archive"/></svg><span data-i18n="回收站">回收站</span><b id="trash-count">0</b></button>
@@ -97,6 +99,7 @@
           <fieldset><legend data-i18n="反应 / 取样时间 · min">反应 / 取样时间 · min</legend><div class="range"><input id="time-min" type="number" min="0" step="any" placeholder="最短 min" data-i18n-placeholder="最短 min" aria-label="最短时间" data-i18n-aria-label="最短时间"><span>–</span><input id="time-max" type="number" min="0" step="any" placeholder="最长 min" data-i18n-placeholder="最长 min" aria-label="最长时间" data-i18n-aria-label="最长时间"></div></fieldset>
           <button id="clear-filters" class="quiet reset" data-i18n="重置">重置</button>
         </div>
+        <div id="key-filters" class="filters key-filters" role="group" aria-label="关键字段筛选" data-i18n-aria-label="关键字段筛选" hidden></div>
         <p id="filter-error" class="inline-error" role="alert" hidden></p>
         <div class="result-filters" role="group" aria-label="结果筛选" data-i18n-aria-label="结果筛选">
           <span class="result-filter-label" data-i18n="实验结果">实验结果</span>
@@ -106,7 +109,7 @@
         </div>
         <div id="chart-filter" class="chart-filter" hidden><span id="chart-filter-label"></span><button id="clear-chart-filter" class="quiet" data-i18n="清除此条件">清除此条件</button></div>
         <div class="list-bar"><span id="result-count" aria-live="polite" data-i18n="正在读取实验记录…">正在读取实验记录…</span><div><span id="selection-count"></span><button id="select-visible" class="quiet" data-i18n="全选筛选样品">全选筛选样品</button><button id="clear-selection" class="quiet" hidden data-i18n="清空选择">清空选择</button><button id="bulk-edit" disabled data-i18n="批量编辑">批量编辑</button><a id="share-selected" class="button" hidden target="_blank" rel="noopener" data-i18n="导出所选实验包">导出所选实验包</a><button id="compare" disabled data-i18n="对比条件">对比条件</button></div></div>
-        <div class="table-scroll catalog-table-scroll"><table class="records-table"><thead><tr><th class="check-cell"><span class="sr-only" data-i18n="选择实验">选择实验</span></th><th data-i18n="实验编号 / 样品">实验编号 / 样品</th><th data-i18n="前驱体">前驱体</th><th><span data-i18n="温度">温度</span> <small>°C</small></th><th><span data-i18n="时间">时间</span> <small>min</small></th><th data-i18n="溶剂 / 配体">溶剂 / 配体</th><th data-i18n="数据附件">数据附件</th><th data-i18n="记录状态">记录状态</th><th><span class="sr-only" data-i18n="打开详情">打开详情</span></th></tr></thead><tbody id="records"></tbody></table></div>
+        <div class="table-scroll catalog-table-scroll"><table class="records-table"><thead><tr><th class="check-cell"><span class="sr-only" data-i18n="选择实验">选择实验</span></th><th data-i18n="实验编号 / 样品">实验编号 / 样品</th><th class="col-precursor" data-i18n="前驱体">前驱体</th><th class="col-temperature"><span data-i18n="温度">温度</span> <small>°C</small></th><th class="col-duration"><span data-i18n="时间">时间</span> <small>min</small></th><th class="col-materials" data-i18n="溶剂 / 配体">溶剂 / 配体</th><th data-i18n="数据附件">数据附件</th><th data-i18n="记录状态">记录状态</th><th><span class="sr-only" data-i18n="打开详情">打开详情</span></th></tr></thead><tbody id="records"></tbody></table></div>
         <div id="empty-state" class="empty" hidden><svg class="empty-icon"><use href="#i-flask"/></svg><h3 id="empty-title"></h3><p id="empty-message"></p><button id="empty-new" class="primary" data-i18n="新建第一条实验">新建第一条实验</button></div>
         <p class="filter-note" data-i18n="筛选时仅显示匹配的样品；导出包含折叠组内的匹配记录。">筛选时仅显示匹配的样品；导出包含折叠组内的匹配记录。</p><div class="table-footer"><span data-i18n="— 表示尚未记录；0 是有效实验数值。">— 表示尚未记录；0 是有效实验数值。</span><span data-i18n="展开实验后勾选 2–6 条样品，可并排比较条件。">展开实验后勾选 2–6 条样品，可并排比较条件。</span></div>
       </section>
@@ -299,6 +302,27 @@
       <div id="import-rows" class="table-scroll"></div>
     </div>
     <div class="dialog-footer workflow-actions"><button id="preview-import" data-i18n="预览归属">预览归属</button><button id="confirm-import" class="primary" disabled data-i18n="确认导入">确认导入</button></div>
+  </dialog>
+  <dialog id="project-settings-dialog" class="workflow-dialog settings-dialog" aria-labelledby="project-settings-title">
+    <div class="dialog-header"><div><h2 id="project-settings-title" data-i18n="项目设置">项目设置</h2><p class="dialog-subtitle" data-i18n="决定这个项目使用哪些条件字段、如何称呼它们，以及哪些模板字段作为关键字段。">决定这个项目使用哪些条件字段、如何称呼它们，以及哪些模板字段作为关键字段。</p></div><button id="close-project-settings" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <label class="settings-project"><span data-i18n="实验项目">实验项目</span><select id="settings-project"></select></label>
+      <p id="project-settings-error" class="inline-error" role="alert" hidden></p>
+      <section class="settings-section"><h3 data-i18n="内置条件字段">内置条件字段</h3><p class="field-help" data-i18n="关闭后，这个项目的筛选、表格、编辑器、对比和缺条件提示都不再显示该字段；已保存的数据保持不变。名称留空时使用默认名称。">关闭后，这个项目的筛选、表格、编辑器、对比和缺条件提示都不再显示该字段；已保存的数据保持不变。名称留空时使用默认名称。</p><div id="settings-builtin" class="table-scroll"></div></section>
+      <section class="settings-section"><h3 data-i18n="关键字段">关键字段</h3><p class="field-help" data-i18n="从当前实验模板中选择最多 8 个字段。关键字段会出现在筛选、条件分布、列表、对比、CSV 和批量编辑中。">从当前实验模板中选择最多 8 个字段。关键字段会出现在筛选、条件分布、列表、对比、CSV 和批量编辑中。</p><div id="settings-key-fields"></div></section>
+      <section class="settings-section"><h3 data-i18n="物相预设">物相预设</h3><p class="field-help" data-i18n="每行一个，最多 20 个；在结果摘要中作为物相按钮出现。">每行一个，最多 20 个；在结果摘要中作为物相按钮出现。</p><textarea id="settings-phases" rows="4" maxlength="2000"></textarea></section>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="cancel-project-settings" data-i18n="取消">取消</button><button id="save-project-settings" class="primary" data-i18n="保存设置">保存设置</button></div>
+  </dialog>
+  <dialog id="conventions-dialog" class="workflow-dialog settings-dialog" aria-labelledby="conventions-title">
+    <div class="dialog-header"><div><h2 id="conventions-title" data-i18n="本地约定">本地约定</h2><p class="dialog-subtitle" data-i18n="只适用于这个实验库的约定，保存在数据目录的 local-catalog.json，并随完整备份保存。">只适用于这个实验库的约定，保存在数据目录的 local-catalog.json，并随完整备份保存。</p></div><button id="close-conventions" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p id="conventions-error" class="inline-error" role="alert" hidden></p>
+      <section class="settings-section"><h3><label for="conventions-prefixes" data-i18n="编号前缀">编号前缀</label></h3><p class="field-help" data-i18n="这些前缀的编号中，实验本第 1 册写作 1 或 I 都视为同一册，例如 AB-1-079 与 AB-I-079。多个前缀用逗号或空格分隔。">这些前缀的编号中，实验本第 1 册写作 1 或 I 都视为同一册，例如 AB-1-079 与 AB-I-079。多个前缀用逗号或空格分隔。</p><input id="conventions-prefixes" autocomplete="off" spellcheck="false" maxlength="1200"></section>
+      <section class="settings-section"><h3><label for="conventions-aliases" data-i18n="前驱体别名">前驱体别名</label></h3><p class="field-help" data-i18n="每行一个：显示名称 = 别名 1, 别名 2。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。">每行一个：显示名称 = 别名 1, 别名 2。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。</p><textarea id="conventions-aliases" rows="5" spellcheck="false"></textarea></section>
+      <section class="settings-section"><h3><label for="conventions-translations" data-i18n="英文标签与备注译法（高级）">英文标签与备注译法（高级）</label></h3><p class="field-help" data-i18n="JSON 格式，包含 en、categories、datasetTitles、noteLines 和 noteRules。备注规则使用 JavaScript 正则表达式，保存前会检查。">JSON 格式，包含 en、categories、datasetTitles、noteLines 和 noteRules。备注规则使用 JavaScript 正则表达式，保存前会检查。</p><textarea id="conventions-translations" class="code-input" rows="10" spellcheck="false"></textarea></section>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="cancel-conventions" data-i18n="取消">取消</button><button id="save-conventions" class="primary" data-i18n="保存约定">保存约定</button></div>
   </dialog>
   <dialog id="file-dialog" class="workflow-dialog file-dialog" aria-labelledby="file-dialog-title">
     <div class="dialog-header"><div><h2 id="file-dialog-title" data-i18n="管理附件">管理附件</h2><p id="file-dialog-subtitle" class="dialog-subtitle"></p></div><button id="close-file-dialog" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>

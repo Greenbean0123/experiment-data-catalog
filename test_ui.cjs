@@ -12,7 +12,7 @@ const scripts = ["i18n.js", "app.js"].map(name => fs.readFileSync(path.join(__di
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const sample = (id, fields = {}) => ({id, sample_id: id, experiment_no: id, project_id: "default", project_name: "默认项目", series: "示例系列", experiment_date: "", precursor: "PA12", temperature: 250, duration: 60, solvent: "ODE", ligand: "OA", material_amounts: [], notes: "中文原始记录，不应被翻译", status: "待补全", archived: false, extra_conditions: [], files: [], revision: 1, updated_at: "2026-11-14T12:00:00Z", ...fields});
 
-async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, attachmentHandler, deleteError, statusError, savedConditions = {}} = {}) {
+async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, attachmentHandler, settingsHandler, deleteError, statusError, savedConditions = {}} = {}) {
   const console = new VirtualConsole();
   const errors = [];
   console.on("jsdomError", error => errors.push(error));
@@ -43,6 +43,10 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     if (typeof url === "string" && url.startsWith("api/")) url = "/" + url;  // The page uses relative URLs under /s/{instance}/.
     if (offline) throw new Error("Offline");
     if (workflowHandler && (url.startsWith("/api/history") || url.startsWith("/api/reviews"))) return workflowHandler(url, options, rows);
+    if (url.startsWith("/api/projects/") || url.startsWith("/api/local-catalog")) {
+      assert(settingsHandler, "Unexpected settings request: " + url);
+      return settingsHandler(url, options);
+    }
     if (url.startsWith("/api/trash") || /^\/api\/files\/[^/?]+\/(update|delete)$/.test(url)) {
       assert(attachmentHandler, "Unexpected attachment request: " + url);
       return attachmentHandler(url, options, rows);
@@ -2219,6 +2223,138 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.match($("trash-content").textContent, /The trash is empty/);
       $("trash-close").click();
       assert.ok(pendingLoad !== undefined);
+    } finally { env.dom.window.close(); }
+  }
+  {
+    // Milestone 2: project field settings applied across the UI, key fields, and both settings dialogs.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const template = {revision: 2, name: "Films", fields: [
+      {key: "0", label: "Substrate", section: "condition", type: "single", unit: "", options: ["Si", "Glass"], required: false},
+      {key: "1", label: "Thickness", section: "condition", type: "number", unit: "nm", options: [], required: false},
+      {key: "2", label: "Notes", section: "result", type: "text", unit: "", options: [], required: false}]};
+    const film = (id, values, fields = {}) => sample(id, {experiment_no: id, template, lab_data: {template_revision: 2, values}, ...fields});
+    const settings = {builtin: {precursor: {enabled: true, label: {zh: "电解液", en: "Electrolyte"}}, temperature: {enabled: false, label: {zh: "", en: ""}},
+      duration: {enabled: true, label: {zh: "", en: ""}}, materials: {enabled: true, label: {zh: "", en: ""}}},
+      key_fields: [{section: "condition", label: "Substrate", check_missing: true}, {section: "condition", label: "Thickness", check_missing: false}], phase_presets: ["Phase I"]};
+    const fields = [{section: "condition", label: "Substrate", check_missing: true, available: true, type: "single", unit: "", options: ["Si", "Glass"]},
+      {section: "condition", label: "Thickness", check_missing: false, available: true, type: "number", unit: "nm", options: []}];
+    let entry = {settings, revision: 3, fields}, conflictOnce = false;
+    const puts = [];
+    const local = {catalog: {notebook_prefixes: ["XY"], precursor_aliases: [{label: "Compound A12 (CA12)", aliases: ["CA12", "PA12"]}], translations: {}}, revision: "abc"};
+    const env = await boot({savedLanguage: "en", extraRows: [film("F1", {0: "Si", 1: 120}), film("F2", {0: "Glass", 1: 80}), film("F3", {1: 50})],
+      readHandler: catalog => reply(200, {...catalog, templates: {default: template}, project_settings: {default: entry}}),
+      settingsHandler: (url, options) => {
+        if (url.startsWith("/api/local-catalog")) {
+          if (options.method === "PUT") { puts.push({url, body: JSON.parse(options.body)}); return reply(200, {...local, revision: "def"}); }
+          return reply(200, local);
+        }
+        if (options.method === "PUT") {
+          const body = JSON.parse(options.body);
+          puts.push({url, body});
+          if (conflictOnce) { conflictOnce = false; return reply(409, {error: "项目设置已在其他窗口修改，请刷新后再保存。"}); }
+          entry = {settings: body.settings, revision: entry.revision + 1, fields};
+          return reply(200, entry);
+        }
+        return reply(200, entry);
+      }});
+    try {
+      const {$, w, writes} = env;
+      $("dashboard-records-tab").click(); await flush();
+      // Labels and visibility
+      assert.match($("filter-precursor").closest("label").textContent, /Electrolyte/, "Custom label replaces the built-in name");
+      assert.equal($("temp-min").closest("fieldset").hidden, true, "A switched-off built-in leaves the filters");
+      assert.equal(w.document.querySelector(".records-table").classList.contains("hide-temperature"), true);
+      assert.equal([...$("dashboard-condition-field").options].find(option => option.value === "temperature").disabled, true);
+      assert.ok([...$("dashboard-condition-field").options].some(option => option.value === "key:condition:Substrate"), "Key fields join the distribution");
+      // Key-field filters
+      assert.equal($("key-filters").hidden, false);
+      const substrate = $("key-filters").querySelector('[data-key-filter="key:condition:Substrate"]');
+      substrate.value = "Si"; substrate.dispatchEvent(new w.Event("change", {bubbles: true}));
+      assert.ok(w.document.querySelector('[data-expand="experiment:default:f1"]'));
+      assert.equal(w.document.querySelector('[data-expand="experiment:default:f2"]'), null, "The option filter excludes other values");
+      $("clear-filters").click();
+      const [low] = $("key-filters").querySelectorAll('[data-key-filter="key:condition:Thickness"]');
+      low.value = "100"; low.dispatchEvent(new w.Event("input", {bubbles: true}));
+      assert.ok(w.document.querySelector('[data-expand="experiment:default:f1"]'));
+      assert.equal(w.document.querySelector('[data-expand="experiment:default:f3"]'), null, "The number range applies");
+      $("clear-filters").click();
+      // Details, list chips and comparison
+      w.document.querySelector('[data-expand="experiment:default:f1"]').click();
+      assert.match(w.document.querySelector('[data-open="F1"]').closest("tr").textContent, /Substrate.*Si/, "Key fields show as chips");
+      assert.doesNotMatch(w.document.querySelector('[data-open="F1"]').closest("tr").textContent, /Temp\./);
+      w.document.querySelector('[data-open="F1"]').click();
+      assert.match($("detail-content").textContent, /Electrolyte/);
+      assert.match($("detail-content").textContent, /Thickness120 nm/);
+      assert.doesNotMatch($("detail-content").textContent, /Temperature \/ °C/);
+      $("close-detail").click();
+      // Dashboard distribution by a key field
+      $("dashboard-overview-tab").click();
+      $("dashboard-condition-field").value = "key:condition:Thickness"; $("dashboard-condition-field").dispatchEvent(new w.Event("change", {bubbles: true}));
+      assert.match($("dashboard-condition-rows").textContent, /50 nm.*80 nm.*120 nm/s, "Numbers sort numerically with their unit");
+      $("dashboard-records-tab").click();
+      // Bulk edit offers key fields of the selected project
+      for (const id of ["F1", "F2"]) if (!w.document.querySelector(`[data-select="${id}"]`)) w.document.querySelector(`[data-expand="experiment:default:${id.toLowerCase()}"]`).click();
+      for (const id of ["F1", "F2"]) { const box = w.document.querySelector(`[data-select="${id}"]`); box.checked = true; box.dispatchEvent(new w.Event("change", {bubbles: true})); }
+      $("bulk-edit").click();
+      assert.equal($("bulk-editor").open, true);
+      assert.equal($("bulk-temperature-mode"), null, "Switched-off built-ins are not offered");
+      $("bulk-key0-mode").value = "set"; $("bulk-key0-mode").dispatchEvent(new w.Event("change", {bubbles: true}));
+      $("bulk-key0").value = "Glass";
+      let bulkBody = null;
+      env.w.fetch = (original => async (url, options = {}) => {
+        if (String(url).endsWith("experiments/bulk")) { bulkBody = JSON.parse(options.body); return reply(200, {updated: 1, rows: [{id: "F1", sample_id: "F1", project_id: "default", experiment_no: "F1", changes: [{field: "key:condition:Substrate", before: "Si", after: "Glass"}]}]}); }
+        return original(url, options);
+      })(env.w.fetch);
+      $("bulk-form").dispatchEvent(new w.Event("submit", {cancelable: true})); await flush(); await flush();
+      assert.deepEqual(bulkBody.changes, {key_fields: [{section: "condition", label: "Substrate", mode: "set", value: "Glass"}]});
+      assert.match($("bulk-review").textContent, /Substrate.*Si.*Glass/, "Key-field changes are labelled in the preview");
+      w.confirm = () => true;
+      $("close-bulk").click();
+      // Project settings dialog
+      $("project-settings-view").click(); await flush(); await flush();
+      assert.equal($("project-settings-dialog").open, true);
+      assert.equal($("settings-builtin").querySelector('[data-builtin-enabled="temperature"]').checked, false);
+      assert.equal($("settings-builtin").querySelector('[data-builtin-label="precursor"][data-lang="en"]').value, "Electrolyte");
+      assert.equal($("settings-key-fields").querySelector('[data-key-pick="0"]').checked, true);
+      assert.equal($("settings-key-fields").querySelector('[data-key-missing="1"]').checked, false);
+      $("settings-builtin").querySelector('[data-builtin-enabled="temperature"]').checked = true;
+      $("settings-key-fields").querySelector('[data-key-pick="2"]').click();
+      $("settings-phases").value = "Phase I\nPhase II\nPhase I";
+      $("settings-phases").dispatchEvent(new w.Event("input", {bubbles: true}));
+      conflictOnce = true;
+      $("save-project-settings").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("project-settings-dialog").open, true);
+      assert.match($("project-settings-error").textContent, /latest settings are shown/, "A conflict shows the other window's settings");
+      assert.equal($("settings-builtin").querySelector('[data-builtin-enabled="temperature"]').checked, false);
+      $("settings-builtin").querySelector('[data-builtin-enabled="temperature"]').checked = true;
+      $("settings-phases").value = "Phase I\nPhase II\nPhase I";
+      $("save-project-settings").click(); for (let i = 0; i < 4; i++) await flush();
+      const saved = puts.filter(put => put.url.includes("/settings")).at(-1).body;
+      assert.equal(saved.revision, 3);
+      assert.equal(saved.settings.builtin.temperature.enabled, true);
+      assert.deepEqual(saved.settings.phase_presets, ["Phase I", "Phase II"], "Duplicates are dropped");
+      assert.deepEqual(saved.settings.key_fields.map(item => item.label), ["Substrate", "Thickness"]);
+      assert.equal($("project-settings-dialog").open, false);
+      assert.match($("toast").textContent, /Project settings saved/);
+      assert.equal($("temp-min").closest("fieldset").hidden, false, "Saved settings apply immediately");
+      // Conventions dialog
+      $("conventions-view").click(); await flush(); await flush();
+      assert.equal($("conventions-prefixes").value, "XY");
+      assert.equal($("conventions-aliases").value, "Compound A12 (CA12) = CA12, PA12");
+      $("conventions-prefixes").value = "XY, A1";
+      $("save-conventions").click(); await flush();
+      assert.match($("conventions-error").textContent, /only 1–20 letters: A1/);
+      $("conventions-prefixes").value = "XY, AB";
+      $("conventions-translations").value = JSON.stringify({noteRules: [{pattern: "([", replacement: "x"}]});
+      $("save-conventions").click(); await flush();
+      assert.match($("conventions-error").textContent, /not a valid regular expression/);
+      $("conventions-translations").value = "";
+      $("conventions-aliases").value = "Compound A12 (CA12) = CA12, PA12\nCompound B = CB，cb";
+      $("save-conventions").click(); for (let i = 0; i < 4; i++) await flush();
+      const conventions = puts.filter(put => put.url.includes("local-catalog")).at(-1).body;
+      assert.deepEqual(conventions, {catalog: {notebook_prefixes: ["XY", "AB"], precursor_aliases: [{label: "Compound A12 (CA12)", aliases: ["CA12", "PA12"]}, {label: "Compound B", aliases: ["CB", "cb"]}], translations: {}}, revision: "abc"});
+      assert.equal($("conventions-dialog").open, false);
+      assert.ok(writes !== undefined);
     } finally { env.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");

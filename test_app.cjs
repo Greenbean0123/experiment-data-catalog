@@ -127,6 +127,40 @@ assert.equal(I18n.notesText("a", "en"), "c", "A new catalog replaces earlier rul
 I18n.extend(localTranslations);
 assert.equal(filterRecords([record("imported", {notes: sourceNotes})], {language: "en", query: "example note"}).length, 1);
 assert.equal(comparisonRows([record("imported", {notes: sourceNotes})], "en").find(row => row.label === "Notes").values[0], englishNotes);
+{
+  // Milestone 2: built-in switches, key-field resolution across template versions, missing checks, comparison rows.
+  const {configureProjects, builtinEnabled, builtinCaption, keyFieldValue, missingConditions, comparisonRows: rowsOf, filterRecords: filterOf} = require("./web/app.js");
+  const v1 = {revision: 1, fields: [{key: "0", label: "substrate", section: "condition", type: "single", options: ["Si"], unit: ""}]};
+  const v2 = {revision: 2, fields: [{key: "3", label: "Substrate", section: "condition", type: "single", options: ["Si", "Glass"], unit: ""},
+    {key: "4", label: "Thickness", section: "condition", type: "number", options: [], unit: "nm"}]};
+  const v3 = {revision: 3, fields: [{key: "0", label: "Thickness", section: "condition", type: "number", options: [], unit: "um"}]};
+  configureProjects({p: {revision: 1, settings: {builtin: {temperature: {enabled: false, label: {}}, precursor: {enabled: true, label: {zh: "电解液", en: ""}}}},
+    fields: [{section: "condition", label: "Substrate", check_missing: true, available: true, type: "single", unit: "", options: ["Si", "Glass"]},
+             {section: "condition", label: "Thickness", check_missing: false, available: true, type: "number", unit: "nm", options: []}]}});
+  const old = record("old", {project_id: "p", template: v1, lab_data: {template_revision: 1, values: {0: "Si"}}});
+  const now = record("now", {project_id: "p", template: v2, lab_data: {template_revision: 2, values: {3: "Glass", 4: 90}}});
+  const other = record("other", {project_id: "p", template: v3, lab_data: {template_revision: 3, values: {0: 0.2}}});
+  const bare = record("bare", {project_id: "p", temperature: null});
+  const [substrate, thickness] = [{section: "condition", label: "Substrate", type: "single", unit: ""}, {section: "condition", label: "Thickness", type: "number", unit: "nm"}];
+  assert.equal(keyFieldValue(old, substrate).value, "Si", "Labels match case-insensitively across template versions");
+  assert.equal(keyFieldValue(now, thickness).value, 90);
+  assert.equal(keyFieldValue(other, thickness).unitDiffers, true, "A different unit is flagged");
+  assert.equal(builtinEnabled("p", "temperature"), false);
+  assert.equal(builtinEnabled("", "temperature"), false, "With every project switching it off, the all-projects view hides it too");
+  assert.equal(builtinCaption("p", "precursor", "en"), "电解液", "Falls back to the other language's custom label");
+  assert.equal(builtinCaption("p", "duration", "en"), "Reaction / sampling time · min", "Defaults stay exact");
+  assert.deepEqual(missingConditions([bare]).includes("temperature"), false, "Switched-off built-ins are not missing");
+  assert.ok(missingConditions([bare]).includes("Substrate"), "check_missing key fields are reported");
+  assert.equal(missingConditions([now]).includes("Thickness"), false, "Key fields without check_missing are not reported");
+  const rows = rowsOf([old, now], "en");
+  assert.ok(!rows.some(row => /^Temperature/.test(row.label)), "Comparison hides switched-off built-ins");
+  assert.deepEqual(rows.find(row => row.label === "Thickness (nm)").values, ["", "90 nm"]);
+  assert.deepEqual(filterOf([old, now, other], {project: "p", keyFilters: [{info: {...thickness}, min: "50", max: "", value: "", text: ""}]}).map(r => r.id), ["now"],
+    "Range filters skip other units and missing values");
+  assert.deepEqual(filterOf([old, now], {project: "p", tempMin: "999", keyFilters: []}).length, 2, "A switched-off built-in no longer filters");
+  configureProjects({});
+  console.log("Passed: project field settings, key fields across template versions, missing checks.");
+}
 console.log("Passed: range filters, unknown vs zero, attachment/condition search, archive separation, comparison differences.");
 const mixed = record("mixed", {solvent: "ODE + OA", solvents: ["ODE", "OA"]});
 assert.equal(filterRecords([mixed], {solvent: "OA"}).length, 1);

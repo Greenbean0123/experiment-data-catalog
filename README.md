@@ -125,33 +125,29 @@ Use **×** beside a solvent / ligand to remove it from saved choices. For temper
 - **Comparison plots**. Select 2–6 samples. Use the table or plot signals recorded with the same project and template version. For an XRD overlay, select UTF-8 CSVs from at least two samples with 2θ in degrees and measured intensity as the first two columns. Each file is limited to 5 MiB and 20,000 nonblank rows. The plot starts with measured intensities and supports optional min–max normalization.
 - **Export experiment ZIP**. Use the workspace or select samples in the list. The list expands each selected group to all samples in that archive state, including filtered-out samples, up to 500. The package includes conditions, results, original attachments present at export, checksums, and references to outside parents. Stored source paths and sample notes are omitted. Use **Full backup** for recovery.
 
-## 实验室约定（可选）/ Lab conventions
+## 项目设置与关键字段 / Project settings and key fields
 
-程序本身不含任何课题专用内容。每个实验库可以在数据目录放一个 `local-catalog.json`，保存只适用于自己课题的约定；文件随“完整备份”和“备份到文件夹”一起保存，不属于程序源码，也不要提交到代码仓库。所有键都可省略，不放这个文件时程序按通用方式工作。
+左侧 **项目设置** 为每个项目单独决定：
 
-```json
-{
-  "notebook_prefixes": ["AB"],
-  "precursor_aliases": [
-    {"label": "Compound A (CA)", "aliases": ["CA", "compound-a"]}
-  ],
-  "phase_presets": {"default": ["Phase I", "Phase II"]},
-  "translations": {
-    "en": {"自定义核对类型": "Custom review type"},
-    "categories": {"温度系列": "Temperature series"},
-    "datasetTitles": {"图谱汇总": "Plot collection"},
-    "noteLines": {"未知条件保留为空。": "Unknown conditions were left blank."},
-    "noteRules": [{"pattern": "^导入来源：(.+)。$", "replacement": "Import source: $1."}]
-  }
-}
-```
+- **内置条件字段**：前驱体、温度、反应 / 取样时间、溶剂 / 配体可分别关闭或改名（中英文各一个名称，留空用默认名称）。关闭后，这个项目的筛选、表格、编辑器、详情、对比、批量编辑和缺条件提示都不再显示该字段；已保存的数据不变，重新打开即可恢复显示。温度和时间的单位固定为 °C 和 min。
+- **关键字段**：从项目当前的“实验模板”中选最多 8 个字段（文本、数字、单选、多选），可勾选“缺少时提示”。关键字段出现在筛选（数字范围、选项、包含文字）、条件分布、列表、详情、对比、CSV 和批量编辑中。字段按区域和名称（不区分大小写）在每个样品自己的模板版本中查找，所以模板升级后旧样品仍能对应；数字字段单位不同的样品会单独标出，不参与范围筛选。
+- **物相预设**：结果摘要中的物相按钮，每行一个，最多 20 个。
 
-- `notebook_prefixes`：这些前缀的编号中，实验本第 1 册写作 `1` 或 `I` 都视为同一册，例如 `AB-1-079` 与 `AB-I-079` 归入同一实验。
-- `precursor_aliases`：前驱体的显示名称及别名，只影响显示、筛选和排序（按列出的顺序），保存的原值不变。
-- `phase_presets`：按项目 ID 提供结果摘要中的物相按钮；项目中已有的标签仍会自动加入。
-- `translations`：英文界面下系列名、资料集名称、导入说明句式和其他自定义标签的译法。
+项目设置不进入修改历史和撤销。多个窗口同时修改时，后保存的一方会看到最新设置后重新修改。
 
-修改后重新打开页面即可生效（`notebook_prefixes` 需重启程序）。
+**Project settings** (sidebar) switch built-in condition fields off or rename them per project, promote up to 8 experiment-template fields to **key fields** (filters, condition distribution, list, details, comparison, CSV, bulk edit, optional missing-value check), and set phase presets. Key fields are matched by section and case-insensitive label in each sample's own template version; numbers with a different unit are shown but excluded from range filters.
+
+## 本地约定 / Catalog conventions
+
+左侧 **本地约定** 编辑只适用于这个实验库、整理自自己记录的约定，保存在数据目录的 `local-catalog.json`，随“完整备份”和“备份到文件夹”一起保存，不属于程序源码，也不要提交到代码仓库。保存后立即生效。
+
+- **编号前缀**：这些前缀的编号中，实验本第 1 册写作 `1` 或 `I` 都视为同一册，例如 `AB-1-079` 与 `AB-I-079` 归入同一实验。
+- **前驱体别名**：每行 `显示名称 = 别名 1, 别名 2`，只影响显示、筛选和排序（按列出的顺序），保存的原值不变。
+- **英文标签与备注译法（高级）**：JSON，包含 `en`、`categories`、`datasetTitles`、`noteLines` 和 `noteRules`（JavaScript 正则表达式，保存前检查）。
+
+也可以直接编辑 `local-catalog.json`（停止程序后修改，重新启动生效）。旧版文件中的 `phase_presets` 仍会读取，作为没有项目设置时的物相预设。
+
+**Catalog conventions** (sidebar) edit `data/local-catalog.json`: ID prefixes whose notebook 1 equals I, precursor aliases, and English labels and note rules. Changes apply immediately and travel with backups.
 
 ## 数据在哪里
 
