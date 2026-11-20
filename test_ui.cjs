@@ -12,7 +12,7 @@ const scripts = ["i18n.js", "app.js"].map(name => fs.readFileSync(path.join(__di
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const sample = (id, fields = {}) => ({id, sample_id: id, experiment_no: id, project_id: "default", project_name: "默认项目", series: "示例系列", experiment_date: "", precursor: "PA12", temperature: 250, duration: 60, solvent: "ODE", ligand: "OA", material_amounts: [], notes: "中文原始记录，不应被翻译", status: "待补全", archived: false, extra_conditions: [], files: [], revision: 1, updated_at: "2026-11-14T12:00:00Z", ...fields});
 
-async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, deleteError, statusError, savedConditions = {}} = {}) {
+async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, attachmentHandler, deleteError, statusError, savedConditions = {}} = {}) {
   const console = new VirtualConsole();
   const errors = [];
   console.on("jsdomError", error => errors.push(error));
@@ -42,6 +42,10 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
   w.fetch = async (url, options = {}) => {
     if (offline) throw new Error("Offline");
     if (workflowHandler && (url.startsWith("/api/history") || url.startsWith("/api/reviews"))) return workflowHandler(url, options, rows);
+    if (url.startsWith("/api/trash") || /^\/api\/files\/[^/?]+\/(update|delete)$/.test(url)) {
+      assert(attachmentHandler, "Unexpected attachment request: " + url);
+      return attachmentHandler(url, options, rows);
+    }
     if (url.startsWith("/api/backup/")) { assert(backupHandler, "Unexpected backup request: " + url); return backupHandler(url, options); }
     if (url.startsWith("/api/experiment-defaults?")) return {ok: true, json: async () => sharedHandler ? sharedHandler(new URL(url, w.location.origin).searchParams, rows) : {}};
     if (url.endsWith("/preview")) return previewHandler ? previewHandler(url) : {ok: true, json: async () => ({rows: [["angle", "intensity"], ["1", "2"], ["3", "4"]], points: [[1, 2], [3, 4]], labels: ["angle", "intensity"], truncated: false})};
@@ -1862,6 +1866,157 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.match($("backup-last").textContent, /上次备份：.*文件夹 · 4 个附件/);
       assert.equal($("backup-path").value, folder, "Switching language keeps the folder");
     } finally { backup.dom.window.close(); }
+  }
+  {
+    // Milestone 1: manage attachments, trash, attachment history and an expired session.
+    const trash = [], calls = [];
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const find = (rows, fileId) => { for (const row of rows) { const file = row.files.find(item => item.id === fileId); if (file) return {row, file}; } return {}; };
+    const attachments = await boot({savedLanguage: "en", extraRows: [sample("B", {files: []}), sample("OLD", {archived: true, files: [{id: "f9", name: "old.csv", kind: "XRD", size: 5, sha256: "abcdefabcdef0000"}]})],
+      readHandler: catalog => reply(200, {...catalog, trash_count: trash.length}),
+      workflowHandler: url => reply(200, url.startsWith("/api/history") ? {batches: [], has_more: false, file_events: [
+        {id: "e1", file_id: "f1", record_id: "A", action: "rename", before: {name: "old.csv", kind: "XRD", record_id: "A"}, after: {name: "pattern.csv", kind: "XRD", record_id: "A"}, created_at: "2026-11-20T10:00:00Z", sample_id: "A"},
+        {id: "e2", file_id: "f1", record_id: "B", action: "move", before: {name: "pattern.csv", kind: "XRD", record_id: "A"}, after: {name: "pattern.csv", kind: "XRD", record_id: "B"}, created_at: "2026-11-20T11:00:00Z", sample_id: "B"}]} : {items: []}),
+      attachmentHandler: (url, options, rows) => {
+        const body = options.body ? JSON.parse(options.body) : {};
+        calls.push({url, body});
+        if (url.startsWith("/api/trash?")) return reply(200, {items: structuredClone(trash), total_bytes: trash.reduce((sum, item) => sum + item.size, 0)});
+        const id = url.split("/")[3];
+        if (url.endsWith("/update")) {
+          const {row, file} = find(rows, id);
+          if (body.record_revision !== row.revision) return reply(409, {error: "这条记录已在其他窗口更新。请保留当前内容，关闭编辑窗口后刷新再编辑。"});
+          if (body.name) file.name = body.name;
+          if (body.kind) file.kind = body.kind;
+          row.revision++;
+          const changed = [row];
+          if (body.target_record_id) {
+            const target = rows.find(item => item.id === body.target_record_id);
+            assert.equal(body.target_revision, target.revision);
+            row.files = row.files.filter(item => item.id !== id); target.files.push(file); target.revision++; changed.push(target);
+          }
+          return reply(200, {file, records: changed});
+        }
+        if (url.endsWith("/delete")) {
+          const {row, file} = find(rows, id);
+          row.files = row.files.filter(item => item.id !== id); row.revision++;
+          trash.push({...file, deleted_at: "2026-11-20T12:00:00Z", record_id: row.id, sample_id: row.sample_id, experiment_no: row.experiment_no, project_id: row.project_id, record_archived: false, name_conflict: true});
+          return reply(200, {records: [row], trash_count: trash.length});
+        }
+        if (url.endsWith("/restore")) {
+          const index = trash.findIndex(item => item.id === id), item = trash[index], row = rows.find(entry => entry.id === item.record_id);
+          if (item.name_conflict && !body.name) return reply(409, {error: "同名同类附件已存在，请为恢复的附件输入新名称。"});
+          trash.splice(index, 1);
+          const file = {...item, name: body.name || item.name}; row.files.push(file); row.revision++;
+          return reply(200, {file, records: [row], trash_count: trash.length});
+        }
+        if (url === "/api/trash/purge") {
+          assert.equal(body.confirm, "purge");
+          const bytes = trash.filter(item => body.file_ids.includes(item.id)).reduce((sum, item) => sum + item.size, 0);
+          for (const fileId of body.file_ids) trash.splice(trash.findIndex(item => item.id === fileId), 1);
+          return reply(200, {purged: body.file_ids.length, bytes, trash_count: trash.length});
+        }
+        throw new Error("Unhandled " + url);
+      }});
+    try {
+      const {$, w, rows, confirmations} = attachments;
+      const open = id => {
+        const find = () => w.document.querySelector(`[data-open="${id}"]`);
+        if (!find()) w.document.querySelector(`[data-expand="experiment:default:${id.toLowerCase()}"]`).click();
+        find().click();
+      };
+      $("dashboard-records-tab").click();
+      assert.equal($("trash-count").hidden, true, "An empty trash shows no count");
+      open("A");
+      const manage = () => $("detail-content").querySelector('[data-manage-file="f1"]');
+      assert.ok(manage(), "Active samples offer attachment management");
+      manage().click();
+      assert.equal($("file-dialog").open, true);
+      assert.equal($("file-name").value, "pattern.csv");
+      assert.deepEqual([...$("file-target").options].map(option => option.value).includes("OLD"), false, "Archived samples are not move targets");
+      $("save-file").click(); await flush();
+      assert.match($("file-error").textContent, /no changes/i, "Unchanged values are not submitted");
+      assert.equal(calls.length, 0);
+      $("file-name").value = "renamed.csv";
+      $("file-kind").value = "NMR";
+      $("save-file").click(); await flush(); await flush();
+      assert.deepEqual(calls.at(-1), {url: "/api/files/f1/update", body: {record_revision: 1, name: "renamed.csv", kind: "NMR"}});
+      assert.equal($("file-dialog").open, false);
+      assert.match($("detail-content").textContent, /renamed\.csv/, "The detail view uses the returned record");
+      assert.match($("toast").textContent, /Attachment updated/);
+      // A stale revision keeps the dialog open, explains, and refreshes the catalog for a retry.
+      rows.find(row => row.id === "A").revision = 7;
+      manage().click();
+      $("file-name").value = "stale.csv";
+      $("save-file").click(); await flush(); await flush(); await flush();
+      assert.equal($("file-dialog").open, true);
+      assert.match($("file-error").textContent, /updated in another window/i);
+      $("save-file").click(); await flush(); await flush();
+      assert.equal(calls.at(-1).body.record_revision, 7, "The retry uses the refreshed revision");
+      // Move to another sample of the same project.
+      manage().click();
+      $("file-target").value = "B";
+      $("save-file").click(); await flush(); await flush();
+      assert.equal(calls.at(-1).body.target_record_id, "B");
+      assert.match($("toast").textContent, /moved to B/);
+      assert.equal($("detail-content").querySelector('[data-manage-file="f1"]'), null, "The source sample no longer lists the moved file");
+      // Trash: delete from B, restore with a new name, then purge.
+      $("close-detail").click();
+      open("B");
+      manage().click();
+      $("delete-file").click(); await flush(); await flush();
+      assert.match(confirmations.at(-1), /Move stale\.csv to the trash/);
+      assert.equal($("trash-count").textContent, "1");
+      assert.equal($("trash-count").hidden, false);
+      $("close-detail").click();
+      $("trash-view").click(); await flush(); await flush();
+      assert.equal($("trash-dialog").open, true);
+      assert.match($("trash-content").textContent, /stale\.csv/);
+      assert.match($("trash-content").textContent, /choose a new name/);
+      $("trash-content").querySelector('[data-trash-restore="f1"]').click(); await flush();
+      const rename = $("trash-content").querySelector('[data-trash-name="f1"]');
+      assert.ok(rename, "A name conflict asks for a new name before restoring");
+      rename.value = "restored.csv";
+      $("trash-content").querySelector('[data-trash-restore="f1"]').click(); await flush(); await flush(); await flush();
+      assert.equal(calls.filter(call => call.url.endsWith("/restore")).at(-1).body.name, "restored.csv");
+      assert.match($("toast").textContent, /restored\.csv restored to B/);
+      assert.equal($("trash-count").hidden, true);
+      assert.match($("trash-content").textContent, /The trash is empty/);
+      assert.equal($("purge-all").disabled, true);
+      $("trash-close").click();
+      open("B"); manage().click(); $("delete-file").click(); await flush(); await flush(); $("close-detail").click();
+      $("trash-view").click(); await flush(); await flush();
+      const box = $("trash-content").querySelector('[data-trash-select="f1"]');
+      box.checked = true; box.dispatchEvent(new w.Event("change", {bubbles: true}));
+      assert.equal($("purge-selected").disabled, false);
+      w.confirm = message => { confirmations.push(message); return false; };
+      $("purge-selected").click(); await flush();
+      assert.equal(calls.some(call => call.url === "/api/trash/purge"), false, "Declining the warning purges nothing");
+      w.confirm = message => { confirmations.push(message); return true; };
+      $("purge-selected").click(); await flush(); await flush(); await flush();
+      assert.match(confirmations.at(-1), /Permanently delete 1 attachments.*cannot be undone/);
+      assert.deepEqual(calls.filter(call => call.url === "/api/trash/purge").at(-1).body, {file_ids: ["f1"], confirm: "purge"});
+      assert.match($("toast").textContent, /Permanently deleted 1 attachments/);
+      $("language-switch").click(); await flush();
+      assert.match($("trash-content").textContent, /回收站是空的/);
+      $("trash-close").click();
+      // Archived records do not offer management; history lists attachment changes.
+      $("language-switch").click(); await flush();
+      $("archived-view").click();
+      open("OLD");
+      assert.equal($("detail-content").querySelector("[data-manage-file]"), null);
+      $("close-detail").click();
+      $("history-view").click(); await flush(); await flush();
+      assert.match($("history-content").textContent, /Attachment changes/);
+      assert.match($("history-content").textContent, /old\.csv → pattern\.csv/);
+      assert.match($("history-content").textContent, /Attachment moved.*pattern\.csv · A → B/);
+      $("close-history").click();
+    } finally { attachments.dom.window.close(); }
+    const expired = await boot({savedLanguage: "en", readHandler: () => ({ok: false, status: 401, json: async () => ({error: "会话已失效，请从启动入口重新打开实验数据目录。"})})});
+    try {
+      await flush(); await flush();
+      assert.equal(expired.$("session-banner").hidden, false, "A 401 shows the session banner");
+      assert.match(expired.$("session-banner").textContent, /session has ended/);
+    } finally { expired.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

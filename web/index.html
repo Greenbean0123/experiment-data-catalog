@@ -60,6 +60,7 @@
       <button class="nav-item" id="manage-template"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="实验模板">实验模板</span></button>
       <button class="nav-item" id="folder-import"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="导入文件夹">导入文件夹</span></button>
       <button class="nav-item" id="manage-categories"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="数据类别">数据类别</span></button>
+      <button class="nav-item" id="trash-view"><svg class="icon" aria-hidden="true"><use href="#i-archive"/></svg><span data-i18n="回收站">回收站</span><b id="trash-count">0</b></button>
       <button class="nav-item" id="backup-view"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span data-i18n="完整备份">完整备份</span><b id="backup-badge" class="backup-badge" hidden>!</b></button>
     </nav>
     <div class="sidebar-bottom"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg><div><strong data-i18n="本地工作区">本地工作区</strong><small data-i18n="数据由你自己保管">数据由你自己保管</small></div></div>
@@ -247,6 +248,7 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
+  <div id="session-banner" class="session-banner" role="alert" hidden><span data-i18n="会话已失效，请从启动入口重新打开实验数据目录。">会话已失效，请从启动入口重新打开实验数据目录。</span><span class="muted" data-i18n="未保存的内容仍在当前页面，可先复制保存。">未保存的内容仍在当前页面，可先复制保存。</span></div>
   <dialog id="history-dialog" class="workflow-dialog" aria-labelledby="history-title">
     <div class="dialog-header"><div><h2 id="history-title" data-i18n="修改历史">修改历史</h2><p id="history-subtitle" class="dialog-subtitle"></p></div><button id="close-history" class="icon-button" data-i18n-aria-label="关闭">×</button></div>
     <div class="dialog-body"><p id="history-error" class="inline-error" role="alert" hidden></p><div id="history-content"></div></div>
@@ -297,6 +299,29 @@
       <div id="import-rows" class="table-scroll"></div>
     </div>
     <div class="dialog-footer workflow-actions"><button id="preview-import" data-i18n="预览归属">预览归属</button><button id="confirm-import" class="primary" disabled data-i18n="确认导入">确认导入</button></div>
+  </dialog>
+  <dialog id="file-dialog" class="workflow-dialog file-dialog" aria-labelledby="file-dialog-title">
+    <div class="dialog-header"><div><h2 id="file-dialog-title" data-i18n="管理附件">管理附件</h2><p id="file-dialog-subtitle" class="dialog-subtitle"></p></div><button id="close-file-dialog" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p id="file-error" class="inline-error" role="alert" hidden></p>
+      <div class="form-grid">
+        <label class="span-two"><span data-i18n="文件名">文件名</span><input id="file-name" maxlength="240" autocomplete="off" spellcheck="false"></label>
+        <label><span data-i18n="数据类别">数据类别</span><select id="file-kind"></select></label>
+        <label><span data-i18n="所属样品">所属样品</span><select id="file-target"></select></label>
+      </div>
+      <p class="field-help" data-i18n="只能移到同一项目中未归档的样品。修改名称、类别或归属不会改动文件内容和校验值。">只能移到同一项目中未归档的样品。修改名称、类别或归属不会改动文件内容和校验值。</p>
+    </div>
+    <div class="dialog-footer file-actions"><button id="delete-file" class="quiet danger" data-i18n="移到回收站">移到回收站</button><div><button id="cancel-file" data-i18n="取消">取消</button><button id="save-file" class="primary" data-i18n="保存修改">保存修改</button></div></div>
+  </dialog>
+  <dialog id="trash-dialog" class="workflow-dialog" aria-labelledby="trash-title">
+    <div class="dialog-header"><div><h2 id="trash-title" data-i18n="回收站">回收站</h2><p id="trash-subtitle" class="dialog-subtitle"></p></div><button id="close-trash" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p class="field-help" data-i18n="移到回收站的附件不再显示在样品中，文件副本仍保留在本机并包含在完整备份里。恢复后放回原样品；永久删除后无法恢复。">移到回收站的附件不再显示在样品中，文件副本仍保留在本机并包含在完整备份里。恢复后放回原样品；永久删除后无法恢复。</p>
+      <label class="lab-check trash-scope"><input id="trash-all-projects" type="checkbox"><span data-i18n="显示全部项目">显示全部项目</span></label>
+      <p id="trash-error" class="inline-error" role="alert" hidden></p>
+      <div id="trash-content" class="table-scroll"></div>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="trash-close" data-i18n="关闭">关闭</button><button id="purge-selected" class="danger" disabled data-i18n="永久删除所选">永久删除所选</button><button id="purge-all" class="danger" disabled data-i18n="清空回收站">清空回收站</button></div>
   </dialog>
   <dialog id="backup-dialog" class="workflow-dialog backup-dialog" aria-labelledby="backup-title">
     <div class="dialog-header"><div><h2 id="backup-title" data-i18n="完整备份">完整备份</h2><p id="backup-last" class="dialog-subtitle"></p></div><button id="close-backup" class="icon-button" data-i18n-aria-label="关闭">×</button></div>

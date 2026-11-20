@@ -358,6 +358,8 @@ function initialize() {
   const processedCache = new Map();
   let dashboardTab = "overview";
   let backupStatus = null, backupTimer = null, backupStarting = false;
+  let trashCount = 0, trashItems = [], trashTotal = 0, trashBusy = false, trashSelected = new Set(), trashRenaming = "";
+  let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false;
   let listScrolledTo = "";
   try { $("experiment-order").value = localStorage.getItem("catalog-experiment-order") === "desc" ? "desc" : "asc"; } catch {}
   try { projectId = localStorage.getItem("catalog-project") ?? "default"; } catch {}
@@ -404,6 +406,7 @@ function initialize() {
       const response = await fetch(path, {...options, cache: "no-store", headers, signal: options.signal || controller.signal});
       const payload = await response.json();
       if (!response.ok) {
+        if (response.status === 401) showSessionExpired();
         const error = new Error(payload.error || "操作失败，请重试。");
         error.status = response.status || 400;
         throw error;
@@ -895,6 +898,7 @@ function initialize() {
     I18n.extend(result.translations || {});
     configureCatalog(result.conventions);
     if (result.backup && !backupTimer) { backupStatus = result.backup; renderBackupBadge(); }
+    if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
     if (projectId && !projects.some(project => project.id === projectId)) projectId = "default";
     loaded = true;
     loadError = null;
@@ -1465,7 +1469,7 @@ function initialize() {
       await api("/api/categories", {method: "DELETE", body: JSON.stringify({name: deletingCategory, replacement})});
       deletingCategory = "";
       await load();
-      if ($("detail").open) $("detail-content").querySelector(".files-list").innerHTML = fileListHtml(records.find(record => record.id === detailId).files);
+      if ($("detail").open) $("detail-content").querySelector(".files-list").innerHTML = (record => fileListHtml(record.files, !record.archived))(records.find(record => record.id === detailId));
       toast(t("类别已删除，附件文件完整保留。"));
     } catch (error) { showError("catalog-error", error.message); }
     finally {
@@ -2027,13 +2031,32 @@ function initialize() {
     } else {
       $("history-subtitle").textContent = historyRecord ? records.find(record => record.id === historyRecord)?.sample_id || "" : projectId ? projectLabel(projectId) : t("全部项目");
       $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${t(historyActions[batch.action] || batch.action)}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
+      $("history-content").insertAdjacentHTML("beforeend", fileEventsHtml(historyFileEvents));
     }
+  }
+
+  const fileEventActions = {upload: "添加附件", rename: "重命名附件", recategorize: "更改附件类别", move: "移动附件",
+    delete: "移到回收站", restore: "从回收站恢复", purge: "永久删除附件"};
+  function fileEventDetail(event) {
+    const before = event.before || {}, after = event.after || {};
+    const sample = id => recordLabel(records.find(record => record.id === id) || {sample_id: id}, "sample_id");
+    if (event.action === "rename") return `${before.name} → ${after.name}`;
+    if (event.action === "recategorize") return `${after.name || before.name} · ${I18n.dataKind(before.kind, language)} → ${I18n.dataKind(after.kind, language)}`;
+    if (event.action === "move") return `${after.name || before.name} · ${sample(before.record_id)} → ${sample(after.record_id)}`;
+    return (after.name || before.name || "") + ((after.kind || before.kind) ? ` · ${I18n.dataKind(after.kind || before.kind, language)}` : "");
+  }
+  function fileEventsHtml(events) {
+    if (!events.length) return "";
+    const locale = language === "en" ? "en-US" : "zh-CN";
+    return `<h3 class="history-files-heading">${t("附件操作")}</h3><p class="field-help">${t("附件操作只作记录，不在撤销范围内；移到回收站的附件可在回收站中恢复。")}</p>
+      <table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("样品")}</th><th>${t("操作")}</th><th>${t("内容")}</th></tr></thead><tbody>${events.map(event => `<tr><td>${escape(new Date(event.created_at).toLocaleString(locale))}</td><td>${escape(event.sample_id || "")}</td><td>${escape(t(fileEventActions[event.action] || event.action))}</td><td>${escape(fileEventDetail(event))}</td></tr>`).join("")}</tbody></table>`;
   }
 
   async function loadHistory(more = false) {
     const offset = more ? historyOffset : 0;
     const result = await api(`/api/history?record_id=${encodeURIComponent(historyRecord)}&project_id=${encodeURIComponent(historyRecord ? "" : projectId)}&offset=${offset}`);
     historyBatches = more ? [...historyBatches, ...result.batches] : result.batches;
+    if (!more) historyFileEvents = Array.isArray(result.file_events) ? result.file_events : [];
     historyOffset = historyBatches.length; historyMore = result.has_more;
     renderHistory();
   }
@@ -2281,6 +2304,207 @@ function initialize() {
     $(dialog).addEventListener("cancel", event => { event.preventDefault(); close(); });
   }
 
+  function showSessionExpired() {
+    sessionExpired = true;
+    $("session-banner").hidden = false;
+  }
+
+  // Attachment changes answer with the authoritative records; merge them without reloading the catalog.
+  function applyRecords(changed) {
+    const replacements = new Map((Array.isArray(changed) ? changed : []).map(record => [record.id, record]));
+    if (!replacements.size) return;
+    records = records.map(record => replacements.get(record.id) || record);
+    for (const [id, record] of replacements) if (!records.some(item => item.id === id)) records.push(record);
+    render({keepWorkspaceControls: true});
+    if ($("detail").open && detailId) openDetail(detailId);
+  }
+
+  function renderTrashCount() {
+    $("trash-count").textContent = String(trashCount);
+    $("trash-count").hidden = !trashCount;
+  }
+
+  const sampleName = record => recordLabel(record, "sample_id");
+  function openFileDialog(recordId, fileId) {
+    const record = records.find(item => item.id === recordId), file = record?.files.find(item => item.id === fileId);
+    if (!record || !file || record.archived) return;
+    fileTarget = {recordId, fileId};
+    $("file-error").hidden = true;
+    $("file-dialog-subtitle").textContent = `${file.name} · ${sampleName(record)}`;
+    $("file-name").value = file.name;
+    $("file-kind").innerHTML = [...new Set([...kinds, file.kind])].map(kind => `<option value="${escape(kind)}" data-kind-label="${escape(kind)}">${escape(I18n.dataKind(kind, language))}</option>`).join("");
+    $("file-kind").value = file.kind;
+    const targets = records.filter(item => item.project_id === record.project_id && !item.archived)
+      .sort((a, b) => compareExperimentNo(sampleName(a), sampleName(b)));
+    $("file-target").innerHTML = targets.map(item => `<option value="${escape(item.id)}">${escape(sampleName(item))}${item.id === record.id ? " · " + escape(t("当前样品")) : ""}</option>`).join("");
+    $("file-target").value = record.id;
+    setFileBusy(false);
+    $("file-dialog").showModal();
+    $("file-name").focus();
+  }
+  function setFileBusy(busy) {
+    fileSaving = busy;
+    for (const id of ["file-name", "file-kind", "file-target", "save-file", "delete-file", "cancel-file", "close-file-dialog"]) $(id).disabled = busy;
+  }
+  function closeFileDialog() {
+    if (fileSaving) return;
+    fileTarget = null;
+    $("file-dialog").close();
+  }
+  async function refreshAfterConflict(error) {
+    if (error.status !== 409) return;
+    try { await load(); } catch {}
+  }
+  $("detail-content").addEventListener("click", event => {
+    const button = event.target.closest("[data-manage-file]");
+    if (button && detailId) openFileDialog(detailId, button.dataset.manageFile);
+  });
+  $("save-file").addEventListener("click", async () => {
+    if (fileSaving || !fileTarget) return;
+    const record = records.find(item => item.id === fileTarget.recordId), file = record?.files.find(item => item.id === fileTarget.fileId);
+    if (!record || !file) return closeFileDialog();
+    const name = $("file-name").value.trim(), kind = $("file-kind").value, target = $("file-target").value;
+    if (!name) return showError("file-error", "请填写文件名。");
+    const body = {record_revision: record.revision};
+    if (name !== file.name) body.name = name;
+    if (kind !== file.kind) body.kind = kind;
+    if (target !== record.id) {
+      const destination = records.find(item => item.id === target);
+      if (!destination) return showError("file-error", "目标样品不存在，请刷新后重试。");
+      Object.assign(body, {target_record_id: target, target_revision: destination.revision});
+    }
+    if (Object.keys(body).length === 1) return showError("file-error", "没有需要保存的修改。");
+    $("file-error").hidden = true;
+    setFileBusy(true);
+    try {
+      const result = await api(`/api/files/${encodeURIComponent(file.id)}/update`, {method: "POST", body: JSON.stringify(body)});
+      setFileBusy(false);
+      closeFileDialog();
+      applyRecords(result.records);
+      const moved = body.target_record_id && records.find(item => item.id === body.target_record_id);
+      toast(moved ? t("附件已移到 {sample}。", {sample: sampleName(moved)}) : t("附件已更新。"));
+    } catch (error) {
+      setFileBusy(false);
+      showError("file-error", error.message);
+      await refreshAfterConflict(error);
+    }
+  });
+  $("delete-file").addEventListener("click", async () => {
+    if (fileSaving || !fileTarget) return;
+    const record = records.find(item => item.id === fileTarget.recordId), file = record?.files.find(item => item.id === fileTarget.fileId);
+    if (!record || !file) return closeFileDialog();
+    if (!confirm(t("把 {name} 移到回收站？附件会从样品中移除，可在“回收站”中恢复。", {name: file.name}))) return;
+    setFileBusy(true);
+    try {
+      const result = await api(`/api/files/${encodeURIComponent(file.id)}/delete`, {method: "POST", body: JSON.stringify({record_revision: record.revision})});
+      setFileBusy(false);
+      closeFileDialog();
+      if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
+      applyRecords(result.records);
+      toast(t("{name} 已移到回收站。", {name: file.name}));
+    } catch (error) {
+      setFileBusy(false);
+      showError("file-error", error.message);
+      await refreshAfterConflict(error);
+    }
+  });
+  for (const id of ["close-file-dialog", "cancel-file"]) $(id).addEventListener("click", closeFileDialog);
+  $("file-dialog").addEventListener("cancel", event => { event.preventDefault(); closeFileDialog(); });
+
+  function renderTrash() {
+    const locale = language === "en" ? "en-US" : "zh-CN";
+    const scope = $("trash-all-projects").checked ? t("全部项目") : projectId ? projectLabel(projectId) : t("全部项目");
+    $("trash-subtitle").textContent = t("{scope} · {count} 个附件 · {size}", {scope, count: trashItems.length, size: sizeText(trashTotal)});
+    trashSelected = new Set([...trashSelected].filter(id => trashItems.some(item => item.id === id)));
+    $("trash-content").innerHTML = trashItems.length ? `<table class="workflow-table trash-table"><thead><tr><th><span class="sr-only">${t("选择")}</span></th><th>${t("文件")}</th><th>${t("样品")}</th><th>${t("移入时间")}</th><th>${t("大小")}</th><th>${t("操作")}</th></tr></thead><tbody>${trashItems.map(item => {
+      const renaming = trashRenaming === item.id;
+      const restore = item.record_archived ? `<span class="field-help">${t("样品已归档，请先恢复样品。")}</span>`
+        : renaming ? `<div class="trash-rename"><input data-trash-name="${escape(item.id)}" maxlength="240" value="${escape(item.name)}" aria-label="${escape(t("恢复后的文件名"))}"><button data-trash-restore="${escape(item.id)}" class="primary">${t("确认恢复")}</button><button data-trash-cancel="${escape(item.id)}">${t("取消")}</button></div>`
+        : `<button data-trash-restore="${escape(item.id)}">${t("恢复")}</button>${item.name_conflict ? `<small class="field-help">${t("原样品已有同名同类附件，恢复时需要改名。")}</small>` : ""}`;
+      return `<tr><td><input type="checkbox" data-trash-select="${escape(item.id)}" ${trashSelected.has(item.id) ? "checked" : ""} aria-label="${escape(t("选择 {name}", {name: item.name}))}"></td>
+        <td><span class="data-tag">${kindText(item.kind)}</span> <strong>${escape(item.name)}</strong></td><td>${escape(recordLabel(item, "sample_id"))}</td>
+        <td>${escape(new Date(item.deleted_at).toLocaleString(locale))}</td><td>${sizeText(item.size)}</td><td>${restore}</td></tr>`;
+    }).join("")}</tbody></table>` : `<p class="empty">${t("回收站是空的。")}</p>`;
+    $("purge-selected").disabled = trashBusy || !trashSelected.size;
+    $("purge-all").disabled = trashBusy || !trashItems.length;
+    for (const control of $("trash-content").querySelectorAll("button,input")) control.disabled = trashBusy;
+    $("trash-all-projects").disabled = trashBusy;
+  }
+  async function loadTrash() {
+    const scope = $("trash-all-projects").checked ? "" : projectId || "";
+    const result = await api(`/api/trash?project_id=${encodeURIComponent(scope)}`);
+    trashItems = Array.isArray(result.items) ? result.items : [];
+    trashTotal = Number(result.total_bytes) || 0;
+    renderTrash();
+  }
+  async function trashAction(work) {
+    if (trashBusy) return;
+    trashBusy = true; $("trash-error").hidden = true; renderTrash();
+    try { await work(); }
+    catch (error) { showError("trash-error", error.message); await refreshAfterConflict(error); }
+    finally { trashBusy = false; try { await loadTrash(); } catch (error) { showError("trash-error", error.message); } }
+  }
+  async function openTrash() {
+    trashSelected = new Set(); trashRenaming = ""; trashItems = []; trashTotal = 0;
+    $("trash-error").hidden = true;
+    $("trash-content").textContent = t("正在读取…");
+    $("trash-dialog").showModal();
+    try { await loadTrash(); } catch (error) { showError("trash-error", error.message); }
+  }
+  async function restoreTrashItem(id) {
+    const item = trashItems.find(entry => entry.id === id);
+    if (!item) return;
+    if (item.name_conflict && trashRenaming !== id) { trashRenaming = id; renderTrash(); $("trash-content").querySelector(`[data-trash-name="${id}"]`)?.focus(); return; }
+    const body = {record_revision: records.find(record => record.id === item.record_id)?.revision};
+    if (trashRenaming === id) {
+      const name = $("trash-content").querySelector(`[data-trash-name="${id}"]`).value.trim();
+      if (!name) return showError("trash-error", "请填写文件名。");
+      body.name = name;
+    }
+    await trashAction(async () => {
+      if (!Number.isInteger(body.record_revision)) { await load(); body.record_revision = records.find(record => record.id === item.record_id)?.revision; }
+      const result = await api(`/api/trash/${encodeURIComponent(id)}/restore`, {method: "POST", body: JSON.stringify(body)});
+      trashRenaming = "";
+      if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
+      applyRecords(result.records);
+      toast(t("{name} 已恢复到 {sample}。", {name: result.file?.name || item.name, sample: recordLabel(item, "sample_id")}));
+    });
+  }
+  async function purge(ids) {
+    const chosen = trashItems.filter(item => ids.includes(item.id));
+    if (!chosen.length) return;
+    const size = sizeText(chosen.reduce((sum, item) => sum + (Number(item.size) || 0), 0));
+    if (!confirm(t("永久删除 {count} 个附件（{size}）？文件副本会从本机删除，此操作不能撤销。", {count: chosen.length, size}))) return;
+    await trashAction(async () => {
+      const result = await api("/api/trash/purge", {method: "POST", body: JSON.stringify({file_ids: chosen.map(item => item.id), confirm: "purge"})});
+      trashSelected.clear();
+      if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
+      toast(t("已永久删除 {count} 个附件，释放 {size}。", {count: result.purged, size: sizeText(result.bytes || 0)}));
+    });
+  }
+  $("trash-view").addEventListener("click", openTrash);
+  $("trash-all-projects").addEventListener("change", () => trashAction(async () => {}));
+  $("trash-content").addEventListener("change", event => {
+    const box = event.target.closest("[data-trash-select]");
+    if (!box) return;
+    if (box.checked) trashSelected.add(box.dataset.trashSelect); else trashSelected.delete(box.dataset.trashSelect);
+    $("purge-selected").disabled = trashBusy || !trashSelected.size;
+  });
+  $("trash-content").addEventListener("click", event => {
+    const restore = event.target.closest("[data-trash-restore]");
+    if (restore) return restoreTrashItem(restore.dataset.trashRestore);
+    if (event.target.closest("[data-trash-cancel]")) { trashRenaming = ""; renderTrash(); }
+  });
+  $("trash-content").addEventListener("keydown", event => {
+    const input = event.target.closest("[data-trash-name]");
+    if (input && event.key === "Enter" && !event.isComposing) { event.preventDefault(); restoreTrashItem(input.dataset.trashName); }
+  });
+  $("purge-selected").addEventListener("click", () => purge([...trashSelected]));
+  $("purge-all").addEventListener("click", () => purge(trashItems.map(item => item.id)));
+  const closeTrash = () => { if (!trashBusy) $("trash-dialog").close(); };
+  for (const id of ["close-trash", "trash-close"]) $(id).addEventListener("click", closeTrash);
+  $("trash-dialog").addEventListener("cancel", event => { event.preventDefault(); closeTrash(); });
+
   const backupStale = status => {
     const time = Date.parse(status?.last?.time || "");
     return !Number.isFinite(time) || Date.now() - time > (status.stale_after_days || 7) * 864e5;
@@ -2356,8 +2580,8 @@ function initialize() {
   $("backup-done").addEventListener("click", closeBackup);
   $("backup-dialog").addEventListener("cancel", event => { event.preventDefault(); closeBackup(); });
 
-  function fileListHtml(files) {
-    return files.map(file => `<li><span class="data-tag ${file.kind === "NMR" ? "nmr" : ""}">${kindText(file.kind)}</span><div class="file-meta"><strong>${escape(file.name)}</strong><small>${sizeText(file.size)} · SHA-256 ${escape(file.sha256.slice(0, 12))}…</small>${file.source ? `<small>${text("来源副本：")}${escape(file.source)}</small>` : ""}</div><a class="button" href="/api/files/${file.id}" download>${text("下载")}</a></li>`).join("") || `<li class="muted">${text("尚未关联数据文件。")}</li>`;
+  function fileListHtml(files, manage = false) {
+    return files.map(file => `<li><span class="data-tag ${file.kind === "NMR" ? "nmr" : ""}">${kindText(file.kind)}</span><div class="file-meta"><strong>${escape(file.name)}</strong><small>${sizeText(file.size)} · SHA-256 ${escape(file.sha256.slice(0, 12))}…</small>${file.source ? `<small>${text("来源副本：")}${escape(file.source)}</small>` : ""}</div>${manage ? `<button type="button" class="quiet" data-manage-file="${escape(file.id)}">${text("管理")}</button>` : ""}<a class="button" href="/api/files/${file.id}" download>${text("下载")}</a></li>`).join("") || `<li class="muted">${text("尚未关联数据文件。")}</li>`;
   }
 
   function openDetail(id) {
@@ -2374,7 +2598,7 @@ function initialize() {
       <section class="detail-section"><div class="workspace-section-heading"><h3>${text("结果摘要")}</h3><button type="button" class="quiet" data-edit-result="${record.id}">${text("编辑结果")}</button></div><div id="detail-result-content">${resultHtml(record)}</div></section>
       <section class="detail-section"><h3>${text("实验观察与备注")}</h3><div class="notes" id="detail-notes"></div><details id="detail-notes-original" class="notes-original" hidden><summary>${text("查看原文")}</summary><div class="notes">${escape(record.notes)}</div></details></section>
       <section class="detail-section"><h3>${text("数据附件")} <span class="muted">${record.files.length}</span></h3>
-      <ul class="files-list">${fileListHtml(record.files)}</ul>
+      <ul class="files-list">${fileListHtml(record.files, !record.archived)}</ul>
       <div class="upload-box"><div><label for="upload-kind">${text("数据类别")}</label><div class="select-with-action"><select id="upload-kind"></select><button type="button" id="add-upload-kind" class="icon-button" aria-label="${escape(t("新增类别"))}" data-i18n-aria-label="新增类别" title="${escape(t("新增类别"))}" data-i18n-title="新增类别"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button></div></div><div class="file-picker"><button type="button" id="choose-files">${text("选择文件")}</button><span id="file-selection"></span><input id="upload-files" type="file" multiple hidden></div><button id="upload-button" class="primary" data-i18n="添加文件">${t("添加文件")}</button></div>
       <p class="field-help">${text("文件将复制到本机 data 文件夹，原文件保持原样。单个文件上限 256 MB；文件夹请先压缩为 ZIP。")}</p><p id="upload-error" class="inline-error" role="alert" hidden></p></section>
       <p class="field-help">${text("最近修改：")}<time id="updated-time" datetime="${escape(record.updated_at)}">${escape(new Date(record.updated_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</time> · ${text("附件校验值用于核对文件内容。")}</p>`;
@@ -2850,6 +3074,8 @@ function initialize() {
     if ($("review-dialog").open) renderReviews();
     renderBackupBadge();
     if ($("backup-dialog").open) renderBackup();
+    if ($("trash-dialog").open) renderTrash();
+    renderTrashCount();
     if ($("bulk-editor").open) {
       for (const {field, label} of bulkFields) $(`bulk-${field}-mode`).setAttribute("aria-label", t("{field} 操作", {field: t(label)}));
       renderBulkReview();
@@ -3258,7 +3484,7 @@ function initialize() {
   $("comparison").addEventListener("close", clearComparisonXrd);
   const hasUnfinishedWork = () => dirty || saving || uploading || catalogSaving || materialSaving || presetSaving ||
     statusSaving || previewPhaseSaving || bulkBusy || bulkDirty || workflowBusy || workflowDirty || templateDirty || templateSaving || importing ||
-    backupStarting || backupStatus?.state === "running";
+    backupStarting || backupStatus?.state === "running" || fileSaving || trashBusy;
   window.addEventListener("beforeunload", event => {
     if (hasUnfinishedWork()) { event.preventDefault(); event.returnValue = ""; }
   });
