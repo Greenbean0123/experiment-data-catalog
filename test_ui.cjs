@@ -2679,5 +2679,68 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal(skip.$("onboarding-dialog").open, false);
     } finally { skip.dom.window.close(); }
   }
+  {
+    // M3 review fixes: replacement uploads, sheet list after a failed parse, header priority, configured projects, history undo.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const calls = [];
+    let failNext = false;
+    const batch = {id: "c".repeat(32), action: "import", source: "import", created_at: "2026-11-20T10:00:00Z", count: 2, remaining: 2};
+    const handler = (url, options) => {
+      const body = options.body && typeof options.body === "string" ? JSON.parse(options.body) : null;
+      calls.push({url, method: options.method || "GET", body});
+      if (url.startsWith("/api/import/records/parse")) {
+        if (url.includes("sheet=Samples")) return reply(200, {upload_id: "u3", format: "xlsx", sheets: ["Overview", "Samples"], sheet: "Samples", columns: ["编号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
+        if (failNext) return reply(400, {error: "表格最多 2000 行、100 列，请拆分后再导入。", sheets: ["Overview", "Samples"], sheet: "Overview"});
+        return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "", columns: ["编号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
+      }
+      if (url === "/api/import/records/preview") return reply(200, {rows: [{row: 1, sample_id: "S-1", action: "create", errors: []}], counts: {create: 1, skip: 0, error: 0}, token: "t1"});
+      if (url.startsWith("/api/import/batches/")) return reply(200, {archived: 2, kept: 0});
+      if (url === "/api/onboarding/done") return reply(200, {done: true});
+      if (url === "/api/templates" || /^\/api\/projects\/[^/]+$/.test(url)) return reply(200, {});
+      throw new Error("Unhandled " + url);
+    };
+    const env = await boot({savedLanguage: "en", m3Handler: handler,
+      readHandler: catalog => reply(200, {...catalog, onboarding: {empty: true, done: false},
+        project_settings: {default: {revision: 3, settings: {builtin: {}, key_fields: [], phase_presets: ["Kept"]}, fields: []}}}),
+      settingsHandler: (url, options) => { calls.push({url, method: options.method || "GET"}); return reply(200, {settings: {}, revision: 3, fields: []}); },
+      workflowHandler: async url => reply(200, url.startsWith("/api/history") ? {batches: [batch], has_more: false, file_events: []} : {items: []})});
+    try {
+      const {$, w} = env;
+      await flush(); await flush();
+      // Onboarding on a project that already has saved settings keeps them.
+      w.document.querySelector('[name="onboarding-preset"][value="film"]').checked = true;
+      for (let i = 0; i < 4; i++) $("onboarding-next").click();
+      for (let i = 0; i < 6; i++) await flush();
+      assert.equal(calls.some(call => call.url === "/api/templates" || call.url.endsWith("/settings") && call.method === "PUT"), false, "Configured projects are never overwritten");
+      assert.match($("toast").textContent, /kept as they are/);
+      if ($("backup-dialog").open) $("close-backup").click();
+      // Specific headers win: "样品编号" is the sample ID even after a generic "编号" column.
+      $("records-import-view").click();
+      const choose = name => { Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], name)], configurable: true}); $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); };
+      choose("a.csv"); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("ri-mapping").querySelector('[data-import-column="1"]').value, "sample_id");
+      assert.equal($("ri-mapping").querySelector('[data-import-column="0"]').value, "", "A generic header does not claim the sample ID");
+      $("ri-preview-button").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("ri-commit").disabled, false);
+      // A replacement file that fails to parse leaves nothing to commit, but offers the workbook's other sheets.
+      failNext = true;
+      choose("b.xlsx"); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("ri-commit").disabled, true, "The previous upload can no longer be committed");
+      assert.equal($("ri-preview-button").disabled, true);
+      assert.equal($("ri-mapping").textContent, "");
+      assert.equal($("ri-sheet-label").hidden, false, "The sheet picker is offered after a failed parse");
+      $("ri-sheet").value = "Samples"; $("ri-sheet").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+      assert.ok(calls.some(call => call.url.includes("sheet=Samples")));
+      assert.equal($("ri-mapping").querySelector('[data-import-column="1"]').value, "sample_id");
+      w.confirm = () => true;
+      $("ri-cancel").click();
+      // Import batches can be archived from Change history.
+      $("history-view").click(); for (let i = 0; i < 3; i++) await flush();
+      $("history-content").querySelector("[data-archive-import]").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.ok(calls.some(call => call.url === `/api/import/batches/${"c".repeat(32)}/archive`), "History archives the import batch");
+      $("history-content").querySelector("[data-history-batch]").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.equal($("preview-undo").hidden, true, "Import batches are undone by archiving, not by field undo");
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

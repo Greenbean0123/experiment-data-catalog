@@ -523,6 +523,7 @@ function initialize() {
         if (response.status === 401) showSessionExpired();
         const error = new Error(payload.error || "操作失败，请重试。");
         error.status = response.status || 400;
+        error.payload = payload;
         throw error;
       }
       return payload;
@@ -2279,7 +2280,7 @@ function initialize() {
 
   function renderHistory() {
     $("history-more").hidden = Boolean(historyDetail) || !historyMore;
-    $("preview-undo").hidden = !historyDetail || Boolean(undoPreview) || ["create", "undo"].includes(historyDetail?.action) || !historyDetail.rows.some(row => !row.reverted_by && (!historyRecord || row.id === historyRecord));
+    $("preview-undo").hidden = !historyDetail || Boolean(undoPreview) || ["create", "undo"].includes(historyDetail?.action) || isImportBatch(historyDetail) || !historyDetail.rows.some(row => !row.reverted_by && (!historyRecord || row.id === historyRecord));
     $("confirm-undo").hidden = !undoPreview;
     $("undo-scope-label").hidden = !historyDetail || !historyRecord || Boolean(undoPreview) || $("preview-undo").hidden;
     $("history-back").textContent = t(historyDetail ? undoPreview ? "返回修改" : "返回历史" : "关闭");
@@ -2290,9 +2291,22 @@ function initialize() {
       $("history-content").innerHTML = note + (undoPreview ? `<p class="form-hint">${t("确认后恢复下列字段。后续修改有冲突时整批撤销取消。")}</p>` : "") + workflowRows(rows);
     } else {
       $("history-subtitle").textContent = historyRecord ? records.find(record => record.id === historyRecord)?.sample_id || "" : projectId ? projectLabel(projectId) : t("全部项目");
-      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${escape(t(batch.action === "import" && batch.source === "import" ? "导入台账" : historyActions[batch.action] || batch.action))}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
+      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${escape(t(batch.action === "import" && batch.source === "import" ? "导入台账" : historyActions[batch.action] || batch.action))}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button>${isImportBatch(batch) ? ` <button data-archive-import="${escape(batch.id)}">${t("撤回这次导入（归档）")}</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
       $("history-content").insertAdjacentHTML("beforeend", fileEventsHtml(historyFileEvents));
     }
+  }
+
+  const isImportBatch = batch => batch?.action === "import" && batch?.source === "import";
+  async function archiveImportBatch(id) {
+    if (!confirm(t("把这次导入的样品全部归档？导入后被修改过的样品会保留。归档的样品可以恢复。"))) return;
+    workflowControls(true); $("history-error").hidden = true;
+    try {
+      const result = await api(`api/import/batches/${encodeURIComponent(id)}/archive`, {method: "POST", body: "{}"});
+      await load();
+      await loadHistory();
+      toast(t("已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。", {archived: result.archived, kept: result.kept}));
+    } catch (error) { showError("history-error", error.message); }
+    finally { workflowControls(false); }
   }
 
   const fileEventActions = {upload: "添加附件", rename: "重命名附件", recategorize: "更改附件类别", move: "移动附件",
@@ -2336,6 +2350,8 @@ function initialize() {
   $("history-view").addEventListener("click", () => openHistory());
   $("record-history").addEventListener("click", () => openHistory(detailId));
   $("history-content").addEventListener("click", async event => {
+    const archiveImport = event.target.closest("[data-archive-import]");
+    if (archiveImport && !workflowBusy) return archiveImportBatch(archiveImport.dataset.archiveImport);
     const button = event.target.closest("[data-history-batch]");
     if (!button || workflowBusy) return;
     workflowControls(true); $("history-error").hidden = true;
@@ -3147,11 +3163,10 @@ function initialize() {
   }
   // Applies a preset to a project that has no template yet: the example template plus matching project settings.
   async function applyPreset(project, preset) {
-    if (preset === "solution" || preset === "later") return;
-    if (!templates[project]) {
-      const example = exampleTemplate(preset);
-      templates[project] = await api("api/templates", {method: "PUT", body: JSON.stringify({...example, project_id: project, revision: 0})});
-    }
+    if (preset === "solution" || preset === "later") return false;
+    const saved = PROJECT_SETTINGS.get(project);
+    if (templates[project] || (Number.isInteger(saved?.revision) && saved.revision > 0)) return true;  // kept as it is
+    templates[project] = await api("api/templates", {method: "PUT", body: JSON.stringify({...exampleTemplate(preset), project_id: project, revision: 0})});
     const fields = (templates[project].fields || []).filter(field => field.section === "condition").slice(0, 2);
     const current = PROJECT_SETTINGS.get(project);
     const off = preset === "film" ? ["precursor", "materials"] : [];
@@ -3159,6 +3174,7 @@ function initialize() {
     await api(`api/projects/${encodeURIComponent(project)}/settings`, {method: "PUT", body: JSON.stringify({
       settings: {builtin, key_fields: fields.map(field => ({section: field.section, label: field.label, check_missing: false})), phase_presets: []},
       revision: Number.isInteger(current?.revision) ? current.revision : 0})});
+    return false;
   }
   async function finishOnboarding() {
     const project = projects[0]?.id || "default";
@@ -3167,14 +3183,14 @@ function initialize() {
     onboardingBusy = true; renderOnboarding(); $("onboarding-error").hidden = true;
     try {
       if (name && name !== projectLabel(project)) await api(`api/projects/${encodeURIComponent(project)}`, {method: "PUT", body: JSON.stringify({name})});
-      await applyPreset(project, preset);
+      const kept = await applyPreset(project, preset);
       if ($("onboarding-demo").checked && !demoExists()) await api("api/demo", {method: "POST", body: "{}"});
       await markOnboardingDone();
       onboardingBusy = false;
       $("onboarding-dialog").close();
       projectId = project;
       await load();
-      toast(t("设置完成，可以开始记录实验了。"));
+      toast(t(kept ? "设置完成。项目已有模板或设置，已原样保留。" : "设置完成，可以开始记录实验了。"));
       if ($("onboarding-backup").checked) openBackup();
     } catch (error) {
       onboardingBusy = false; renderOnboarding();
@@ -3198,15 +3214,17 @@ function initialize() {
   $("onboarding-dialog").addEventListener("cancel", event => { event.preventDefault(); skipOnboarding(); });
 
   // ---- Record import (api/import/records/*) ----
-  let riUpload = null, riFile = null, riPreview = null, riBusy = false, riDirty = false, riBatch = null;
+  let riUpload = null, riFile = null, riPreview = null, riBusy = false, riDirty = false, riBatch = null, riSheets = [];
+  // Specific names are matched across every column first; generic ones (IMPORT_GENERIC) only fill what is left.
+  const IMPORT_GENERIC = {sample_id: ["编号", "样品", "sample", "id"], experiment_no: ["批次", "batch", "experiment"], duration: ["时间", "time"]};
   const IMPORT_GUESSES = {
-    sample_id: ["样品编号", "样品", "编号", "sample", "sample id", "sampleid", "sample_id"],
-    experiment_no: ["实验编号", "批次", "experiment", "experiment no", "experiment number", "experiment_no", "batch"],
+    sample_id: ["样品编号", "sample id", "sampleid", "sample_id", "sample no", "sample number"],
+    experiment_no: ["实验编号", "experiment no", "experiment number", "experiment_no", "batch no"],
     series: ["系列", "实验系列", "series"],
     experiment_date: ["日期", "实验日期", "date", "experiment date"],
     precursors: ["前驱体", "precursor", "precursors"],
     temperature: ["温度", "反应温度", "temperature", "temp"],
-    duration: ["时间", "反应时间", "取样时间", "时长", "duration", "time"],
+    duration: ["反应时间", "取样时间", "时长", "duration", "reaction time"],
     solvents: ["溶剂", "配体", "溶剂 / 配体", "溶剂/配体", "solvent", "solvents", "ligand", "ligands"],
     notes: ["备注", "说明", "notes", "note", "remarks", "comment"],
   };
@@ -3219,24 +3237,32 @@ function initialize() {
     const template = (templates[project]?.fields || []).map(field => ({value: `template:${field.key}`, label: t("模板：{field}", {field: field.label + (field.unit ? ` (${field.unit})` : "")}), field}));
     return [...builtins, ...template];
   }
-  function guessTarget(header, targets, used) {
-    const key = headerKey(header);
-    for (const [target, names] of Object.entries(IMPORT_GUESSES)) {
-      if (!used.has(target) && targets.some(item => item.value === target) && names.some(name => headerKey(name) === key)) return target;
-    }
-    const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === key);
-    return template ? template.value : "";
+  function guessTargets(headers, targets) {
+    const guesses = headers.map(() => ""), used = new Set();
+    const offer = (table, index, key) => {
+      for (const [target, names] of Object.entries(table)) {
+        if (!used.has(target) && targets.some(item => item.value === target) && names.some(name => headerKey(name) === key)) { guesses[index] = target; used.add(target); return true; }
+      }
+      return false;
+    };
+    headers.forEach((header, index) => offer(IMPORT_GUESSES, index, headerKey(header)));
+    headers.forEach((header, index) => {
+      if (guesses[index]) return;
+      const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === headerKey(header));
+      if (template) { guesses[index] = template.value; used.add(template.value); }
+    });
+    headers.forEach((header, index) => { if (!guesses[index]) offer(IMPORT_GENERIC, index, headerKey(header)); });
+    return guesses;
   }
   function renderImportMapping() {
     const box = $("ri-mapping");
     if (!riUpload) { box.innerHTML = ""; return; }
     const targets = importTargets($("ri-project").value);
     const previous = new Map([...box.querySelectorAll("[data-import-column]")].map(select => [select.dataset.importColumn, select.value]));
-    const used = new Set();
+    const guesses = guessTargets(riUpload.columns, targets);
     box.innerHTML = `<table class="workflow-table import-mapping"><thead><tr><th>${t("表格列")}</th><th>${t("示例值")}</th><th>${t("导入到")}</th></tr></thead><tbody>${riUpload.columns.map((header, index) => {
-      let value = previous.has(String(index)) ? previous.get(String(index)) : guessTarget(header, targets, used);
+      let value = previous.has(String(index)) ? previous.get(String(index)) : guesses[index];
       if (value && !value.startsWith("extra:") && !targets.some(item => item.value === value)) value = "";
-      if (value && !value.startsWith("extra:")) used.add(value);
       const samples = riUpload.rows.slice(0, 3).map(row => row[index] ?? "").filter(Boolean).join(" · ");
       const extra = `extra:${header}`;
       return `<tr><th scope="row">${escape(header)}</th><td class="muted">${escape(samples)}</td><td><select data-import-column="${index}" aria-label="${escape(t("{column} 导入到", {column: header}))}">
@@ -3273,10 +3299,10 @@ function initialize() {
     const counts = riPreview?.counts || {};
     $("ri-commit").disabled = !riPreview || Boolean(riBatch) || Boolean(counts.error) || !counts.create;
     $("ri-undo").hidden = !riBatch;
-    $("ri-sheet-label").hidden = !riUpload || (riUpload.sheets || []).length < 2;
+    $("ri-sheet-label").hidden = riSheets.length < 2;
   }
   function resetImport() {
-    riUpload = null; riFile = null; riPreview = null; riDirty = false; riBatch = null;
+    riUpload = null; riFile = null; riPreview = null; riDirty = false; riBatch = null; riSheets = [];
     $("ri-file").value = ""; $("ri-file-name").textContent = "";
     renderImportMapping(); renderImportPreview(); syncImportControls();
   }
@@ -3289,15 +3315,23 @@ function initialize() {
   }
   async function parseImportFile(sheet = "") {
     if (!riFile) return;
+    riUpload = null; riPreview = null; riBatch = null;
+    $("ri-mapping").innerHTML = ""; renderImportMapping(); renderImportPreview();
     riBusy = true; syncImportControls(); $("records-import-error").hidden = true;
     try {
       const query = new URLSearchParams({name: riFile.name, ...(sheet ? {sheet} : {})});
       riUpload = await api(`api/import/records/parse?${query}`, {method: "POST", body: riFile, headers: {"Content-Type": "application/octet-stream"}});
       riPreview = null; riDirty = true;
-      $("ri-sheet").innerHTML = (riUpload.sheets || []).map(name => `<option value="${escape(name)}" ${name === riUpload.sheet ? "selected" : ""}>${escape(name)}</option>`).join("");
+      riSheets = riUpload.sheets || [];
+      $("ri-sheet").innerHTML = riSheets.map(name => `<option value="${escape(name)}" ${name === riUpload.sheet ? "selected" : ""}>${escape(name)}</option>`).join("");
       $("ri-mapping").innerHTML = "";
       renderImportMapping(); renderImportPreview();
-    } catch (error) { showError("records-import-error", error.message); }
+    } catch (error) {
+      showError("records-import-error", error.message);
+      // The selected sheet failed; other sheets of the workbook may still be importable.
+      riSheets = Array.isArray(error.payload?.sheets) ? error.payload.sheets : [];
+      $("ri-sheet").innerHTML = riSheets.map(name => `<option value="${escape(name)}" ${name === error.payload?.sheet ? "selected" : ""}>${escape(name)}</option>`).join("");
+    }
     finally { riBusy = false; syncImportControls(); }
   }
   async function runImport(commit) {
@@ -3314,7 +3348,7 @@ function initialize() {
         $("ri-summary").textContent = t("已导入 {created} 条样品，跳过 {skipped} 条。", {created: result.created, skipped: result.skipped});
         projectId = body.project_id;
         await load();
-        toast(t("已导入 {created} 条样品。", {created: result.created}));
+        toast(t("已导入 {created} 条样品。之后也可以在“修改历史”中撤回这次导入。", {created: result.created}));
       }
       if (!commit) renderImportPreview();
     } catch (error) {
@@ -3328,7 +3362,8 @@ function initialize() {
   $("ri-file").addEventListener("change", () => {
     riFile = $("ri-file").files[0] || null;
     $("ri-file-name").textContent = riFile ? `${riFile.name} · ${sizeText(riFile.size)}` : "";
-    riBatch = null;
+    riUpload = null; riPreview = null; riBatch = null; riSheets = [];
+    $("ri-mapping").innerHTML = ""; renderImportMapping(); renderImportPreview(); syncImportControls();
     if (riFile) parseImportFile();
   });
   $("ri-sheet").addEventListener("change", () => parseImportFile($("ri-sheet").value));

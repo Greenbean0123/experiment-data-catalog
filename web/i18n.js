@@ -2,6 +2,8 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "设置完成。项目已有模板或设置，已原样保留。": "All set. The project already had a template or settings, so they were kept as they are.",
+    "已导入 {created} 条样品。之后也可以在“修改历史”中撤回这次导入。": "Imported {created} samples. You can also undo this import later from Change history.",
     "请填写项目名称。": "Enter a project name.",
     "项目已改名为 {name}。": "Project renamed to {name}.",
     "永久删除示例实验库？“示例项目”中的全部样品和附件都会删除，其他项目不受影响。": "Permanently delete the demo catalog? All samples and attachments in the demo project are removed; other projects are not affected.",
@@ -744,6 +746,8 @@ const CatalogI18n = (() => {
     if (keyMatch) return `The project has switched off ${keyMatch[1]}; nothing can be imported into it.`;
     keyMatch = message.match(/^第 (\d+) 行 (.+) 不是有效的数值。$/);
     if (keyMatch) return `Row ${keyMatch[1]}: ${keyMatch[2]} is not a valid number.`;
+    keyMatch = message.match(/^第 (\d+) 行 ([^：]+)：(.+)$/);
+    if (keyMatch) return `Row ${keyMatch[1]} · ${keyMatch[2]}: ${translateError(keyMatch[3], language)}`;
     keyMatch = message.match(/^还有 (\d+) 行有错误，请修正后再导入。$/);
     if (keyMatch) return `${keyMatch[1]} rows still have errors. Fix them before importing.`;
     keyMatch = message.match(/^本地约定格式不正确：(.+)$/);
