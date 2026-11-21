@@ -62,6 +62,7 @@ CONDITION_LIST_ERRORS = {
 OUTCOMES = ("", "not_measured", "measurement_failed", "no_target", "measured")
 EMPTY_SHARED_CONDITIONS = {"precursors": [], "temperature": None,
                            "materials": {"solvents": [], "material_amounts": []}}
+EMPTY_SHARED_STATE = {"conditions": {}, "overrides": {}, "last_save": ""}
 # Bump when the database layout changes; older programs refuse catalogs written by newer ones.
 SCHEMA_VERSION = 3
 FILE_FIELDS = ("id", "experiment_id", "name", "kind", "size", "sha256", "source", "created_at")
@@ -169,10 +170,8 @@ def experiment_key(number, notebook_prefixes):
     return number.lower()
 
 
-def shared_default_keys(number, prefixes):
-    key = experiment_key(number, prefixes)
-    book_one = key.replace("-i-", "-1-", 1)
-    return (key, book_one) if book_one != key and experiment_key(book_one, prefixes) == key else (key,)
+def record_experiment_key(record, prefixes):
+    return experiment_key(record["experiment_no"] or experiment_number(record["sample_id"]), prefixes)
 
 
 def record_materials(record):
@@ -687,10 +686,9 @@ class Store:
         self.file_copy_lock = threading.Lock()
         self.backup_state_lock = threading.Lock()
         self.backup_progress = {"state": "idle"}
-        self.grouping_prefixes = frozenset()
         self._catalog_data = {}
         self._catalog_revision = None
-        self._catalog_error = ""
+        self._catalog_error = {}
         self.check_schema_version()
         with self.connect() as db:
             new_categories = not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='categories'").fetchone()
@@ -793,7 +791,7 @@ class Store:
                     experiment_no TEXT NOT NULL, kind TEXT NOT NULL, field TEXT NOT NULL, title TEXT NOT NULL,
                     sources TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', resolution TEXT NOT NULL DEFAULT '',
                     revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1))
+                    automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1)), missing TEXT
                 );
                 CREATE TABLE IF NOT EXISTS history_batches (
                     id TEXT PRIMARY KEY, action TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -825,10 +823,14 @@ class Store:
                 id TEXT PRIMARY KEY, file_id TEXT NOT NULL, record_id TEXT NOT NULL, action TEXT NOT NULL,
                 before TEXT, after TEXT, created_at TEXT NOT NULL
             )""")
-            if "automatic" not in {row["name"] for row in db.execute("PRAGMA table_info(review_items)")}:
+            review_columns = {row["name"] for row in db.execute("PRAGMA table_info(review_items)")}
+            if "automatic" not in review_columns:
                 db.execute("ALTER TABLE review_items ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1))")
+            if "missing" not in review_columns:
+                db.execute("ALTER TABLE review_items ADD COLUMN missing TEXT")
             db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT OR IGNORE INTO app_settings VALUES ('catalog_id', ?)", (json.dumps(uuid.uuid4().hex),))
+            self.grouping_prefixes = frozenset(self.setting(db, "accepted_notebook_prefixes", []))
             db.execute("""CREATE TABLE IF NOT EXISTS project_settings (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id), settings TEXT NOT NULL, revision INTEGER NOT NULL
             )""")
@@ -883,43 +885,72 @@ class Store:
             self.refresh_local_catalog(data)
             return self._catalog_data
 
-    def refresh_local_catalog(self, data):
+    def refresh_local_catalog(self, data, *, retry_conflict=False):
         revision = local_catalog_revision(data)
-        if revision == self._catalog_revision:
+        if revision == self._catalog_revision and not (retry_conflict and self._catalog_error.get("error_kind") == "prefix_conflict"):
             return
         local = decode_local_catalog(data)
         if local is None:
-            self._catalog_error = UNPARSABLE_LOCAL_CATALOG
+            self._catalog_error = {"error": UNPARSABLE_LOCAL_CATALOG, "error_kind": "unparsable"}
         else:
             prefixes = frozenset(item.upper() for item in catalog_prefixes(local.get("notebook_prefixes")))
-            self._catalog_error = self.prefix_merge_error(prefixes)
-            self._catalog_data = local
-            if not self._catalog_error:
+            try:
+                with self.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    self.apply_notebook_prefixes(db, prefixes)
+            except Problem as conflict:
+                self._catalog_error = {"error": str(conflict), "error_kind": "prefix_conflict"}
+            else:
                 self.grouping_prefixes = prefixes
+                self._catalog_error = {}
+            self._catalog_data = local
         self._catalog_revision = revision
 
-    def prefix_merge_error(self, prefixes):
-        added = prefixes - self.grouping_prefixes
-        if not added:
-            return ""
-        with self.connect() as db:
-            stored = {(row["project_id"], row["experiment_key"]): row["settings"] for row in
-                      db.execute("SELECT project_id, experiment_key, settings FROM experiment_defaults")}
-        conflicts = set()
-        for (project, key), settings in stored.items():
-            merged = experiment_key(key, added)
-            if merged == key or (project, merged) not in stored:
+    def apply_notebook_prefixes(self, db, prefixes):
+        if prefixes != self.grouping_prefixes:
+            self.remap_shared_defaults(db, prefixes)
+        self.write_setting(db, "accepted_notebook_prefixes", sorted(prefixes))
+
+    def remap_shared_defaults(self, db, prefixes):
+        stored = {(row["project_id"], row["experiment_key"]): json.loads(row["settings"]) for row in db.execute(
+            "SELECT project_id, experiment_key, settings FROM experiment_defaults ORDER BY project_id, experiment_key")}
+        if not stored:
+            return
+        destinations = {}
+        for row in db.execute("SELECT id, project_id, experiment_no, sample_id, notes, series FROM experiments"):
+            if is_dataset(row):
                 continue
-            conditions = json.loads(settings)["conditions"]
-            other = json.loads(stored[project, merged])["conditions"]
-            # An omitted field carries no stored default; explicit blanks still count.
-            if any(conditions[field] != other[field] for field in conditions.keys() & other.keys()):
-                conflicts.add(merged.upper())
-        if not conflicts:
-            return ""
-        experiments = "、".join(sorted(conflicts)[:10])
-        return (f"以下实验在新的编号前缀下会合并，但共用条件不一致：{experiments}。"
-                "请先统一这些实验的共用条件，再修改前缀。")
+            project = row["project_id"]
+            source = (project, record_experiment_key(row, self.grouping_prefixes))
+            if source in stored:
+                target = (project, record_experiment_key(row, prefixes))
+                destinations.setdefault(source, {}).setdefault(target, set()).add(row["id"])
+
+        rewritten = {}
+        conflicts = set()
+        for (project, key), state in stored.items():
+            # A saved group can outlive its last sample. Only split to keys with samples.
+            targets = destinations.get((project, key)) or {(project, experiment_key(key, prefixes)): set()}
+            for target, samples in targets.items():
+                merged = rewritten.setdefault(target, {**state, "overrides": {}})
+                if merged["conditions"] != state["conditions"]:
+                    conflicts.add(target[1].upper())
+                if not merged["last_save"]:
+                    merged["last_save"] = state["last_save"]
+                for sample, fields in state["overrides"].items():
+                    if len(targets) == 1 or sample in samples:
+                        overrides = merged["overrides"]
+                        overrides[sample] = sorted(set(overrides.get(sample, ())).union(fields))
+        if conflicts:
+            experiments = "、".join(sorted(conflicts)[:10])
+            raise Problem(f"以下实验在新的编号前缀下会合并，但共用条件不一致：{experiments}。"
+                          "请先统一这些实验的共用条件，再修改前缀。", 409)
+
+        db.executemany("DELETE FROM experiment_defaults WHERE project_id=? AND experiment_key=?",
+                       stored.keys() - rewritten.keys())
+        for (project, key), state in rewritten.items():
+            if state != stored.get((project, key)):
+                self.write_shared_defaults(db, project, key, state)
 
     def local_translations(self, local=None):
         value = (self.local_catalog() if local is None else local).get("translations")
@@ -956,9 +987,9 @@ class Store:
 
     def get_local_catalog(self):
         with self.lock:
-            self.refresh_local_catalog(self.local_catalog_bytes())
+            self.refresh_local_catalog(self.local_catalog_bytes(), retry_conflict=True)
             revision, error = self._catalog_revision, self._catalog_error
-            local = {} if error == UNPARSABLE_LOCAL_CATALOG else self._catalog_data
+            local = {} if error.get("error_kind") == "unparsable" else self._catalog_data
         translations = self.local_translations(local)
         maps = {}
         for key in CATALOG_TRANSLATION_MAPS:
@@ -970,10 +1001,7 @@ class Store:
                              and catalog_text(rule.get("replacement")) and catalog_text(rule.get("flags", ""))] if isinstance(rules, list) else []
         catalog = {"notebook_prefixes": catalog_prefixes(local.get("notebook_prefixes")),
                    "precursor_aliases": self.conventions(local)["precursor_aliases"], "translations": maps}
-        result = {"catalog": catalog, "revision": revision}
-        if error:
-            result["error"] = error
-        return result
+        return {"catalog": catalog, "revision": revision, **error}
 
     def save_local_catalog(self, payload):
         if not isinstance(payload, dict) or not isinstance(payload.get("revision"), str):
@@ -987,9 +1015,6 @@ class Store:
                 raise Problem(STALE_LOCAL_CATALOG, 409)
             catalog = validate_local_catalog(payload.get("catalog"))
             prefixes = frozenset(item.upper() for item in catalog["notebook_prefixes"])
-            error = self.prefix_merge_error(prefixes)
-            if error:
-                raise Problem(error, 409)
             updated = {**local, **catalog}
             content = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8", errors="backslashreplace")
 
@@ -997,11 +1022,14 @@ class Store:
                 if self.local_catalog_bytes() != data:
                     raise Problem(STALE_LOCAL_CATALOG, 409)
 
-            write_local_catalog(self.data / LOCAL_CATALOG, content, before_replace=check_unchanged)
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                self.apply_notebook_prefixes(db, prefixes)
+                write_local_catalog(self.data / LOCAL_CATALOG, content, before_replace=check_unchanged)
             self.grouping_prefixes = prefixes
             self._catalog_data = updated
             self._catalog_revision = local_catalog_revision(content)
-            self._catalog_error = ""
+            self._catalog_error = {}
             return {"catalog": catalog, "revision": self._catalog_revision}
 
     def setting(self, db, key, default=None):
@@ -1010,8 +1038,11 @@ class Store:
 
     def put_setting(self, key, value):
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO app_settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (key, json.dumps(value, ensure_ascii=False)))
+            self.write_setting(db, key, value)
+
+    def write_setting(self, db, key, value):
+        db.execute("INSERT INTO app_settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, json.dumps(value, ensure_ascii=False)))
 
     @contextmanager
     def connect(self):
@@ -1071,18 +1102,11 @@ class Store:
 
     def shared_group(self, db, project_id, number):
         prefixes = self.grouping_prefixes
-        keys = shared_default_keys(number, prefixes)
-        key = keys[0]
+        key = experiment_key(number, prefixes)
         members = [row for row in db.execute("SELECT * FROM experiments WHERE project_id=? AND archived=0 ORDER BY id", (project_id,))
-                   if experiment_key(row["experiment_no"] or experiment_number(row["sample_id"]), prefixes) == key
-                   and not is_dataset(row)]
-        states = {}
-        for candidate in keys:
-            row = db.execute("SELECT settings FROM experiment_defaults WHERE project_id=? AND experiment_key=?",
-                             (project_id, candidate)).fetchone()
-            if row:
-                states[candidate] = json.loads(row["settings"])
-        conditions = {field: value for state in states.values() for field, value in state["conditions"].items()}
+                   if record_experiment_key(row, prefixes) == key and not is_dataset(row)]
+        state = self.read_shared_defaults(db, project_id, key)
+        conditions = dict((state or EMPTY_SHARED_STATE)["conditions"])
         if conditions.keys() != EMPTY_SHARED_CONDITIONS.keys():
             recorded = [shared_values(row) for row in members]
             for field, empty in EMPTY_SHARED_CONDITIONS.items():
@@ -1090,40 +1114,32 @@ class Store:
                     continue
                 known = [values[field] for values in recorded if values[field] != empty]
                 conditions[field] = known[0] if known and all(value == known[0] for value in known) else empty
-        snapshot = [project_id, keys, states, [(row["id"], row["revision"]) for row in members]]
-        token = hashlib.sha256(json.dumps(snapshot).encode("utf-8")).hexdigest()
-        return members, states, conditions, token
+        snapshot = [project_id, key, state, [(row["id"], row["revision"]) for row in members]]
+        token = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode("utf-8")).hexdigest()
+        return members, state, conditions, token
 
     def shared_defaults(self, project_id, number):
         project_id, number = lab_text(project_id, 120, required=True), lab_text(number, 120, required=True)
         with self.lock, self.connect() as db:
             self.local_catalog()
             db.execute("BEGIN")
-            members, states, conditions, token = self.shared_group(db, project_id, number)
-        last_save = next((state["last_save"] for state in states.values() if state["last_save"]), "")
+            members, state, conditions, token = self.shared_group(db, project_id, number)
+        last_save = (state or EMPTY_SHARED_STATE)["last_save"]
         return {"conditions": conditions, "token": token, "count": len(members), "last_save": last_save}
 
     def apply_shared_conditions(self, db, group, project_id, number, record_id, clean, now, disabled):
-        members, states, previous, token = group
+        members, state, previous, token = group
         submitted = {field: value for field, value in shared_values(clean).items()
                      if ("precursor" if field == "precursors" else field) not in disabled}
         if not submitted:
             return {}
-        keys = shared_default_keys(number, self.grouping_prefixes)
-        stored_fields = {field for state in states.values() for field in state["conditions"]}
-        first_setup = not any(state["last_save"] for state in states.values())
-        changes = submitted
-        if len(keys) > 1:
-            # The first shared save can establish previously inferred defaults.
-            changes = {field: value for field, value in submitted.items()
-                       if value != previous[field] or
-                       (first_setup and field not in stored_fields and value != EMPTY_SHARED_CONDITIONS[field])}
-
-        overrides = {}
-        for state in states.values():
-            for sample, fields in state["overrides"].items():
-                overrides.setdefault(sample, set()).update(fields)
-        protected = {}
+        state = state or EMPTY_SHARED_STATE
+        stored = state["conditions"]
+        first_setup = not state["last_save"]
+        overrides = state["overrides"]
+        active_ids = {record_id, *(row["id"] for row in members)}
+        kept = {sample: [field for field in fields if sample not in active_ids or field not in submitted]
+                for sample, fields in overrides.items()}
         before = {}
         for row in members:
             if row["id"] == record_id:
@@ -1131,12 +1147,12 @@ class Store:
             fixed = overrides.get(row["id"], [])
             values = shared_values(row)
             patch = {}
-            for field, new in changes.items():
+            for field, new in submitted.items():
                 value = values[field]
-                follows = value == previous[field] or ((first_setup or field not in stored_fields)
+                follows = value == previous[field] or ((first_setup or field not in stored)
                                                        and value == EMPTY_SHARED_CONDITIONS[field])
                 if field in fixed or not follows:
-                    protected.setdefault(row["id"], []).append(field)
+                    kept.setdefault(row["id"], []).append(field)
                 elif value != new:
                     patch[field] = new
             if patch:
@@ -1144,40 +1160,48 @@ class Store:
                 before[row["id"]] = row
                 db.execute("UPDATE experiments SET " + ",".join(key + "=?" for key in columns) + ",revision=revision+1,updated_at=? WHERE id=?",
                            (*columns.values(), now, row["id"]))
-        owners = {row["id"]: experiment_key(row["experiment_no"] or experiment_number(row["sample_id"]), ())
-                  for row in members}
-        owners[record_id] = experiment_key(number, ())
-        used = {keys[0], *states, *owners.values()}
-        for key in keys:
-            if key not in used:
-                continue
-            state = states.get(key, {})
-            kept = {sample: [field for field in fields if sample not in owners
-                             or field not in (submitted if sample == record_id else changes)]
-                    for sample, fields in state.get("overrides", {}).items()}
-            for sample, fields in protected.items():
-                if owners[sample] == key:
-                    kept.setdefault(sample, []).extend(fields)
-            self.write_shared_defaults(db, project_id, key, {
-                "conditions": {**state.get("conditions", {}), **changes},
-                "overrides": {sample: fields for sample, fields in kept.items() if fields},
-                "last_save": f"{token}:{record_id}",
-            })
+        self.write_shared_defaults(db, project_id, experiment_key(number, self.grouping_prefixes), {
+            "conditions": {**stored, **submitted},
+            "overrides": {sample: sorted(fields) for sample, fields in kept.items() if fields},
+            "last_save": f"{token}:{record_id}",
+        })
         return before
+
+    def read_shared_defaults(self, db, project_id, key):
+        row = db.execute("SELECT settings FROM experiment_defaults WHERE project_id=? AND experiment_key=?",
+                         (project_id, key)).fetchone()
+        return json.loads(row["settings"]) if row else None
 
     def write_shared_defaults(self, db, project_id, key, values):
         db.execute("""INSERT INTO experiment_defaults VALUES (?,?,?)
                       ON CONFLICT(project_id, experiment_key) DO UPDATE SET settings=excluded.settings""",
                    (project_id, key, json.dumps(values, ensure_ascii=False)))
 
+    def move_shared_override(self, db, current, clean):
+        prefixes = self.grouping_prefixes
+        source = (current["project_id"], record_experiment_key(current, prefixes))
+        target = (clean["project_id"], record_experiment_key(clean, prefixes)) if not is_dataset(clean) else None
+        if source == target or is_dataset(current):
+            return None
+        state = self.read_shared_defaults(db, *source)
+        record_id = current["id"]
+        if not state or record_id not in state["overrides"]:
+            return None
+        moved = state["overrides"].pop(record_id)
+        self.write_shared_defaults(db, *source, state)
+        other = self.read_shared_defaults(db, *target) if target else None
+        if other is not None:
+            other["overrides"][record_id] = moved
+            self.write_shared_defaults(db, *target, other)
+        return other
+
     def remember_shared_baseline(self, db, group, record_id, current, clean):
-        members, states, previous, _ = group
-        if not members or (current and len(members) == 1 and not states):
+        members, state, previous, _ = group
+        if not members or (current and len(members) == 1 and members[0]["id"] == record_id and not state):
             return
-        key = experiment_key(clean["experiment_no"], ())
-        state = states.get(key, {"conditions": {}, "overrides": {}, "last_save": ""})
+        key = experiment_key(clean["experiment_no"], self.grouping_prefixes)
+        state = state or EMPTY_SHARED_STATE
         baseline, overrides = dict(state["conditions"]), dict(state["overrides"])
-        stored_fields = {field for settings in states.values() for field in settings["conditions"]}
         values = shared_values(clean)
         old = shared_values(current) if current else {}
         previous_fixed = set(overrides.get(record_id, []))
@@ -1188,8 +1212,7 @@ class Store:
             if value == previous[field]:
                 fixed.discard(field)
             elif previous[field] != EMPTY_SHARED_CONDITIONS[field]:
-                # Preserve an inferred default in the sample's own group only.
-                if field not in stored_fields:
+                if field not in state["conditions"]:
                     baseline[field] = previous[field]
                 if value == EMPTY_SHARED_CONDITIONS[field]:
                     fixed.add(field)
@@ -1386,6 +1409,8 @@ class Store:
         rows, updates = [], []
         try:
             with self.lock, self.connect() as db:
+                if not preview:
+                    self.local_catalog()
                 db.execute("BEGIN" if preview else "BEGIN IMMEDIATE")
                 batch = db.execute("SELECT * FROM history_batches WHERE id=?", (batch_id,)).fetchone()
                 if not batch or batch["action"] in {"create", "undo"}:
@@ -1437,6 +1462,8 @@ class Store:
                     now = timestamp()
                     for current, changed in updates:
                         if changed:
+                            if changed.keys() & {"experiment_no", "sample_id", "project_id", "notes", "series"}:
+                                self.move_shared_override(db, current, {**current, **changed})
                             db.execute("UPDATE experiments SET " + ",".join(key + "=?" for key in changed) + ",revision=revision+1,updated_at=? WHERE id=?",
                                        (*changed.values(), now, current["id"]))
                     undo_id = self.log_history(db, {current["id"]: current for current, _ in updates}, "undo")
@@ -1459,16 +1486,22 @@ class Store:
                 sources.setdefault(row["record_id"], []).append({"label": row["name"] + " · p. " + row["page"], "source_id": row["source_id"], "value": row["caption"]})
             items = [dict(row) for row in db.execute("SELECT * FROM review_items ORDER BY created_at, rowid")]
         by_id = {row["id"]: row for row in records}
-        stored_keys, closed_builtins = {}, {}
+        stored_keys, closed_conditions, legacy_builtins = {}, {}, {}
         for item in items:
             item["sources"] = json.loads(item["sources"])
+            stored_missing = item.pop("missing")
+            if stored_missing is not None:
+                item["missing"] = json.loads(stored_missing)
             if item["automatic"] and item["field"].startswith("key:"):
                 _, section, label = item["field"].split(":", 2)
                 item["field"] = f"key:{section}:{label.lower()}"
                 stored_keys.setdefault((item["record_id"], item["field"]), set()).add(item["id"])
             elif (item["automatic"] and item["kind"] == "missing_conditions" and not item["field"]
                   and item["status"] in ("resolved", "dismissed")):
-                closed_builtins.setdefault(item["record_id"], set()).add(item["id"])
+                if stored_missing is None:
+                    legacy_builtins.setdefault(item["record_id"], set()).add(item["id"])
+                else:
+                    closed_conditions.setdefault(item["record_id"], set()).update(item["missing"])
             record = by_id.get(item["record_id"])
             if not record and not item["record_id"] and item["kind"] != "folder_import":
                 matches = [row for row in records if row["project_id"] == item["project_id"] and row["experiment_no"] == item["experiment_no"] and not is_dataset(row)]
@@ -1493,16 +1526,17 @@ class Store:
             if template:
                 missing = missing_template_fields(template, details, "condition")
             issue_id = "conditions-" + record["id"]
-            fingerprint_missing = missing
+            covered = closed_conditions.get(record["id"], set())
+            legacy = legacy_builtins.get(record["id"])
+            if not template and missing and legacy:
+                # Older IDs hash all missing built-ins or the enabled subset.
+                covered = covered | {field for size in range(1, len(PROJECT_BUILTINS) + 1)
+                                     for fields in combinations(PROJECT_BUILTINS, size)
+                                     if review_fingerprint(issue_id, fields) in legacy
+                                     for field in fields}
+            fingerprint_missing = [field for field in missing if field not in covered]
+            missing = fingerprint_missing
             if not template:
-                closed = closed_builtins.get(record["id"])
-                if missing and closed:
-                    # Older IDs hash the enabled subset of the four missing built-ins.
-                    covered = {field for size in range(1, len(PROJECT_BUILTINS) + 1)
-                               for fields in combinations(PROJECT_BUILTINS, size)
-                               if review_fingerprint(issue_id, fields) in closed
-                               for field in fields}
-                    fingerprint_missing = [field for field in missing if field not in covered]
                 missing = [field for field in fingerprint_missing if project["settings"]["builtin"][field]["enabled"]]
             base = {"record_id": record["id"], "project_id": record["project_id"], "experiment_no": record["experiment_no"],
                     "sample_id": record["sample_id"], "record_revision": record["revision"], "sources": sources.get(record["id"], []),
@@ -1523,7 +1557,7 @@ class Store:
             usable = [file for file in record["files"] if not any(marker in file["name"] for marker in ("-empty-only.zip", "-missing.json")) and file["size"] > 0 and (self.files / file["id"]).is_file()]
             if not usable:
                 items.append({**base, "id": "data-" + record["id"], "kind": "missing_data", "title": "数据附件待补充", "missing": []})
-        persistent = {item["id"] for item in items if not item["generated"]}
+        persistent = {item["id"]: item for item in items if not item["generated"]}
         output, generated_ids = [], set()
         for item in items:
             if item["generated"]:
@@ -1532,15 +1566,20 @@ class Store:
                     existing = stored_keys.get((item["record_id"], item["field"]), set())
                     if not item["field"] and relevant != item["missing"]:
                         # A legacy pending item may use the fingerprint of the enabled subset.
-                        existing = {review_fingerprint(item["id"], item["missing"])} & persistent
+                        existing = {review_fingerprint(item["id"], item["missing"])} & persistent.keys()
                 else:
                     relevant = [(file["id"], file["size"], (self.files / file["id"]).is_file())
                                 for file in by_id[item["record_id"]]["files"]]
                     existing = set()
                 item["id"] = review_fingerprint(item["id"], relevant)
-                generated_ids.update(existing)
+                matches = existing | ({item["id"]} & persistent.keys())
+                generated_ids.update(matches)
                 generated_ids.add(item["id"])
-                if existing or item["id"] in persistent:
+                if matches:
+                    if item["kind"] == "missing_conditions":
+                        for match in matches:
+                            if persistent[match]["status"] == "pending":
+                                persistent[match]["missing"] = item["missing"]
                     continue
             output.append(item)
         return {"items": [item for item in output if not item.get("automatic") or item["status"] != "pending" or item["id"] in generated_ids]}
@@ -1635,6 +1674,14 @@ class Store:
                 changes = history_changes(history_state(current), changed_record)
             result = {"preview": preview, "changes": changes, "status": payload["status"], "id": review_id, "sample_id": current["sample_id"] if current else review["experiment_no"]}
             if not preview:
+                missing = review["missing"]
+                if payload["status"] == "pending":
+                    missing = None
+                elif review["automatic"] and review["kind"] == "missing_conditions" and review["status"] == "pending":
+                    shown = next((item for item in self.review_list()["items"] if item["id"] == review_id), None)
+                    if shown is None:
+                        raise Problem("待核对项已变化，请刷新后再处理。", 409)
+                    missing = json.dumps(shown["missing"], ensure_ascii=False)
                 now = timestamp()
                 if values:
                     db.execute("UPDATE experiments SET " + ",".join(field + "=?" for field in values) + ",revision=revision+1,updated_at=? WHERE id=?",
@@ -1650,7 +1697,8 @@ class Store:
                 resolution = note.strip()
                 if apply_value and not resolution:
                     resolution = "Confirmed value: " + json.dumps(payload["value"], ensure_ascii=False)
-                db.execute("UPDATE review_items SET record_id=?,status=?,resolution=?,revision=revision+1,updated_at=? WHERE id=?", (current["id"] if current else None, payload["status"], resolution if payload["status"] != "pending" else "", now, review_id))
+                db.execute("UPDATE review_items SET record_id=?,status=?,resolution=?,missing=?,revision=revision+1,updated_at=? WHERE id=?",
+                           (current["id"] if current else None, payload["status"], resolution if payload["status"] != "pending" else "", missing, now, review_id))
                 if values:
                     self.log_history(db, {current["id"]: current}, "review", review_id=review_id, review_revision=review["revision"] + 1)
         if not preview:
@@ -1913,6 +1961,11 @@ class Store:
                 if clean["ligand"]:
                     db.execute("INSERT OR IGNORE INTO condition_options(field,name) VALUES ('ligand',?)", (clean["ligand"],))
                 db.executemany("INSERT OR IGNORE INTO condition_options(field,name) VALUES (?,?)", ((field, format(clean[field], ".15g")) for field in NUMERIC_CONDITIONS if clean[field] is not None))
+                if current:
+                    moved = self.move_shared_override(db, current, clean)
+                    if moved is not None and group:
+                        members, _, conditions, token = group
+                        group = members, moved, conditions, token
                 if not shared or not current:
                     self.log_history(db, {record_id: current}, "edit" if current else "create")
                 if shared:
@@ -1921,8 +1974,7 @@ class Store:
                         previous_rows[record_id] = current
                     self.log_history(db, previous_rows, "shared")
                 elif group:
-                    previous = current if any(row["id"] == record_id for row in group[0]) else None
-                    self.remember_shared_baseline(db, group, record_id, previous, clean)
+                    self.remember_shared_baseline(db, group, record_id, current, clean)
         except sqlite3.IntegrityError:
             raise Problem("该项目内样品编号已存在（含已归档记录）。请使用不同编号。", 409)
         return record_id
