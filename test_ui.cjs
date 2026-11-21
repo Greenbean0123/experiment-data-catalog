@@ -237,7 +237,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
   }
 
   {
-    let commitCount = 0, finishCommit, undone = false;
+    let commitCount = 0, finishCommit, undone = false, commitBody;
     const batchId = "a".repeat(32);
     const env = await boot({savedLanguage: "en", workflowHandler: async (url, options, rows) => {
       const respond = data => ({ok: true, json: async () => structuredClone(data)});
@@ -246,7 +246,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       if (url === "/api/history/" + batchId) return respond({id: batchId, action: "bulk", created_at: "2026-11-17T12:00:00Z", rows: changes});
       const payload = JSON.parse(options.body);
       if (payload.preview) return respond({preview: true, updated: 2, rows: changes.map(row => ({...row, changes: row.changes.map(change => ({...change, before: change.after, after: change.before}))})), revisions: changes.map(({id, revision}) => ({id, revision}))});
-      commitCount++;
+      commitCount++; commitBody = payload;
       await new Promise(resolve => { finishCommit = resolve; });
       for (const [index, id] of ["A", "ZERO"].entries()) { const row = rows.find(row => row.id === id); row.temperature = index ? 200 : 100; row.revision++; }
       undone = true;
@@ -262,6 +262,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal(env.$("confirm-undo").hidden, false);
       env.$("confirm-undo").click(); env.$("confirm-undo").click(); await flush();
       assert.equal(commitCount, 1);
+      assert.equal(Object.hasOwn(commitBody, "record_ids"), false, "A whole-batch undo names no records, so batches over 500 samples can be undone");
       finishCommit(); await flush(); await flush();
       assert.match(env.$("history-content").textContent, /Undone/);
       assert.equal(env.rows[0].temperature, 100);
@@ -2791,6 +2792,23 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("demo-view").click(); for (let i = 0; i < 4; i++) await flush();
       assert.deepEqual(calls, ["DELETE /api/demo", "POST /api/demo"], "Without a current demo the entry creates one");
       assert.equal($("project-select").value, "demo-3", "The new demo project id comes from the server");
+    } finally { env.dom.window.close(); }
+  }
+  {
+    // Headers that state a different unit are not auto-mapped (Fahrenheit or hours would be stored as °C / min).
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const env = await boot({savedLanguage: "en", m3Handler: url => {
+      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "",
+        columns: ["Sample ID", "Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], rows: [["S-1", "77", "25", "1", "60"]], total_rows: 1});
+      throw new Error("Unhandled " + url);
+    }});
+    try {
+      const {$, w} = env;
+      $("records-import-view").click();
+      Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], "units.csv")], configurable: true});
+      $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+      const mapped = [0, 1, 2, 3, 4].map(index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value);
+      assert.deepEqual(mapped, ["sample_id", "", "temperature", "", "duration"], "Only headers in the stored unit are guessed");
     } finally { env.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");

@@ -2387,13 +2387,15 @@ function initialize() {
       const payload = {preview: true};
       if (historyRecord && $("undo-scope").value === "record") payload.record_ids = [historyRecord];
       undoPreview = await api(`api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
+      undoPreview.recordIds = payload.record_ids;
       renderHistory();
     } catch (error) { showError("history-error", error.message); }
     finally { workflowControls(false); }
   });
   $("confirm-undo").addEventListener("click", async () => {
     if (workflowBusy || !undoPreview) return;
-    const payload = {preview: false, record_ids: undoPreview.rows.map(row => row.id), revisions: undoPreview.revisions};
+    const payload = {preview: false, revisions: undoPreview.revisions};
+    if (undoPreview.recordIds) payload.record_ids = undoPreview.recordIds;
     workflowControls(true); $("history-error").hidden = true;
     try {
       await api(`api/history/${historyDetail.id}/undo`, {method: "POST", body: JSON.stringify(payload)});
@@ -3248,18 +3250,28 @@ function initialize() {
     const template = (templates[project]?.fields || []).map(field => ({value: `template:${field.key}`, label: t("模板：{field}", {field: field.label + (field.unit ? ` (${field.unit})` : "")}), field}));
     return [...builtins, ...template];
   }
+  // A header that states a unit ("Temperature (°F)") is only guessed for a target with the same unit; the user can still map it by hand.
+  const UNIT_ALIASES = [["°c", "℃", "c", "degc", "摄氏度"], ["min", "mins", "minute", "minutes", "分钟"]];
+  const unitKey = value => { const unit = String(value || "").toLowerCase().replace(/\s+/g, ""); return (UNIT_ALIASES.find(names => names.includes(unit)) || [unit])[0]; };
+  const headerUnit = header => { const match = String(header).match(/[（(]([^）)]*)[）)]\s*$/) || String(header).match(/[\/·]\s*(°c|min|℃)\s*$/i); return match ? unitKey(match[1]) : ""; };
+  const BUILTIN_UNITS = {temperature: "°c", duration: "min"};
+  function unitFits(header, target) {
+    const unit = headerUnit(header), expected = target.field ? unitKey(target.field.unit) : BUILTIN_UNITS[target.value] || "";
+    return !unit || !expected || unit === expected;
+  }
   function guessTargets(headers, targets) {
     const guesses = headers.map(() => ""), used = new Set();
     const offer = (table, index, key) => {
       for (const [target, names] of Object.entries(table)) {
-        if (!used.has(target) && targets.some(item => item.value === target) && names.some(name => headerKey(name) === key)) { guesses[index] = target; used.add(target); return true; }
+        const item = targets.find(candidate => candidate.value === target);
+        if (!used.has(target) && item && unitFits(headers[index], item) && names.some(name => headerKey(name) === key)) { guesses[index] = target; used.add(target); return true; }
       }
       return false;
     };
     headers.forEach((header, index) => offer(IMPORT_GUESSES, index, headerKey(header)));
     headers.forEach((header, index) => {
       if (guesses[index]) return;
-      const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === headerKey(header));
+      const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === headerKey(header) && unitFits(header, item));
       if (template) { guesses[index] = template.value; used.add(template.value); }
     });
     headers.forEach((header, index) => { if (!guesses[index]) offer(IMPORT_GENERIC, index, headerKey(header)); });
