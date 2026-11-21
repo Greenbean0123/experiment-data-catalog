@@ -33,4 +33,5 @@ user can hit in normal use that lose or silently change stored data, show wrong 
 ## Planned
 
 - M4: installer and updates, code signing, replace the AGPL-derived theme.
-- Rebuild the Windows desktop package from current code (the existing build predates the data-folder lock and session).
+- Let users remove or hide an unused, empty `default` project. Catalogs upgraded from an install that only used its own
+  project gain an empty `default` project at start-up (backend).
