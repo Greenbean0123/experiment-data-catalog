@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -18,14 +19,17 @@ import threading
 import uuid
 import webbrowser
 import zipfile
+import zlib
 from contextlib import contextmanager, nullcontext
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from itertools import combinations
+from itertools import combinations, islice
 from pathlib import Path
 from sys import float_info
+from time import monotonic
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 STATUSES = ("待补全", "已记录", "待表征", "已完成")
@@ -92,6 +96,24 @@ STALE_BACKUP_DAYS = 7
 DEMO_PROJECT = "demo"
 DEMO_NAME = "示例项目"
 DUPLICATE_CATALOG_NAME = "该名称已存在，请直接选择或使用其他名称。"
+MAX_RECORD_UPLOAD = 5 * 1024 * 1024
+MAX_WORKBOOK_XML = 64 * 1024 * 1024
+MAX_IMPORT_ROWS, MAX_IMPORT_COLUMNS = 2000, 100
+IMPORT_TTL = 30 * 60
+IMPORT_TABLE_LIMIT = "表格最多 2000 行、100 列，请拆分后再导入。"
+UNREADABLE_IMPORT = "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"
+EXPIRED_IMPORT = "导入文件已过期，请重新选择文件。"
+STALE_IMPORT = "数据已变化，请重新预览。"
+IMPORT_TARGETS = {"sample_id", "experiment_no", "series", "experiment_date", "precursors",
+                  "temperature", "duration", "solvents", "notes"}
+IMPORT_UNITS = {"temperature": "°C", "duration": "min"}
+SQLITE_NOCASE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+DUPLICATE_SAMPLE = "该项目内样品编号已存在（含已归档记录）。请使用不同编号。"
+SHARED_INPUTS = {"precursors": ("precursors", "precursor"), "temperature": ("temperature",),
+                 "materials": ("solvents", "solvent", "ligand", "material_amounts")}
+
+# Record imports validate field lengths after parsing, within the upload's byte limit.
+csv.field_size_limit(max(csv.field_size_limit(), MAX_RECORD_UPLOAD))
 
 
 class Problem(Exception):
@@ -312,25 +334,63 @@ def validate_result_summary(value):
     return {key: result[key] for key in EMPTY_RESULT}
 
 
+def validate_record_text(field, value):
+    if not isinstance(value, str) or len(value) > TEXT_LIMITS[field] or "\x00" in value:
+        raise Problem(f"{field} 格式不正确或内容过长。")
+    return value.strip()
+
+
+def validate_condition_list(field, values):
+    if (not isinstance(values, list) or len(values) > 20 or
+            any(not isinstance(value, str) or not value.strip() or len(value) > 250 or
+                any(ord(char) < 32 for char in value) for value in values)):
+        raise Problem(CONDITION_LIST_ERRORS[field])
+    return list(dict.fromkeys(value.strip() for value in values))
+
+
+def validate_record_date(value):
+    if value:
+        try:
+            if date.fromisoformat(value).isoformat() != value:
+                raise ValueError()
+        except ValueError:
+            raise Problem("实验日期格式应为 YYYY-MM-DD。")
+    return value
+
+
+def validate_numeric_condition(field, value):
+    lower, upper = NUMERIC_CONDITIONS[field]
+    if value is not None and (type(value) not in (int, float) or not lower <= value <= upper or not math.isfinite(value)):
+        raise Problem(f"{field} 必须是 {lower} 到 {upper} 范围内的有限数值，未知时留空。")
+    return value
+
+
+def validate_extra_condition(condition):
+    if not isinstance(condition, dict):
+        raise Problem("自定义条件格式不正确。")
+    item = {}
+    for key in ("name", "value", "unit"):
+        value = condition.get(key, "")
+        if not isinstance(value, str) or len(value) > 250 or "\x00" in value:
+            raise Problem("自定义条件的名称、数值和单位应为简短文本。")
+        item[key] = value.strip()
+    if not item["name"]:
+        raise Problem("自定义条件名称不能为空或重复。")
+    return item
+
+
 def validate(payload):
     if not isinstance(payload, dict):
         raise Problem("实验记录必须是对象。")
     clean = {}
-    for field, limit in TEXT_LIMITS.items():
+    for field in TEXT_LIMITS:
         value = "" if field in CONDITION_LIST_ERRORS and field + "s" in payload else payload.get(field, "")
-        if not isinstance(value, str) or len(value) > limit or "\x00" in value:
-            raise Problem(f"{field} 格式不正确或内容过长。")
-        clean[field] = value.strip()
-    for field, error in CONDITION_LIST_ERRORS.items():
+        clean[field] = validate_record_text(field, value)
+    for field in CONDITION_LIST_ERRORS:
         key = field + "s"
         if key not in payload:
             continue
-        values = payload[key]
-        if (not isinstance(values, list) or len(values) > 20 or
-                any(not isinstance(value, str) or not value.strip() or len(value) > 250 or
-                    any(ord(char) < 32 for char in value) for value in values)):
-            raise Problem(error)
-        values = list(dict.fromkeys(value.strip() for value in values))
+        values = validate_condition_list(field, payload[key])
         clean[key] = None if field == "precursor" and len(values) < 2 else json.dumps(values, ensure_ascii=False)
         clean[field] = " + ".join(values)
     if "material_amounts" in payload:
@@ -352,18 +412,9 @@ def validate(payload):
     if not clean["sample_id"]:
         raise Problem("请填写样品编号。")
     clean["experiment_no"] = clean["experiment_no"] or experiment_number(clean["sample_id"])
-    if clean["experiment_date"]:
-        try:
-            if date.fromisoformat(clean["experiment_date"]).isoformat() != clean["experiment_date"]:
-                raise ValueError()
-        except ValueError:
-            raise Problem("实验日期格式应为 YYYY-MM-DD。")
-    for field, (lower, upper) in NUMERIC_CONDITIONS.items():
-        value = payload.get(field)
-        if value is not None:
-            if type(value) not in (int, float) or not lower <= value <= upper or not math.isfinite(value):
-                raise Problem(f"{field} 必须是 {lower} 到 {upper} 范围内的有限数值，未知时留空。")
-        clean[field] = value
+    validate_record_date(clean["experiment_date"])
+    for field in NUMERIC_CONDITIONS:
+        clean[field] = validate_numeric_condition(field, payload.get(field))
     clean["status"] = payload.get("status", "待补全")
     if clean["status"] not in STATUSES:
         raise Problem("记录状态不正确。")
@@ -372,15 +423,8 @@ def validate(payload):
         raise Problem("自定义条件最多 30 项。")
     extra, names = [], set()
     for condition in conditions:
-        if not isinstance(condition, dict):
-            raise Problem("自定义条件格式不正确。")
-        item = {}
-        for key in ("name", "value", "unit"):
-            value = condition.get(key, "")
-            if not isinstance(value, str) or len(value) > 250 or "\x00" in value:
-                raise Problem("自定义条件的名称、数值和单位应为简短文本。")
-            item[key] = value.strip()
-        if not item["name"] or item["name"].casefold() in names:
+        item = validate_extra_condition(condition)
+        if item["name"].casefold() in names:
             raise Problem("自定义条件名称不能为空或重复。")
         names.add(item["name"].casefold())
         extra.append(item)
@@ -520,6 +564,187 @@ def validate_template_value(field, value):
           or any(option not in field["options"] for option in value) or len(set(value)) != len(value)):
         raise Problem("请选择模板中已有的选项。")
     return value
+
+
+def read_record_table(rows):
+    header_index, header = next(rows)
+    width, total_text, data = len(header), sum(map(len, header)), []
+    for index, row in rows:
+        width = max(width, len(row))
+        if width > MAX_IMPORT_COLUMNS:
+            raise Problem(IMPORT_TABLE_LIMIT)
+        if any(cell.strip() for cell in row):
+            data.append((index - header_index, row))
+            if len(data) > MAX_IMPORT_ROWS:
+                raise Problem(IMPORT_TABLE_LIMIT)
+            total_text += sum(map(len, row))
+            if total_text > MAX_WORKBOOK_XML:
+                raise ValueError("Expanded spreadsheet is too large")
+    if width > MAX_IMPORT_COLUMNS:
+        raise Problem(IMPORT_TABLE_LIMIT)
+    if not width:
+        raise ValueError("Missing spreadsheet columns")
+    columns = [(header[index].strip() if index < len(header) else "") or f"列 {index + 1}" for index in range(width)]
+    return columns, [(index, row + [""] * (width - len(row))) for index, row in data]
+
+
+def csv_record_rows(data):
+    try:
+        source = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        source = data.decode("gb18030")
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", source):
+        raise ValueError("Not a text CSV")
+    best, delimiter = (-1, -1, -1), ","
+    for candidate in (",", ";", "\t"):
+        reader = csv.reader(io.StringIO(source, newline=""), delimiter=candidate, strict=True)
+        try:
+            header = next(reader, None)
+        except csv.Error:
+            continue
+        if header is not None:
+            widths = []
+            try:
+                widths.extend(len(row) for row in islice(reader, 20) if row)
+            except csv.Error:
+                pass
+            width = len(header)
+            split = sum(other > 1 for other in widths)
+            score = (width > 1, widths.count(width) if width > 1 else split, split)
+            if score > best:
+                best, delimiter = score, candidate
+    return enumerate(csv.reader(io.StringIO(source, newline=""), delimiter=delimiter, strict=True))
+
+
+def xlsx_part(base, target):
+    path = posixpath.normpath(unquote(target).lstrip("/") if target.startswith("/") else
+                              posixpath.join(posixpath.dirname(base), unquote(target)))
+    if path.startswith("../") or path in ("", ".", ".."):
+        raise ValueError("Invalid workbook relationship")
+    return path
+
+
+def xlsx_string(element):
+    text = "".join(node.text or "" for node in
+                   element.findall("./{*}t") + element.findall("./{*}r/{*}t"))
+    if "_x" in text:
+        text = re.sub(r"_x([0-9a-fA-F]{4})_", lambda match: chr(int(match[1], 16)), text)
+        text = text.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+    return text
+
+
+def xlsx_date_styles(styles):
+    builtin = {14, 15, 16, 17, 22, 27, 28, 29, 30, 31, 34, 35, 36, 50, 51, 52, 53, 54, 55, 57, 58}
+    for fmt in styles.findall("./{*}numFmts/{*}numFmt"):
+        code = re.sub(r'"[^"]*"|\\.|_.|\*.|\[(?![hms]+\])[^\]]*\]', "", fmt.get("formatCode", "").lower()).split(";")[0]
+        if re.search(r"[dy]", code) or ("m" in code and not re.search(r"[hs]|\[m+\]", code)):
+            builtin.add(fmt.get("numFmtId"))
+    date_formats = {str(value) for value in builtin}
+    return {str(index) for index, fmt in enumerate(styles.findall("./{*}cellXfs/{*}xf"))
+            if fmt.get("numFmtId") in date_formats}
+
+
+def xlsx_record_cell(cell, shared, date_styles, date1904):
+    kind = cell.get("t", "n")
+    if kind == "inlineStr":
+        value = cell.find("./{*}is")
+        return xlsx_string(value) if value is not None else ""
+    value = cell.findtext("./{*}v", "")
+    if not value:
+        return ""
+    if kind == "s":
+        if not re.fullmatch(r"[0-9]{1,9}", value):
+            raise ValueError("Invalid shared string index")
+        return shared[int(value)]
+    if kind == "b":
+        return {"0": "FALSE", "1": "TRUE", "false": "FALSE", "true": "TRUE"}[value]
+    if kind == "d":
+        return date.fromisoformat(value[:10]).isoformat()
+    if kind == "n" and cell.get("s", "0") in date_styles:
+        days = math.floor(float(value))
+        epoch = date(1904, 1, 1) if date1904 else date(1899, 12, 31 if days < 60 else 30)
+        return (epoch + timedelta(days=days)).isoformat()
+    return value
+
+
+def xlsx_record_rows(worksheet, shared, date_styles, date1904):
+    sheet_data = worksheet.find("./{*}sheetData")
+    if sheet_data is None:
+        raise ValueError("Missing worksheet data")
+    row_index = 0
+    for element in sheet_data.iterfind("./{*}row"):
+        ref = element.get("r", str(row_index + 1))
+        if not re.fullmatch(r"[1-9][0-9]{0,6}", ref) or int(ref) <= row_index:
+            raise ValueError("Invalid worksheet row")
+        row_index = int(ref)
+        row, column = [], 0
+        for cell in element.iterfind("./{*}c"):
+            reference = cell.get("r")
+            next_column = column + 1
+            if reference:
+                match = re.fullmatch(r"([A-Za-z]{1,3})[1-9][0-9]{0,6}", reference)
+                if not match:
+                    raise ValueError("Invalid worksheet column")
+                next_column = 0
+                for letter in match[1].upper():
+                    next_column = 26 * next_column + ord(letter) - ord("A") + 1
+            if next_column <= column:
+                raise ValueError("Repeated worksheet column")
+            column = next_column
+            value = xlsx_record_cell(cell, shared, date_styles, date1904)
+            if column > MAX_IMPORT_COLUMNS:
+                if value:
+                    raise Problem(IMPORT_TABLE_LIMIT)
+                continue
+            if not value and cell.find("./{*}v") is None and cell.find("./{*}is") is None:
+                continue
+            row.extend([""] * (column - len(row) - 1))
+            row.append(value)
+        yield row_index, row
+
+
+def read_xlsx_record_table(data, requested_sheet):
+    with zipfile.ZipFile(io.BytesIO(data)) as book:
+        budget = MAX_WORKBOOK_XML
+
+        def part(name):
+            nonlocal budget
+            info = book.getinfo(name)
+            budget -= info.file_size
+            if budget < 0 or info.flag_bits & 1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise ValueError("Unsupported workbook XML part")
+            xml = book.read(info)
+            if b"<!DOCTYPE" in xml.replace(b"\0", b""):
+                raise ValueError("Workbook XML cannot contain a DTD")
+            return ElementTree.fromstring(xml)
+
+        workbook_path = "xl/workbook.xml"
+        if "_rels/.rels" in book.namelist():
+            for rel in part("_rels/.rels"):
+                if rel.get("Type", "").endswith("/officeDocument") and rel.get("TargetMode") != "External":
+                    workbook_path = xlsx_part("", rel.attrib["Target"])
+                    break
+        workbook = part(workbook_path)
+        parent, name = posixpath.split(workbook_path)
+        relations = {rel.attrib["Id"]: rel for rel in part(posixpath.join(parent, "_rels", name + ".rels"))
+                     if rel.get("TargetMode") != "External"}
+        sheets = {}
+        for sheet in workbook.findall("./{*}sheets/{*}sheet"):
+            rel_id = next((value for attr, value in sheet.attrib.items() if attr.endswith("}id")), None)
+            rel = relations.get(rel_id)
+            if rel is not None and rel.get("Type", "").rsplit("/", 1)[-1] == "worksheet":
+                sheets[sheet.attrib["name"]] = xlsx_part(workbook_path, rel.attrib["Target"])
+        selected = requested_sheet or next(iter(sheets))
+        support = {rel.get("Type", "").rsplit("/", 1)[-1]: xlsx_part(workbook_path, rel.attrib["Target"])
+                   for rel in relations.values() if rel.get("Type", "").endswith(("/sharedStrings", "/styles"))}
+        shared_path = support.get("sharedStrings", posixpath.join(parent, "sharedStrings.xml"))
+        styles_path = support.get("styles", posixpath.join(parent, "styles.xml"))
+        shared = [xlsx_string(item) for item in part(shared_path).iterfind("./{*}si")] if shared_path in book.namelist() else []
+        styles = xlsx_date_styles(part(styles_path)) if styles_path in book.namelist() else set()
+        properties = workbook.find("./{*}workbookPr")
+        date1904 = properties is not None and properties.get("date1904") in ("1", "true")
+        columns, rows = read_record_table(xlsx_record_rows(part(sheets[selected]), shared, styles, date1904))
+    return list(sheets), selected, columns, rows
 
 
 def missing_template_fields(template, details, section):
@@ -699,6 +924,7 @@ class Store:
         self._catalog_data = {}
         self._catalog_revision = None
         self._catalog_error = {}
+        self.record_uploads = {}
         self.check_schema_version()
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -2014,6 +2240,33 @@ class Store:
                                ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
             self.unlink_purged_files(pending)
         return {"deleted_records": count, "deleted_files": len(pending)}
+
+    def expire_record_uploads(self):
+        now = monotonic()
+        self.record_uploads = {key: entry for key, entry in self.record_uploads.items() if entry[0] > now}
+        return now
+
+    def parse_record_upload(self, name, sheet, data):
+        if len(data) > MAX_RECORD_UPLOAD:
+            raise Problem("请求过大或长度无效。", 413)
+        extension = Path(name).suffix.lower()
+        try:
+            if extension == ".csv":
+                sheets, selected = [], ""
+                columns, rows = read_record_table(csv_record_rows(data))
+            elif extension == ".xlsx":
+                sheets, selected, columns, rows = read_xlsx_record_table(data, sheet)
+            else:
+                raise ValueError("Unsupported spreadsheet type")
+        except (ValueError, LookupError, StopIteration, OverflowError, OSError, EOFError, csv.Error,
+                zipfile.BadZipFile, zlib.error, ElementTree.ParseError) as exc:
+            raise Problem(UNREADABLE_IMPORT) from exc
+        upload_id = uuid.uuid4().hex
+        with self.lock:
+            expires = self.expire_record_uploads() + IMPORT_TTL
+            self.record_uploads[upload_id] = (expires, columns, rows)
+        return {"upload_id": upload_id, "format": extension[1:], "sheets": sheets, "sheet": selected,
+                "columns": columns, "rows": [row for _, row in rows[:20]], "total_rows": len(rows)}
 
     def delete_condition_option(self, payload):
         field, name = validate_condition_option(payload)
@@ -3550,6 +3803,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/demo":
                 self.json_body()
                 return self.send_json(store.create_demo(), 201)
+            if path == "/api/import/records/parse":
+                size = self.body_length(MAX_RECORD_UPLOAD)
+                data = self.rfile.read(size)
+                if len(data) != size:
+                    raise Problem(UNREADABLE_IMPORT)
+                return self.send_json(store.parse_record_upload(query.get("name", [""])[0], query.get("sheet", [None])[0], data))
             match = re.fullmatch(r"/api/files/([a-f0-9]{32})/(update|delete)", path)
             if match:
                 return self.send_json(store.change_file(*match.groups(), self.json_body()))

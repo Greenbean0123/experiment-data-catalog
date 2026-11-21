@@ -2922,6 +2922,95 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(list(self.store.files.iterdir()), [])
         self.assertFalse(any(project["id"] == "demo" for project in self.store.catalog()["projects"]))
 
+    def parse_upload(self, name, data, sheet=None, status=200):
+        query = {"name": name}
+        if sheet is not None:
+            query["sheet"] = sheet
+        return self.request_json("/api/import/records/parse?" + urlencode(query), data, "POST", status)
+
+    def test_record_import_csv_encodings_delimiters_and_limits(self):
+        for encoding, delimiter in (("utf-8", ","), ("utf-8-sig", ","), ("gb18030", ","),
+                                    ("utf-8", ";"), ("utf-8", "\t")):
+            with self.subTest(encoding=encoding, delimiter=delimiter):
+                source = io.StringIO(newline="")
+                writer = csv.writer(source, delimiter=delimiter)
+                writer.writerow(["样品编号", "", "备注"])
+                writer.writerow(["实验 A", "250 °C", "两行; a, b\n第二行"])
+                writer.writerows([[str(index), "1", ""] for index in range(20)])
+                data = self.parse_upload("试验.CSV", source.getvalue().encode(encoding))
+                self.assertEqual((data["format"], data["sheets"], data["sheet"]), ("csv", [], ""))
+                self.assertEqual(data["columns"], ["样品编号", "列 2", "备注"])
+                self.assertEqual(data["rows"][0], ["实验 A", "250 °C", "两行; a, b\n第二行"])
+                self.assertEqual((data["total_rows"], len(data["rows"])), (21, 20))
+                self.assertRegex(data["upload_id"], r"^[0-9a-f]{32}$")
+
+        for data in (b"x\n" + b"row\n" * 2001, b"x\n" + b"a," * 100 + b"a", b"a," * 100 + b"a\n"):
+            self.assertEqual(self.parse_upload("large.csv", data, status=400),
+                             {"error": "表格最多 2000 行、100 列，请拆分后再导入。"})
+        boundary = self.parse_upload("limit.csv", b"x\n" + (b"a," * 99 + b"a\n") * 2000)
+        self.assertEqual((boundary["total_rows"], len(boundary["columns"])), (2000, 100))
+        for name, data in (("test.csv", b"\xff"), ("test.csv", b'a,b\n"unclosed'), ("test.csv", b""),
+                           ("test.xlsx", b"a,b\n"), ("test.xls", b"a,b\n")):
+            self.assertEqual(self.parse_upload(name, data, status=400),
+                             {"error": "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"})
+        route = "/api/import/records/parse?name=large.csv"
+        self.assertEqual(self.request(route, b"x", "POST", authenticate=False)[0], 401)
+        status, payload, _ = self.request(route, b"", "POST",
+                                          headers={"Content-Length": str(5 * 1024 * 1024 + 1)})
+        self.assertEqual((status, json.loads(payload)), (413, {"error": "请求过大或长度无效。"}))
+
+    def test_record_import_xlsx_shared_inline_formulas_dates_and_sheet_selection(self):
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        pkg_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as workbook:
+            workbook.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                              '<Default Extension="xml" ContentType="application/xml"/>'
+                              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                              '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                              + "".join(f'<Override PartName="/xl/{part}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.{kind}+xml"/>'
+                                        for part, kind in (("worksheets/sheet1", "worksheet"), ("worksheets/sheet2", "worksheet"),
+                                                           ("styles", "styles"), ("sharedStrings", "sharedStrings"))) + '</Types>')
+            workbook.writestr("_rels/.rels", f'<Relationships xmlns="{pkg_ns}"><Relationship Id="rId1" '
+                              f'Type="{rel_ns}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+            workbook.writestr("xl/workbook.xml", f'<workbook xmlns="{ns}" xmlns:r="{rel_ns}"><sheets>'
+                              '<sheet name="主表" sheetId="1" r:id="rId1"/><sheet name="Second sheet" sheetId="2" r:id="rId2"/>'
+                              '</sheets></workbook>')
+            workbook.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{pkg_ns}">'
+                              + "".join(f'<Relationship Id="rId{index}" Type="{rel_ns}/{kind}" Target="{target}"/>'
+                                        for index, (kind, target) in enumerate((("worksheet", "worksheets/sheet1.xml"),
+                                            ("worksheet", "/xl/worksheets/sheet2.xml"), ("sharedStrings", "sharedStrings.xml"),
+                                            ("styles", "styles.xml")), 1)) + '</Relationships>')
+            workbook.writestr("xl/sharedStrings.xml", f'<sst xmlns="{ns}"><si><t>编号</t></si>'
+                              '<si><r><t>样品</t></r><r><t>-1</t></r></si></sst>')
+            workbook.writestr("xl/styles.xml", f'<styleSheet xmlns="{ns}"><numFmts count="1">'
+                              '<numFmt numFmtId="164" formatCode="yyyy/mm/dd h:mm"/></numFmts><cellXfs count="4">'
+                              '<xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/><xf numFmtId="20"/></cellXfs></styleSheet>')
+            workbook.writestr("xl/worksheets/sheet1.xml", f'<worksheet xmlns="{ns}"><sheetData><row r="1">'
+                              '<c r="A1" t="s"><v>0</v></c><c r="C1" t="inlineStr"><is><t>日期</t></is></c>'
+                              '<c r="D1" t="inlineStr"><is><t>公式</t></is></c><c r="E1" t="inlineStr"><is><t>布尔</t></is></c>'
+                              '<c r="F1" t="inlineStr"><is><r><t>自定义</t></r><r><t>日期</t></r></is></c>'
+                              '</row><row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2"><v>12.5</v></c>'
+                              '<c r="C2" s="1"><v>45292.75</v></c><c r="D2"><f>B2*2</f><v>25</v></c><c r="E2" t="b"><v>1</v></c>'
+                              '<c r="F2" s="2"><v>45293</v></c></row></sheetData></worksheet>')
+            workbook.writestr("xl/worksheets/sheet2.xml", f'<worksheet xmlns="{ns}"><sheetData><row r="1">'
+                              '<c r="A1" t="inlineStr"><is><t>Note</t></is></c><c r="B1" t="inlineStr"><is><t>Time</t></is></c>'
+                              '</row><row r="3"><c r="A3" t="str"><f>"second"</f><v>second</v></c><c r="B3" s="3"><v>0.5</v></c>'
+                              '</row></sheetData></worksheet>')
+        data = buffer.getvalue()
+        parsed = self.parse_upload("Book.xlsx", data)
+        self.assertEqual((parsed["format"], parsed["sheets"], parsed["sheet"], parsed["total_rows"]),
+                         ("xlsx", ["主表", "Second sheet"], "主表", 1))
+        self.assertEqual(parsed["columns"], ["编号", "列 2", "日期", "公式", "布尔", "自定义日期"])
+        self.assertEqual(parsed["rows"], [["样品-1", "12.5", "2024-01-01", "25", "TRUE", "2024-01-02"]])
+        selected = self.parse_upload("Book.xlsx", data, "Second sheet")
+        self.assertEqual((selected["sheet"], selected["columns"], selected["rows"]),
+                         ("Second sheet", ["Note", "Time"], [["second", "0.5"]]))
+        self.assertNotEqual(parsed["upload_id"], selected["upload_id"])
+        self.assertEqual(self.parse_upload("Book.xlsx", data, "Missing", status=400),
+                         {"error": "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"})
+
 
 class DataSafetyTests(unittest.TestCase):
     def setUp(self):
