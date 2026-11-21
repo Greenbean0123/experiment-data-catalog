@@ -312,3 +312,18 @@ onboarding and imports (M3), packaging (M4).
   it answers 200 with the new `catalog`, `revision`, `active_prefixes` and `"publication_pending": true`. The change is
   accepted and will be published automatically (§8.2). The UI tells the user that the conventions were saved and the file
   will be written shortly. A failure before commit still returns an error and changes nothing.
+
+## 10. Release-check 2 amendments (binding)
+
+- **Prefix changes touch only affected groups.** A prefix change rewrites only `experiment_defaults` rows whose key is
+  merged or split by that change. Every other row, including rows of groups that currently have no samples, stays
+  exactly as stored.
+- **Legacy decisions stay in their project.** A review decision made before v4 only covers issues of the same project
+  as the stored review item.
+- **Legacy coverage is frozen at upgrade.** The v3→v4 step (and v1/v2 upgrades) computes each legacy automatic
+  missing-condition decision's coverage from its stored fingerprint against the record and template as they are at
+  upgrade time, and stores it as the decision's coverage. Later edits never shrink or reinterpret it.
+- **Pending conventions publication never breaks reads.** While `pending_local_catalog` cannot be published (file
+  locked), every endpoint serves the committed settings from the database (translations, conventions, active prefixes)
+  and retries publication later; no request fails because of it.
+- Deferred to M3 (low): recovery of a first-time folder backup interrupted while publishing its history file.
