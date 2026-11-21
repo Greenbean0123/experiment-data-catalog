@@ -2538,7 +2538,9 @@ function initialize() {
         reviewItem = {...reviewItem, generated: false, revision: stored.revision};
       }
       const payload = reviewPlan?.payload || {revision: reviewItem.revision, record_revision: reviewItem.record_revision,
-        record_id: reviewItem.record_id, status, note, apply_value: apply, value};
+        record_id: reviewItem.record_id, status, note, apply_value: apply, value,
+        // Automatic missing-condition items are decided for exactly the fields shown.
+        ...(reviewItem.kind === "missing_conditions" && Array.isArray(reviewItem.missing) ? {missing: reviewItem.missing} : {})};
       const result = await api(`api/reviews/${reviewItem.id}/decide`, {method: "POST", body: JSON.stringify({...payload, preview})});
       if (preview) {
         reviewPlan = {payload, preview: result};
@@ -3003,6 +3005,10 @@ function initialize() {
   let conventionsBlocked = false;
   function fillConventions(result) {
     const catalog = result?.catalog || {};
+    // The service may have just accepted a repaired prefix set; refresh the grouping shown on the page.
+    if (Array.isArray(result?.active_prefixes) && result.active_prefixes.map(String).sort().join(",") !== [...notebookPrefixes].sort().join(",")) {
+      load().catch(() => {});
+    }
     const unrepresentable = (Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : [])
       .some(entry => [entry.label, ...(entry.aliases || [])].some(value => /[\u0000-\u001f\u007f]/.test(String(value))));
     conventionsBlocked = result?.error_kind === "unparsable" || (Boolean(result?.error) && result?.error_kind !== "prefix_conflict") || unrepresentable;

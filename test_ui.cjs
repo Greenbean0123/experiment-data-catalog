@@ -2507,5 +2507,26 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("close-conventions").click();
     } finally { env.dom.window.close(); }
   }
+  {
+    // §8.3: decisions on automatic missing-condition items carry exactly the fields shown.
+    const decided = [];
+    const item = {id: "d".repeat(32), record_id: "A", project_id: "default", experiment_no: "A", sample_id: "A", title: "缺少条件", field: "", kind: "missing_conditions",
+      status: "pending", revision: 1, record_revision: 1, sources: [], missing: ["precursor"], generated: false, resolution: ""};
+    const env = await boot({savedLanguage: "en", workflowHandler: async (url, options) => {
+      const respond = data => ({ok: true, json: async () => structuredClone(data)});
+      if (!options.method) return respond({items: [item]});
+      const payload = JSON.parse(options.body);
+      decided.push({url, payload});
+      return respond({});
+    }});
+    try {
+      env.$("review-view").click(); await flush(); await flush();
+      env.w.document.querySelector("[data-review-item]").click();
+      env.$("confirm-review").click(); await flush(); await flush();
+      const decision = decided.find(entry => entry.url.endsWith("/decide"));
+      assert.ok(decision, "The decision was sent");
+      assert.deepEqual(decision.payload.missing, ["precursor"], "The displayed missing fields travel with the decision");
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
