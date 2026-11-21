@@ -2540,7 +2540,7 @@ function initialize() {
       const payload = reviewPlan?.payload || {revision: reviewItem.revision, record_revision: reviewItem.record_revision,
         record_id: reviewItem.record_id, status, note, apply_value: apply, value,
         // Automatic missing-condition items are decided for exactly the fields shown.
-        ...(reviewItem.kind === "missing_conditions" && Array.isArray(reviewItem.missing) ? {missing: reviewItem.missing} : {})};
+        ...(reviewItem.kind === "missing_conditions" ? {missing: Array.isArray(reviewItem.missing) ? reviewItem.missing : []} : {})};
       const result = await api(`api/reviews/${reviewItem.id}/decide`, {method: "POST", body: JSON.stringify({...payload, preview})});
       if (preview) {
         reviewPlan = {payload, preview: result};
@@ -3003,14 +3003,15 @@ function initialize() {
     return {notebook_prefixes: prefixes, precursor_aliases, translations};
   }
   let conventionsBlocked = false;
-  function fillConventions(result) {
+  function fillConventions(result, {refresh = true} = {}) {
     const catalog = result?.catalog || {};
     // The service may have just accepted a repaired prefix set; refresh the grouping shown on the page.
-    if (Array.isArray(result?.active_prefixes) && result.active_prefixes.map(String).sort().join(",") !== [...notebookPrefixes].sort().join(",")) {
+    if (refresh && Array.isArray(result?.active_prefixes) && result.active_prefixes.map(String).sort().join(",") !== [...notebookPrefixes].sort().join(",")) {
       load().catch(() => {});
     }
     const unrepresentable = (Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : [])
-      .some(entry => [entry.label, ...(entry.aliases || [])].some(value => /[\u0000-\u001f\u007f]/.test(String(value))));
+      .some(entry => [entry.label, ...(entry.aliases || [])].some(value => /[\u0000-\u001f\u007f]/.test(String(value))))
+      || (Array.isArray(catalog.notebook_prefixes) ? catalog.notebook_prefixes : []).some(prefix => !/^[A-Za-z]{1,20}$/.test(String(prefix)));
     conventionsBlocked = result?.error_kind === "unparsable" || (Boolean(result?.error) && result?.error_kind !== "prefix_conflict") || unrepresentable;
     if (result?.error) showError("conventions-error", result.error);
     else if (unrepresentable) showError("conventions-error", "有名称或别名包含换行等控制字符，无法在这里编辑。请先停止程序，手工修改 local-catalog.json。");
@@ -3064,11 +3065,11 @@ function initialize() {
     conventionsBusy = true; syncConventionsControls();
     try {
       const result = await api("api/local-catalog", {method: "PUT", body: JSON.stringify({catalog, revision: conventionsRevision})});
-      fillConventions(result);
+      fillConventions(result, {refresh: false});
       conventionsBusy = false;
       $("conventions-dialog").close();
       try { await load(); } catch {}
-      toast(t("本地约定已保存。"));
+      toast(t(result?.publication_pending ? "本地约定已保存，local-catalog.json 将在文件可写时自动更新。" : "本地约定已保存。"));
     } catch (error) {
       conventionsBusy = false; syncConventionsControls();
       showError("conventions-error", error.message);

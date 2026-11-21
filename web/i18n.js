@@ -2,6 +2,7 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "本地约定已保存，local-catalog.json 将在文件可写时自动更新。": "Catalog conventions saved. local-catalog.json will be updated automatically once the file can be written.",
     "有名称或别名包含换行等控制字符，无法在这里编辑。请先停止程序，手工修改 local-catalog.json。": "Some names or aliases contain line breaks or other control characters and cannot be edited here. Stop the app and edit local-catalog.json by hand.",
     "无单位": "no unit",
     "有别名包含换行，编辑器已把它拆成多个别名。请核对后再保存。": "Some aliases contain line breaks; the editor has split them into separate aliases. Check them before saving.",

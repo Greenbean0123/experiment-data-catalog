@@ -2528,5 +2528,43 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.deepEqual(decision.payload.missing, ["precursor"], "The displayed missing fields travel with the decision");
     } finally { env.dom.window.close(); }
   }
+  {
+    // §9: raw prefixes the input cannot represent, committed-but-pending saves, legacy review items.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    let raw = ["AB\n"], puts = 0;
+    const decided = [];
+    const legacy = {id: "e".repeat(32), record_id: "A", project_id: "default", experiment_no: "A", sample_id: "A", title: "缺少条件", field: "", kind: "missing_conditions",
+      status: "dismissed", revision: 2, record_revision: 1, sources: [], generated: false, resolution: "old"};
+    const env = await boot({savedLanguage: "en",
+      settingsHandler: (url, options) => {
+        if (options.method === "PUT") { puts++; return reply(200, {catalog: {notebook_prefixes: ["XY"], precursor_aliases: [], translations: {}}, revision: "r2", active_prefixes: ["XY"], publication_pending: true}); }
+        return reply(200, {catalog: {notebook_prefixes: raw, precursor_aliases: [], translations: {}}, revision: "r1", active_prefixes: []});
+      },
+      workflowHandler: async (url, options) => {
+        if (!options.method) return reply(200, {items: [legacy]});
+        decided.push({url, payload: JSON.parse(options.body)});
+        return reply(200, {});
+      }});
+    try {
+      const {$} = env;
+      $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.equal($("save-conventions").disabled, true, "A prefix with a line break blocks the editor instead of being trimmed");
+      $("close-conventions").click();
+      raw = ["XY"];
+      $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.equal($("save-conventions").disabled, false);
+      $("save-conventions").click(); for (let i = 0; i < 5; i++) await flush();
+      assert.equal(puts, 1);
+      assert.match($("toast").textContent, /updated automatically once the file can be written/, "A committed but unpublished save is reported as saved");
+      $("review-view").click(); await flush(); await flush();
+      $("review-status").value = "dismissed"; $("review-status").dispatchEvent(new env.w.Event("input", {bubbles: true})); await flush();
+      env.w.document.querySelector("[data-review-item]").click();
+      $("review-outcome").value = "pending"; $("review-outcome").dispatchEvent(new env.w.Event("change", {bubbles: true}));
+      $("confirm-review").click(); await flush(); await flush();
+      const decision = decided.find(entry => entry.url.endsWith("/decide"));
+      assert.ok(decision, "The legacy item can be reopened");
+      assert.deepEqual(decision.payload.missing, [], "Legacy items send an empty displayed list");
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
