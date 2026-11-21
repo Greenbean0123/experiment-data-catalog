@@ -410,7 +410,7 @@ class StoreTests(unittest.TestCase):
                                  "record_revision": key["record_revision"], "missing": key["missing"]})
         with self.store.connect() as db:
             coverage = {row["id"]: json.loads(row["coverage"]) for row in db.execute("SELECT id, coverage FROM review_items")}
-        self.assertEqual(coverage, {closed["id"]: ["temperature"], pending["id"]: ["template:1:0", "template:1:1"],
+        self.assertEqual(coverage, {closed["id"]: ["temperature"], pending["id"]: ["template:default:1:0", "template:default:1:1"],
                                     key["id"]: ["key:condition:temperature"]})
 
     def test_legacy_builtin_review_dispositions_cover_only_their_fields(self):
@@ -440,6 +440,35 @@ class StoreTests(unittest.TestCase):
                                    and item["kind"] == "missing_conditions"]
                 self.assertEqual((closed["id"], closed["status"]), (legacy, status))
                 self.assertEqual((pending["status"], pending["missing"]), ("pending", ["temperature"]))
+
+    def test_template_review_decision_stays_with_its_project(self):
+        record = self.store.save({"sample_id": "Moved film"})
+        destination = self.store.add_catalog_item("projects", {"name": "Other film lab"})["project"]["id"]
+        for project, label in (("default", "Pressure"), (destination, "Substrate")):
+            self.store.save_template({"project_id": project, "revision": 0, "name": "Films", "fields": [
+                {"label": label, "section": "condition", "type": "text", "required": True},
+            ]})
+
+        def issues():
+            return [item for item in self.store.review_list()["items"] if item["record_id"] == record
+                    and item["kind"] == "missing_conditions"]
+
+        row, = self.store.list()
+        self.store.save({**row, "lab_data": {"template_revision": 1}}, record)
+        assignment = self.store.history(record)["batches"][0]["id"]
+        pressure, = issues()
+        self.assertEqual(pressure["missing"], ["Pressure"])
+        revision = self.store.add_review({"issue_id": pressure["id"]})["revision"]
+        self.store.decide_review(pressure["id"], {"preview": False, "status": "dismissed", "revision": revision,
+                                 "record_revision": pressure["record_revision"], "missing": pressure["missing"],
+                                 "note": "Checked notebook"})
+
+        preview = self.store.undo_history(assignment, {"preview": True})
+        self.store.undo_history(assignment, {"preview": False, "revisions": preview["revisions"]})
+        row, = self.store.list()
+        self.store.save({**row, "project_id": destination, "lab_data": {"template_revision": 1}}, record)
+        self.assertEqual([(item["project_id"], item["status"], item["missing"]) for item in issues()],
+                         [("default", "dismissed", ["Pressure"]), (destination, "pending", ["Substrate"])])
 
     def test_key_field_review_disposition_survives_casing_only_rename(self):
         field = dict(section="condition", label="Substrate", type="text")
@@ -2039,6 +2068,29 @@ class HTTPTests(unittest.TestCase):
         self.request_json(endpoint, {**payload, "missing": current["missing"]}, "POST")
         self.assertEqual(issue()["status"], "resolved")
 
+    def test_legacy_automatic_review_can_be_reopened_and_decided_with_displayed_missing(self):
+        store = self.server.store
+        record = store.save({"sample_id": "Legacy review", "precursor": "Ni source", "duration": 5, "solvent": "Water"})
+        fingerprint = hashlib.sha256(json.dumps(["conditions-" + record, ["temperature"]]).encode()).hexdigest()[:32]
+        store.add_review({"issue_id": fingerprint})
+        with store.connect() as db:
+            db.execute("UPDATE review_items SET status='dismissed', missing=NULL, coverage=NULL WHERE id=?", (fingerprint,))
+
+        def issue():
+            current, = [item for item in self.request_json("/api/reviews")["items"]
+                        if item["record_id"] == record and item["kind"] == "missing_conditions"]
+            return current
+
+        route = f"/api/reviews/{fingerprint}/decide"
+        for before, after in (("dismissed", "pending"), ("pending", "resolved")):
+            with self.subTest(status=after):
+                current = issue()
+                self.assertEqual((current["id"], current["status"], current["missing"]),
+                                 (fingerprint, before, ["temperature"]))
+                self.request_json(route, {"preview": False, "status": after, "revision": current["revision"],
+                                          "record_revision": current["record_revision"], "missing": current["missing"]}, "POST")
+        self.assertEqual(issue()["status"], "resolved")
+
     def test_bulk_http_preview_commit_and_boundaries(self):
         record_id = self.server.store.save({"sample_id": "HTTP-bulk", "temperature": 0})
         payload = {"records": [{"id": record_id, "revision": 1}], "changes": {"temperature": {"mode": "set", "value": 275}}, "preview": True}
@@ -2198,6 +2250,37 @@ class HTTPTests(unittest.TestCase):
                                                 "catalog": active["catalog"]}, "PUT")
         self.assertEqual(repaired, active)
         self.assertEqual(self.request_json(endpoint), active)
+
+    def test_local_catalog_put_accepts_committed_change_when_file_replace_fails(self):
+        endpoint = "/api/local-catalog"
+        store = self.server.store
+        path = store.data / "local-catalog.json"
+        self.addCleanup(path.unlink, missing_ok=True)
+        current = self.request_json(endpoint)
+        old = self.request_json(endpoint, {"revision": current["revision"], "catalog": {}}, "PUT")
+        previous = path.read_bytes()
+        numeric, roman = "PUBLISH-1-42", "PUBLISH-I-42"
+        token = store.shared_defaults("default", numeric)["token"]
+        store.save({"sample_id": numeric, "temperature": 240, "shared_token": token})
+
+        with patch.object(server.os, "replace", side_effect=PermissionError("conventions file is open")):
+            saved = self.request_json(endpoint, {"revision": old["revision"],
+                                                 "catalog": {"notebook_prefixes": ["PUBLISH"]}}, "PUT")
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertIs(saved["publication_pending"], True)
+        self.assertEqual(saved["catalog"]["notebook_prefixes"], ["PUBLISH"])
+        self.assertEqual(saved["active_prefixes"], ["PUBLISH"])
+        with store.connect() as db:
+            pending, = db.execute("SELECT value FROM app_settings WHERE key='pending_local_catalog'").fetchone()
+            key, = db.execute("SELECT experiment_key FROM experiment_defaults WHERE experiment_key=?", (roman.lower(),)).fetchone()
+            self.assertEqual(key, roman.lower())
+        self.assertEqual(saved["revision"], hashlib.sha256(pending).hexdigest())
+        published = self.request_json(endpoint)
+        self.assertEqual(published, {key: value for key, value in saved.items() if key != "publication_pending"})
+        self.assertEqual(path.read_bytes(), pending)
+        self.assertEqual(store.shared_defaults("default", roman)["conditions"]["temperature"], 240)
+        with store.connect() as db:
+            self.assertIsNone(store.setting(db, "pending_local_catalog"))
 
     def test_get_retries_unchanged_prefix_conflict_after_defaults_are_repaired(self):
         endpoint = "/api/local-catalog"
@@ -2796,7 +2879,7 @@ class DataSafetyTests(unittest.TestCase):
         states = self.stored_defaults()
         self.assertEqual(set(states), {"ab-i-42"})
         self.assertEqual(states["ab-i-42"]["overrides"], overrides)
-        self.assertEqual(states["ab-i-42"]["origin_keys"], ["ab-1-42"])
+        self.assertEqual(states["ab-i-42"]["origin_keys"], [])
         snapshot, = (self.store.data / "migration-backups").glob("experiments-schema3-*.sqlite3")
         self.assertEqual(self.version(snapshot), 3)
         original = sqlite3.connect(snapshot)
@@ -2806,6 +2889,52 @@ class DataSafetyTests(unittest.TestCase):
                              [("ab-1-42", settings)])
         finally:
             original.close()
+
+    def test_legacy_merged_defaults_only_split_to_keys_with_samples(self):
+        numeric, roman = "AB-1-42", "AB-I-42"
+        for version in (2, 3):
+            with self.subTest(schema=version):
+                self.store = Store(self.root / f"schema-{version}")
+                catalog = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+                self.store.save({"sample_id": numeric + "_a", "temperature": 240})
+                settings = json.dumps({"conditions": {"temperature": 240}, "overrides": {}, "last_save": "legacy"})
+                with self.store.connect() as db:
+                    db.execute("INSERT INTO experiment_defaults VALUES ('default', ?, ?)", (roman.lower(), settings))
+                    db.execute("DELETE FROM app_settings WHERE key='accepted_notebook_prefixes'")
+                    db.execute(f"PRAGMA user_version={version}")
+
+                self.store = Store(self.store.data)
+                self.assertEqual(self.stored_defaults()[roman.lower()]["conditions"], {"temperature": 240})
+                self.store.save_local_catalog({"revision": catalog["revision"], "catalog": {}})
+                new_roman = self.store.save({"sample_id": roman + "_b"})
+                new_sample = next(row for row in self.store.list() if row["id"] == new_roman)
+                self.assertEqual((set(self.stored_defaults()), new_sample["temperature"]), ({numeric.lower()}, None))
+
+    def test_schema_three_legacy_review_covers_template_field_named_like_a_builtin(self):
+        sample = self.store.save({"sample_id": "Film", "precursor": "Ni source", "duration": 5, "solvent": "Water"})
+        self.store.save_template({"project_id": "default", "revision": 0, "name": "Film", "fields": [
+            {"label": "temperature", "section": "condition", "type": "number", "required": True},
+        ]})
+        row, = self.store.list()
+        self.store.save({**row, "lab_data": {"template_revision": 1}}, sample)
+        assignment = self.store.history(sample)["batches"][0]["id"]
+        fingerprint = hashlib.sha256(json.dumps(["conditions-" + sample, ["temperature"]]).encode()).hexdigest()[:32]
+        with self.store.connect() as db:
+            db.execute("""INSERT INTO review_items
+                          (id,record_id,project_id,experiment_no,kind,field,title,sources,status,created_at,updated_at,automatic)
+                          VALUES (?,?,'default','Film','missing_conditions','','缺少实验条件','[]','dismissed','','',1)""",
+                       (fingerprint, sample))
+            db.execute("PRAGMA user_version=3")
+        upgraded = Store(self.store.data)
+
+        def issues():
+            return [(item["id"], item["status"], item.get("missing")) for item in upgraded.review_list()["items"]
+                    if item["kind"] == "missing_conditions"]
+
+        self.assertEqual(issues(), [(fingerprint, "dismissed", ["temperature"])])
+        preview = upgraded.undo_history(assignment, {"preview": True})
+        upgraded.undo_history(assignment, {"preview": False, "revisions": preview["revisions"]})
+        self.assertEqual(issues(), [(fingerprint, "dismissed", ["temperature"])])
 
     def test_legacy_attachment_migration_keeps_files_and_receipts(self):
         for version in (1, 2):
@@ -3600,8 +3729,9 @@ class DataSafetyTests(unittest.TestCase):
         token = self.store.shared_defaults("default", "AB-1-42")["token"]
         self.store.save({"sample_id": "AB-1-42", "temperature": 240, "shared_token": token})
         before = self.stored_defaults()
-        with patch.object(server.os, "replace", side_effect=PermissionError("file open")), self.assertRaises(PermissionError):
-            self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+        with patch.object(server.os, "replace", side_effect=PermissionError("file open")):
+            saved = self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+        self.assertIs(saved["publication_pending"], True)
         self.assertEqual(path.read_bytes(), content)
         with self.store.connect() as db:
             pending, = db.execute("SELECT value FROM app_settings WHERE key='pending_local_catalog'").fetchone()
@@ -3663,8 +3793,12 @@ class DataSafetyTests(unittest.TestCase):
         self.store.folder_backup(target)
         database = target / "data" / "experiments.sqlite3"
         conventions = target / "data" / "local-catalog.json"
+        history = target / "db-history"
+        marker = target / server.BACKUP_MARKER
         previous_database = hashlib.sha256(database.read_bytes()).digest()
         previous_conventions = conventions.read_bytes()
+        previous_history = {path.name: self.store.file_digest(path) for path in history.iterdir()}
+        previous_marker = marker.read_bytes()
         self.store.save({"sample_id": "New sample"})
         self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
         replace = server.os.replace
@@ -3679,6 +3813,43 @@ class DataSafetyTests(unittest.TestCase):
                 self.store.folder_backup(target)
         self.assertEqual(hashlib.sha256(database.read_bytes()).digest(), previous_database)
         self.assertEqual(conventions.read_bytes(), previous_conventions)
+        self.assertEqual({path.name: self.store.file_digest(path) for path in history.iterdir()}, previous_history)
+        self.assertEqual(marker.read_bytes(), previous_marker)
+
+    def test_folder_backup_failed_or_corrupted_history_copy_keeps_previous_generation(self):
+        old = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        self.store.save({"sample_id": "Previous sample"})
+        target = self.root / "mirror"
+        self.store.folder_backup(target)
+        history = target / "db-history"
+        files = (target / "data" / "experiments.sqlite3", target / "data" / "local-catalog.json",
+                 target / server.BACKUP_MARKER)
+
+        def generation():
+            return {path.relative_to(target): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in (*files, *history.iterdir())}
+
+        previous = generation()
+        self.store.save({"sample_id": "New sample"})
+        self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+        copy = server.shutil.copy2
+
+        def fail_history(source, destination, **kwargs):
+            if Path(destination).parent == history:
+                Path(destination).write_bytes(b"partial history")
+                if error is OSError:
+                    raise OSError(message)
+                return destination
+            return copy(source, destination, **kwargs)
+
+        for error, message in ((OSError, "history copy unavailable"),
+                               (Problem, "数据库快照完整性检查未通过，备份未完成。请查看服务日志。")):
+            with self.subTest(error=error.__name__):
+                with patch.object(server.shutil, "copy2", side_effect=fail_history):
+                    with self.assertRaisesRegex(error, message):
+                        self.store.folder_backup(target)
+                self.assertEqual(generation(), previous)
+        self.assertEqual([row["sample_id"] for row in Store(target / "data").list()], ["Previous sample"])
 
     def test_interrupted_folder_backup_keeps_previous_consistent_snapshot(self):
         self.add("I-1", "a.csv", b"1,2\n")

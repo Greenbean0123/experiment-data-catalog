@@ -661,8 +661,8 @@ def local_catalog_revision(data):
 
 
 @contextmanager
-def prepare_local_catalog(path, data):
-    target = tempfile.NamedTemporaryFile(dir=path.parent, prefix=".part-local-catalog-", delete=False)
+def prepare_file_replacement(path, data):
+    target = tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".part-{path.stem}-", delete=False)
     part = Path(target.name)
     try:
         with target:
@@ -895,7 +895,7 @@ class Store:
             pending = db.execute("SELECT value FROM app_settings WHERE key='pending_local_catalog'").fetchone()
             if pending is not None:
                 path = self.data / LOCAL_CATALOG
-                with prepare_local_catalog(path, pending["value"]) as part:
+                with prepare_file_replacement(path, pending["value"]) as part:
                     self.publish_local_catalog(db, path, part)
                 self.grouping_prefixes = frozenset(self.setting(db, "accepted_notebook_prefixes", []))
                 self._catalog_revision = None
@@ -913,14 +913,14 @@ class Store:
         if local is not None:
             prefixes = frozenset(item.upper() for item in catalog_prefixes(local.get("notebook_prefixes")))
             try:
-                self.remap_shared_defaults(db, prefixes)
+                self.remap_shared_defaults(db, prefixes, legacy=True)
             except Problem:
                 pass
             else:
                 self.write_setting(db, "accepted_notebook_prefixes", sorted(prefixes))
                 self.grouping_prefixes = prefixes
                 return
-        self.remap_shared_defaults(db, self.grouping_prefixes)
+        self.remap_shared_defaults(db, self.grouping_prefixes, legacy=True)
 
     def refresh_local_catalog(self, data, *, retry_conflict=False):
         revision = local_catalog_revision(data)
@@ -948,28 +948,36 @@ class Store:
             self.remap_shared_defaults(db, prefixes)
         self.write_setting(db, "accepted_notebook_prefixes", sorted(prefixes))
 
-    def remap_shared_defaults(self, db, prefixes):
+    def remap_shared_defaults(self, db, prefixes, *, legacy=False):
         stored = {(row["project_id"], row["experiment_key"]): json.loads(row["settings"]) for row in db.execute(
             "SELECT project_id, experiment_key, settings FROM experiment_defaults ORDER BY project_id, experiment_key")}
         if not stored:
             return
+        source_prefixes = self.grouping_prefixes
+        if legacy:
+            # Legacy catalogs used the file's prefixes before tracking accepted prefixes in the database.
+            source_prefixes = frozenset(self.setting(db, "accepted_notebook_prefixes", prefixes))
         destinations, members = {}, {}
         for row in db.execute("SELECT id, project_id, experiment_no, sample_id, notes, series FROM experiments"):
             if is_dataset(row):
                 continue
             project = row["project_id"]
-            source = (project, record_experiment_key(row, self.grouping_prefixes))
+            source = (project, record_experiment_key(row, source_prefixes))
             target = (project, record_experiment_key(row, prefixes))
             members.setdefault(target, set()).add(row["id"])
-            if source in stored:
-                destinations.setdefault(source, set()).add(target)
+            destinations.setdefault(source, set()).add(target)
 
         rewritten = {}
         conflicts = set()
         for (project, key), state in stored.items():
-            targets = destinations.get((project, key), set())
+            source = (project, experiment_key(key, source_prefixes))
+            targets = set(destinations.get(source, ()))
+            if legacy and not targets and source_prefixes == prefixes:
+                # Opening the same grouping preserves saved rows even when no samples remain.
+                targets.add(source)
             origins = {}
-            for origin in state.get("origin_keys", [key]):
+            origin_keys = () if legacy else state.get("origin_keys", ())
+            for origin in origin_keys:
                 target = (project, experiment_key(origin, prefixes))
                 targets.add(target)
                 origins.setdefault(target, []).append(origin)
@@ -1071,7 +1079,8 @@ class Store:
             content = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8", errors="backslashreplace")
 
             path = self.data / LOCAL_CATALOG
-            with prepare_local_catalog(path, content) as part, self.connect() as db:
+            publication = {}
+            with prepare_file_replacement(path, content) as part, self.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 self.apply_notebook_prefixes(db, prefixes)
                 db.execute("INSERT INTO app_settings VALUES ('pending_local_catalog', ?)", (content,))
@@ -1079,11 +1088,14 @@ class Store:
                     raise Problem(STALE_LOCAL_CATALOG, 409)
                 db.commit()
                 self.grouping_prefixes = prefixes
-                self.publish_local_catalog(db, path, part)
+                try:
+                    self.publish_local_catalog(db, path, part)
+                except OSError:
+                    publication["publication_pending"] = True
             self._catalog_data = updated
             self._catalog_revision = local_catalog_revision(content)
             self._catalog_error = {}
-            return {"catalog": catalog, "revision": self._catalog_revision, "active_prefixes": sorted(prefixes)}
+            return {"catalog": catalog, "revision": self._catalog_revision, "active_prefixes": sorted(prefixes), **publication}
 
     def setting(self, db, key, default=None):
         row = db.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
@@ -1548,7 +1560,7 @@ class Store:
                 sources.setdefault(row["record_id"], []).append({"label": row["name"] + " · p. " + row["page"], "source_id": row["source_id"], "value": row["caption"]})
             items = [dict(row) for row in db.execute("SELECT * FROM review_items ORDER BY created_at, rowid")]
         by_id = {row["id"]: row for row in records}
-        stored_keys, closed_conditions, legacy_builtins = {}, {}, {}
+        stored_keys, closed_conditions, legacy_conditions = {}, {}, {}
         for item in items:
             item["sources"] = json.loads(item["sources"])
             stored_missing = item.pop("missing")
@@ -1558,12 +1570,13 @@ class Store:
             if item["automatic"] and item["field"].startswith("key:"):
                 item["field"] = item["field"].lower()
                 stored_keys.setdefault((item["record_id"], item["field"]), set()).add(item["id"])
-            if (item["automatic"] and item["kind"] == "missing_conditions"
-                  and item["status"] in ("resolved", "dismissed")):
-                if coverage is not None:
-                    closed_conditions.setdefault(item["record_id"], set()).update(json.loads(coverage))
-                elif not item["field"]:
-                    legacy_builtins.setdefault(item["record_id"], {})[item["id"]] = item.get("missing")
+            if item["automatic"] and item["kind"] == "missing_conditions":
+                item.setdefault("missing", [])
+                if item["status"] in ("resolved", "dismissed"):
+                    if coverage is not None:
+                        closed_conditions.setdefault(item["record_id"], set()).update(json.loads(coverage))
+                    elif not item["field"]:
+                        legacy_conditions.setdefault(item["record_id"], {})[item["id"]] = item
             record = by_id.get(item["record_id"])
             if not record and not item["record_id"] and item["kind"] != "folder_import":
                 matches = [row for row in records if row["project_id"] == item["project_id"] and row["experiment_no"] == item["experiment_no"] and not is_dataset(row)]
@@ -1582,7 +1595,7 @@ class Store:
             issue_id = "conditions-" + record["id"]
             covered = closed_conditions.get(record["id"], set()).copy()
             if template:
-                fields = [(f"template:{template['revision']}:{field['key']}", field["label"])
+                fields = [(f"template:{record['project_id']}:{template['revision']}:{field['key']}", field["label"])
                           for field in missing_template_fields(template, details, "condition")]
             else:
                 missing = [field for field in ("precursor", "temperature", "duration") if record[field] is None or record[field] == ""]
@@ -1592,14 +1605,19 @@ class Store:
                 if not record_materials(record) and extra.get("Reaction medium") != "Solvent-free":
                     missing.append("materials")
                 fields = [(field, field) for field in missing]
-                legacy = legacy_builtins.get(record["id"])
-                if missing and legacy:
-                    # Older IDs hash all missing built-ins or the enabled subset.
-                    for size in range(1, len(PROJECT_BUILTINS) + 1):
-                        for names in combinations(PROJECT_BUILTINS, size):
-                            old_id = review_fingerprint(issue_id, names)
-                            if old_id in legacy:
-                                covered.update(legacy[old_id] or names)
+            legacy = legacy_conditions.get(record["id"])
+            if legacy:
+                # Legacy IDs hash labels, including enabled subsets of the four built-ins.
+                candidates = [[label for _, label in fields]] if template and fields else []
+                candidates.extend(names for size in range(1, len(PROJECT_BUILTINS) + 1)
+                                  for names in combinations(PROJECT_BUILTINS, size))
+                labels = set()
+                for names in candidates:
+                    old = legacy.get(review_fingerprint(issue_id, names))
+                    if old is not None:
+                        old["missing"] = old["missing"] or list(names)
+                        labels.update(old["missing"])
+                covered.update(identity for identity, label in fields if label in labels)
             remaining = [(identity, label) for identity, label in fields if identity not in covered]
             shown = [(identity, label) for identity, label in remaining
                      if template or project["settings"]["builtin"][identity]["enabled"]]
@@ -1633,10 +1651,11 @@ class Store:
                     if include_coverage:
                         item["coverage"] = coverage
                     existing = stored_keys.get((item["record_id"], item["field"]), set())
-                    if (not item["field"] and relevant != item["missing"]
-                            and (not relevant[0].startswith("template:") or any(label not in PROJECT_BUILTINS for label in item["missing"]))):
+                    if not item["field"] and relevant != item["missing"]:
                         # Legacy IDs used the enabled built-ins or unqualified template labels.
-                        existing = {review_fingerprint(item["id"], item["missing"])} & persistent.keys()
+                        old_id = review_fingerprint(item["id"], item["missing"])
+                        if persistent.get(old_id, {}).get("status") == "pending":
+                            existing = {old_id}
                 else:
                     relevant = [(file["id"], file["size"], (self.files / file["id"]).is_file())
                                 for file in by_id[item["record_id"]]["files"]]
@@ -1652,6 +1671,8 @@ class Store:
                                 persistent[match]["missing"] = item["missing"]
                                 if include_coverage:
                                     persistent[match]["coverage"] = coverage
+                            elif not persistent[match]["missing"]:
+                                persistent[match]["missing"] = item["missing"]
                     continue
             output.append(item)
         return {"items": [item for item in output if not item.get("automatic") or item["status"] != "pending" or item["id"] in generated_ids]}
@@ -1708,7 +1729,7 @@ class Store:
             shown = None
             if review["automatic"] and review["kind"] == "missing_conditions":
                 shown = next((item for item in self.review_list(include_coverage=True)["items"] if item["id"] == review_id), None)
-                if shown is None or payload.get("missing") != shown.get("missing", []):
+                if shown is None or payload.get("missing") != shown["missing"]:
                     raise Problem("待核对项已变化，请刷新后再处理。", 409)
             record_id = review["record_id"]
             if not record_id and review["kind"] != "folder_import":
@@ -2926,10 +2947,12 @@ class Store:
         Publish the database snapshot before updating the conventions file.
         """
         mirror = target / "data"
-        for folder in (mirror / "files", mirror / "review-sources", target / "db-history"):
+        history = target / "db-history"
+        for folder in (mirror / "files", mirror / "review-sources", history):
             folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         snapshot = mirror / ".part-experiments.sqlite3"
+        history_copy = history / ".part-experiments.sqlite3"
         snapshot.unlink(missing_ok=True)
         try:
             with self.file_copy_lock:
@@ -2971,22 +2994,30 @@ class Store:
             self.set_backup_progress(phase="database")
             database = mirror / "experiments.sqlite3"
             catalog_path = mirror / LOCAL_CATALOG
-            prepared = nullcontext() if conventions is None else prepare_local_catalog(catalog_path, conventions)
+            prepared = nullcontext() if conventions is None else prepare_file_replacement(catalog_path, conventions)
             with prepared as part:
+                shutil.copy2(snapshot, history_copy)
+                with history_copy.open("r+b") as copied_db:
+                    os.fsync(copied_db.fileno())
+                if self.file_digest(history_copy) != self.file_digest(snapshot):
+                    raise Problem("数据库快照完整性检查未通过，备份未完成。请查看服务日志。", 500)
                 os.replace(snapshot, database)
+                os.replace(history_copy, history / f"experiments-{stamp}.sqlite3")
                 if part is None:
                     catalog_path.unlink(missing_ok=True)
                 else:
                     os.replace(part, catalog_path)
-            shutil.copy2(database, target / "db-history" / f"experiments-{stamp}.sqlite3")
-            for old in sorted((target / "db-history").glob("experiments-*.sqlite3"))[:-DB_HISTORY_KEEP]:
+            for old in sorted(history.glob("experiments-*.sqlite3"))[:-DB_HISTORY_KEEP]:
                 old.unlink(missing_ok=True)
         finally:
             snapshot.unlink(missing_ok=True)
+            history_copy.unlink(missing_ok=True)
         info = {"app": "experiment-data-catalog-backup", "catalog_id": summary["catalog_id"], "schema_version": SCHEMA_VERSION,
                 "time": timestamp(), "records": summary["records"], "files": len(files), "review_sources": len(sources),
                 "bytes": sum(item["size"] for item in files)}
-        (target / BACKUP_MARKER).write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        marker = target / BACKUP_MARKER
+        with prepare_file_replacement(marker, json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8")) as part:
+            os.replace(part, marker)
         (target / "RESTORE.txt").write_text(
             "Experiment Data Catalog folder backup / 实验数据目录文件夹备份\n\n"
             "data/ is a complete catalog folder (database, attachments, source photos). db-history/ keeps earlier database snapshots.\n"
