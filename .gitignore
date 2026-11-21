@@ -5,6 +5,7 @@ local-catalog.json
 research/
 
 # Local tooling and outputs
+.venv-desktop/
 __pycache__/
 *.log
 *.zip

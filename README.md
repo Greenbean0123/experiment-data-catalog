@@ -4,16 +4,18 @@
 
 ## Windows 桌面试用版
 
-解压 `Experiment-Data-Catalog-Desktop-v0.1-Windows-x64.zip`，双击里面的 **Experiment Data Catalog.exe**。应用会在自己的窗口打开。程序包含 Python，界面使用系统安装的 Microsoft Edge WebView2 Runtime。
+解压 `Experiment-Data-Catalog-Desktop-v0.4.0-Windows-x64.zip`，双击里面的 **Experiment Data Catalog.exe**。应用会在自己的窗口打开。程序包含 Python，界面使用系统安装的 Microsoft Edge WebView2 Runtime。
 
 - 首次打开会在 `%LOCALAPPDATA%\ExperimentDataCatalog\data` 建立空白实验库。升级时更新解压的程序目录，数据目录可继续使用。
 - 使用现有实验库时，通过 `--data-dir` 传入含 `experiments.sqlite3` 和 `files` 的目录。在 PowerShell 中运行 `& ".\Experiment Data Catalog.exe" --data-dir "D:\实验数据\data"`。
 - 本地附件、实验包和备份通过系统保存窗口选择存放位置。关闭应用会停止其本地服务。关闭时若有草稿或正在执行的操作，应用会询问是否退出。
 - 桌面版使用本机端口 `18766`，日志在 `%LOCALAPPDATA%\ExperimentDataCatalog\desktop.log`。缺少 WebView2 时可从微软安装 Evergreen Runtime。
 
-开发构建在 Windows x64 上使用 Python 3.12 虚拟环境。安装 `requirements-desktop.txt` 后运行 `python package_desktop.py`，生成的 ZIP 位于 `dist`。
+- 程序没有代码签名，首次运行时 Windows SmartScreen 可能提示，选择“更多信息”→“仍要运行”。
 
-**Desktop trial (Windows x64).** Extract the ZIP and run **Experiment Data Catalog.exe**. The app uses the installed WebView2 Runtime and ships with Python. Its blank catalog is created at `%LOCALAPPDATA%\ExperimentDataCatalog\data`. Launch with `--data-dir` to open an existing catalog folder. Closing the app also stops its local service.
+开发构建在 Windows x64 上使用 Python 3.12（64 位）：`py -3.12 -m venv .venv-desktop`，`.venv-desktop\Scripts\python.exe -m pip install -r requirements-desktop.txt`，再运行 `.venv-desktop\Scripts\python.exe -I package_desktop.py`（`-I` 让构建不读取本机的 PYTHONPATH 等环境设置），生成的 ZIP 位于 `dist`。`test_desktop.py` 检查桌面入口，`dist` 中有 ZIP 时还会解压并启动其中的程序做冒烟测试。
+
+**Desktop trial (Windows x64).** Extract the ZIP and run **Experiment Data Catalog.exe**. The app uses the installed WebView2 Runtime and ships with Python. Its blank catalog is created at `%LOCALAPPDATA%\ExperimentDataCatalog\data`. Launch with `--data-dir` to open an existing catalog folder. Closing the app also stops its local service. The build is not code-signed, so SmartScreen may warn on first run. To build: `py -3.12 -m venv .venv-desktop`, install `requirements-desktop.txt` into it, then run `.venv-desktop\Scripts\python.exe -I package_desktop.py` (`-I` keeps PYTHONPATH and other local Python settings out of the build).
 
 ## 浏览器版
 

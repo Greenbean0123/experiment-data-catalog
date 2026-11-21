@@ -12,7 +12,7 @@ import threading
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from http.cookiejar import CookieJar
 from pathlib import Path
@@ -50,6 +50,26 @@ def serving(service):
     finally:
         service.shutdown()
         thread.join()
+
+
+def create_schema_zero_catalog(data_dir, *, file_id="old-file"):
+    """Create a populated catalog in the original unversioned layout."""
+    data_dir.mkdir()
+    with closing(sqlite3.connect(data_dir / "experiments.sqlite3")) as db, db:
+        db.execute("""CREATE TABLE experiments (
+            id TEXT PRIMARY KEY, sample_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            series TEXT NOT NULL, experiment_date TEXT NOT NULL, precursor TEXT NOT NULL,
+            temperature REAL, duration REAL, solvent TEXT NOT NULL, ligand TEXT NOT NULL,
+            status TEXT NOT NULL, notes TEXT NOT NULL, extra_conditions TEXT NOT NULL,
+            archived INTEGER NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        db.execute("INSERT INTO experiments VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   ("old", "XY-III-352-01", "NMR", "", "", None, 0, "", "", "待补全", "Original", "[]", 0, 4, "date", "date"))
+        db.execute("""CREATE TABLE files (id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                   name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                   source TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(experiment_id, name, kind))""")
+        db.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)", (file_id, "old", "raw.txt", "NMR", 3, hashlib.sha256(b"raw").hexdigest(), "original path", "date"))
+    (data_dir / "files").mkdir()
+    (data_dir / "files" / file_id).write_bytes(b"raw")
 
 
 class StoreTests(unittest.TestCase):
@@ -1463,22 +1483,7 @@ store.add_file("", "unfinished.csv", "XRD", io.BytesIO(b"1,2"), 3,
         self.assertEqual(row["files"][0]["experiment_id"], record_id)
 
         legacy = Path(self.folder.name) / "legacy"
-        legacy.mkdir()
-        with sqlite3.connect(legacy / "experiments.sqlite3") as db:
-            db.execute("""CREATE TABLE experiments (
-                id TEXT PRIMARY KEY, sample_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                series TEXT NOT NULL, experiment_date TEXT NOT NULL, precursor TEXT NOT NULL,
-                temperature REAL, duration REAL, solvent TEXT NOT NULL, ligand TEXT NOT NULL,
-                status TEXT NOT NULL, notes TEXT NOT NULL, extra_conditions TEXT NOT NULL,
-                archived INTEGER NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-            db.execute("INSERT INTO experiments VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       ("old", "XY-III-352-01", "NMR", "", "", None, 0, "", "", "待补全", "Original", "[]", 0, 4, "date", "date"))
-            db.execute("""CREATE TABLE files (id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
-                       name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
-                       source TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(experiment_id, name, kind))""")
-            db.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)", ("old-file", "old", "raw.txt", "NMR", 3, hashlib.sha256(b"raw").hexdigest(), "original path", "date"))
-        (legacy / "files").mkdir()
-        (legacy / "files/old-file").write_bytes(b"raw")
+        create_schema_zero_catalog(legacy)
         migrated = Store(legacy).list()[0]
         self.assertEqual(migrated["experiment_no"], "XY-III-352")
         self.assertEqual((migrated["id"], migrated["sample_id"], migrated["notes"], migrated["duration"], migrated["revision"]),
