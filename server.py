@@ -102,6 +102,8 @@ MAX_IMPORT_ROWS, MAX_IMPORT_COLUMNS = 2000, 100
 IMPORT_TTL = 30 * 60
 IMPORT_TABLE_LIMIT = "表格最多 2000 行、100 列，请拆分后再导入。"
 UNREADABLE_IMPORT = "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"
+IMPORT_READ_ERRORS = (ValueError, LookupError, StopIteration, OverflowError, OSError, EOFError, csv.Error,
+                      zipfile.BadZipFile, zlib.error, ElementTree.ParseError)
 EXPIRED_IMPORT = "导入文件已过期，请重新选择文件。"
 STALE_IMPORT = "数据已变化，请重新预览。"
 IMPORT_TARGETS = {"sample_id", "experiment_no", "series", "experiment_date", "precursors",
@@ -117,9 +119,10 @@ csv.field_size_limit(max(csv.field_size_limit(), MAX_RECORD_UPLOAD))
 
 
 class Problem(Exception):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, **details):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 class CatalogUnavailable(RuntimeError):
@@ -617,22 +620,16 @@ def csv_record_rows(data):
         source = data.decode("gb18030")
     if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", source):
         raise ValueError("Not a text CSV")
-    best, delimiter = (-1, -1, -1), ","
+    best, delimiter = (0, 0), ","
     for candidate in (",", ";", "\t"):
         reader = csv.reader(io.StringIO(source, newline=""), delimiter=candidate, strict=True)
+        widths = []
         try:
-            header = next(reader, None)
+            widths.extend(len(row) for row in islice(reader, 50))
         except csv.Error:
-            continue
-        if header is not None:
-            widths = []
-            try:
-                widths.extend(len(row) for row in islice(reader, 20) if row)
-            except csv.Error:
-                pass
-            width = len(header)
-            split = sum(other > 1 for other in widths)
-            score = (width > 1, widths.count(width) if width > 1 else split, split)
+            pass
+        if widths:
+            score = (widths.count(widths[0]), widths[0])
             if score > best:
                 best, delimiter = score, candidate
     return enumerate(csv.reader(io.StringIO(source, newline=""), delimiter=delimiter, strict=True))
@@ -695,18 +692,17 @@ def xlsx_record_rows(worksheet, shared, date_styles, date1904):
         raise ValueError("Missing worksheet data")
     row_index = 0
     for element in sheet_data.iterfind("./{*}row"):
-        ref = element.get("r", str(row_index + 1))
-        if not re.fullmatch(r"[1-9][0-9]{0,6}", ref) or int(ref) <= row_index:
-            raise ValueError("Invalid worksheet row")
-        row_index = int(ref)
+        ref = element.get("r")
         row, column = [], 0
         for cell in element.iterfind("./{*}c"):
             reference = cell.get("r")
             next_column = column + 1
             if reference:
-                match = re.fullmatch(r"([A-Za-z]{1,3})[1-9][0-9]{0,6}", reference)
+                match = re.fullmatch(r"([A-Za-z]{1,3})([1-9][0-9]{0,6})", reference)
                 if not match:
                     raise ValueError("Invalid worksheet column")
+                if ref is None:
+                    ref = match[2]
                 next_column = 0
                 for letter in match[1].upper():
                     next_column = 26 * next_column + ord(letter) - ord("A") + 1
@@ -722,6 +718,11 @@ def xlsx_record_rows(worksheet, shared, date_styles, date1904):
                 continue
             row.extend([""] * (column - len(row) - 1))
             row.append(value)
+        if ref is None:
+            ref = str(row_index + 1)
+        if not re.fullmatch(r"[1-9][0-9]{0,6}", ref) or int(ref) <= row_index:
+            raise ValueError("Invalid worksheet row")
+        row_index = int(ref)
         if row:
             yield row_index, row
 
@@ -756,17 +757,25 @@ def read_xlsx_record_table(data, requested_sheet):
             rel_id = next((value for attr, value in sheet.attrib.items() if attr.endswith("}id")), None)
             rel = relations.get(rel_id)
             if rel is not None and rel.get("Type", "").rsplit("/", 1)[-1] == "worksheet":
-                sheets[sheet.attrib["name"]] = xlsx_part(workbook_path, rel.attrib["Target"])
+                sheets[sheet.attrib["name"]] = rel
         selected = requested_sheet or next(iter(sheets))
-        support = {rel.get("Type", "").rsplit("/", 1)[-1]: xlsx_part(workbook_path, rel.attrib["Target"])
-                   for rel in relations.values() if rel.get("Type", "").endswith(("/sharedStrings", "/styles"))}
-        shared_path = support.get("sharedStrings", posixpath.join(parent, "sharedStrings.xml"))
-        styles_path = support.get("styles", posixpath.join(parent, "styles.xml"))
-        shared = [xlsx_string(item) for item in part(shared_path).iterfind("./{*}si")] if shared_path in book.namelist() else []
-        styles = xlsx_date_styles(part(styles_path)) if styles_path in book.namelist() else set()
-        properties = workbook.find("./{*}workbookPr")
-        date1904 = properties is not None and properties.get("date1904") in ("1", "true")
-        columns, rows = read_record_table(xlsx_record_rows(part(sheets[selected]), shared, styles, date1904))
+        relation = sheets[selected]
+        try:
+            sheet_path = xlsx_part(workbook_path, relation.attrib["Target"])
+            support = {rel.get("Type", "").rsplit("/", 1)[-1]: xlsx_part(workbook_path, rel.attrib["Target"])
+                       for rel in relations.values() if rel.get("Type", "").endswith(("/sharedStrings", "/styles"))}
+            shared_path = support.get("sharedStrings", posixpath.join(parent, "sharedStrings.xml"))
+            styles_path = support.get("styles", posixpath.join(parent, "styles.xml"))
+            shared = [xlsx_string(item) for item in part(shared_path).iterfind("./{*}si")] if shared_path in book.namelist() else []
+            styles = xlsx_date_styles(part(styles_path)) if styles_path in book.namelist() else set()
+            properties = workbook.find("./{*}workbookPr")
+            date1904 = properties is not None and properties.get("date1904") in ("1", "true")
+            columns, rows = read_record_table(xlsx_record_rows(part(sheet_path), shared, styles, date1904))
+        except Problem as exc:
+            exc.details.update(sheets=list(sheets), sheet=selected)
+            raise
+        except IMPORT_READ_ERRORS as exc:
+            raise Problem(UNREADABLE_IMPORT, sheets=list(sheets), sheet=selected) from exc
     return list(sheets), selected, columns, rows
 
 
@@ -802,13 +811,11 @@ def import_list(text):
     return [piece.strip() for piece in re.split(r"[;；、\r\n]| +\+ +", text) if piece.strip()]
 
 
-def import_number(text, unit, label, row):
+def import_number(text, unit):
     suffix = r"\s*(?:" + re.escape(unit) + ")?" if unit else ""
     match = re.fullmatch(r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)" + suffix, text)
     value = float(match[1]) if match else None
-    if value is None or not math.isfinite(value):
-        raise Problem(f"第 {row} 行 {label} 不是有效的数值。")
-    return value
+    return value if value is not None and math.isfinite(value) else None
 
 
 def record_import_values(row, cells, mapping, template, labels):
@@ -822,22 +829,27 @@ def record_import_values(row, cells, mapping, template, labels):
         elif not text:
             continue
         field = template.get(target)
+        extra_name = target[6:] if target.startswith("extra:") else ""
+        label = field["label"] if field else extra_name or labels[target]
+        unit = field["unit"] if field and field["type"] == "number" else IMPORT_UNITS.get(target)
+        value = raw
+        if unit is not None:
+            value = import_number(text, unit)
+            if value is None:
+                errors.append(f"第 {row} 行 {label} 不是有效的数值。")
+                continue
         try:
             if field:
-                value = raw if field["type"] == "text" else text
-                if field["type"] == "number":
-                    value = import_number(text, field["unit"], field["label"], row)
+                if field["type"] == "single":
+                    value = text
                 elif field["type"] == "multi":
                     value = import_list(text)
-                try:
-                    template_values[field["key"]] = validate_template_value(field, value)
-                except Problem as exc:
-                    raise Problem(f"{field['label']}：{exc}") from exc
-            elif target.startswith("extra:"):
+                template_values[field["key"]] = validate_template_value(field, value)
+            elif extra_name:
                 extra_count += 1
-                extra.append(validate_extra_condition({"name": target[6:], "value": raw}))
+                extra.append(validate_extra_condition({"name": extra_name, "value": raw}))
             elif target in IMPORT_UNITS:
-                values[target] = validate_numeric_condition(target, import_number(text, IMPORT_UNITS[target], labels[target], row))
+                values[target] = validate_numeric_condition(target, value)
             elif target in ("precursors", "solvents"):
                 values[target] = validate_condition_list(target[:-1], import_list(text))
             elif target == "experiment_date":
@@ -850,9 +862,9 @@ def record_import_values(row, cells, mapping, template, labels):
                     raise Problem("请填写样品编号。")
                 values[target] = value
         except Problem as exc:
-            errors.append(str(exc))
+            errors.append(f"第 {row} 行 {label}：{exc}")
     if extra_count > 30:
-        errors.append("自定义条件最多 30 项。")
+        errors.append(f"第 {row} 行 自定义条件：自定义条件最多 30 项。")
     if extra:
         values["extra_conditions"] = extra
     if template_values:
@@ -1807,13 +1819,24 @@ class Store:
                 GROUP BY b.id ORDER BY b.rowid DESC LIMIT 51 OFFSET ?""",
                               (record_id, record_id, project_id, project_id, offset)).fetchall()
             events = []
-            for row in db.execute("""SELECT e.*, r.sample_id FROM file_events e JOIN experiments r ON r.id=e.record_id
-                WHERE (?='' OR e.record_id=? OR e.action='move') AND (?='' OR r.project_id=?)
+            for row in db.execute("""SELECT e.*, r.sample_id, f.experiment_id AS owner_id FROM file_events e
+                LEFT JOIN experiments r ON r.id=e.record_id LEFT JOIN files f ON f.id=e.file_id
+                WHERE (?='' OR e.record_id=? OR e.action='move' OR r.id IS NULL)
+                  AND (?='' OR r.project_id=? OR r.id IS NULL)
                 ORDER BY e.rowid DESC""", (record_id, record_id, project_id, project_id)):
                 event = dict(row)
+                owner_id = event.pop("owner_id")
                 for field in ("before", "after"):
                     event[field] = json.loads(event[field]) if event[field] else None
-                if record_id and event["record_id"] != record_id and event["after"]["record_id"] != record_id:
+                after_id = event["after"]["record_id"] if event["after"] else None
+                if event["sample_id"] is None:
+                    related = db.execute("""SELECT sample_id FROM experiments WHERE id IN (?, ?)
+                        AND (?='' OR id=?) AND (?='' OR project_id=?) ORDER BY id=? DESC LIMIT 1""",
+                                         (after_id, owner_id, record_id, record_id, project_id, project_id, after_id)).fetchone()
+                    if related is None:
+                        continue
+                    event["sample_id"] = related["sample_id"]
+                elif record_id and event["record_id"] != record_id and after_id != record_id:
                     continue
                 events.append(event)
                 if len(events) == 200:
@@ -2335,7 +2358,14 @@ class Store:
                 db.execute(f"DELETE FROM review_items WHERE id IN ({reviews})", args * 2)
                 db.execute(f"DELETE FROM record_sources WHERE record_id IN ({demo_records})", args)
                 db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({demo_files})", args)
-                db.execute(f"DELETE FROM file_events WHERE record_id IN ({demo_records}) OR file_id IN ({demo_files})", args * 2)
+                real_records = {row["id"] for row in db.execute("SELECT id FROM experiments WHERE project_id<>?", args)}
+                events = db.execute("""SELECT e.id, e.after, f.experiment_id AS owner_id FROM file_events e
+                    LEFT JOIN experiments r ON r.id=e.record_id LEFT JOIN files f ON f.id=e.file_id
+                    WHERE r.project_id=? OR r.id IS NULL""", args)
+                # The event's record_id is the before owner when a before state exists.
+                demo_events = [(event["id"],) for event in events if event["owner_id"] not in real_records
+                               and (not event["after"] or json.loads(event["after"])["record_id"] not in real_records)]
+                db.executemany("DELETE FROM file_events WHERE id=?", demo_events)
                 db.execute(f"DELETE FROM files WHERE id IN ({demo_files})", args)
                 count = db.execute("DELETE FROM experiments WHERE project_id=?", args).rowcount
                 for table in ("template_versions", "project_settings", "experiment_defaults"):
@@ -2366,8 +2396,7 @@ class Store:
                 sheets, selected, columns, rows = read_xlsx_record_table(data, sheet)
             else:
                 raise ValueError("Unsupported spreadsheet type")
-        except (ValueError, LookupError, StopIteration, OverflowError, OSError, EOFError, csv.Error,
-                zipfile.BadZipFile, zlib.error, ElementTree.ParseError) as exc:
+        except IMPORT_READ_ERRORS as exc:
             raise Problem(UNREADABLE_IMPORT) from exc
         upload_id = uuid.uuid4().hex
         with self.lock:
@@ -2404,7 +2433,9 @@ class Store:
                 if commit:
                     raise Problem(STALE_IMPORT, 409)
                 raise Problem("字段与所选模板版本不匹配。")
-            labels, disabled = {}, set()
+            labels = {"sample_id": "样品编号", "experiment_no": "实验编号", "series": "实验系列",
+                      "experiment_date": "实验日期", "notes": "备注"}
+            disabled = set()
             for field, (label, builtin_columns) in PROJECT_BUILTINS.items():
                 entry = settings["settings"]["builtin"][field]
                 label = entry["label"]["zh"] or label
@@ -2428,9 +2459,9 @@ class Store:
                 if duplicate:
                     duplicates.append((number, duplicate))
                 if repeated:
-                    errors.append("同一文件中样品编号重复。")
+                    errors.append(f"第 {number} 行 {labels['sample_id']}：同一文件中样品编号重复。")
                 if duplicate and existing == "fail":
-                    errors.append(DUPLICATE_SAMPLE)
+                    errors.append(f"第 {number} 行 {labels['sample_id']}：{DUPLICATE_SAMPLE}")
                 elif duplicate and not repeated:
                     errors = []
                 action = "error" if errors else ("skip" if duplicate else "create")
@@ -4147,7 +4178,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_headers(exc.status, "text/plain; charset=utf-8", len(message))
                 self.wfile.write(message)
                 return
-            self.send_json({"error": str(exc)}, exc.status)
+            self.send_json({"error": str(exc), **exc.details}, exc.status)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception:

@@ -2887,6 +2887,7 @@ class Milestone3Tests(unittest.TestCase):
         revisions = {row["id"]: row["revision"] for row in self.store.list()}
         self.store.bulk_update({"preview": False, "records": [{"id": key, "revision": revisions[key]} for key in (sample["id"], real_id)],
                                 "changes": {"duration": {"mode": "set", "value": 10}}})
+        bulk_batch = self.request_json("/api/history")["batches"][0]["id"]
         with self.store.connect() as db:
             self.store.write_shared_defaults(db, "demo", sample["experiment_no"].lower(), server.EMPTY_SHARED_STATE)
             self.store.write_shared_defaults(db, "default", "m3-real", server.EMPTY_SHARED_STATE)
@@ -2898,6 +2899,8 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"), {"deleted_records": 12, "deleted_files": 5})
         self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE", 404), {"error": "没有示例实验库。"})
         self.assertEqual(self.store.list(), [real])
+        remaining = self.request_json(f"/api/history/{bulk_batch}")
+        self.assertEqual((remaining["action"], [row["id"] for row in remaining["rows"]]), ("bulk", [real_id]))
         self.assertEqual(self.request_json("/api/experiments")["onboarding"], {"done": False, "empty": False})
         self.assertEqual((self.store.files / real_file).read_bytes(), b"real")
         self.assertFalse(any((self.store.files / file_id).exists() for file_id in demo_files))
@@ -2915,6 +2918,39 @@ class Milestone3Tests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(self.request_json(route, {}, "POST", 201), created)
         self.assertEqual(content([row for row in self.store.list() if row["project_id"] == "demo"]), original)
+
+    def test_demo_deletion_preserves_file_events_with_surviving_records_or_files(self):
+        self.store.create_demo()
+        source = self.store.save({"sample_id": "Source"})
+        target = self.store.save({"sample_id": "Destination"})
+        kept = self.store.add_file(source, "kept.csv", "XRD", io.BytesIO(b"keep"), 4)
+        returned = self.store.add_file(source, "returned.csv", "XRD", io.BytesIO(b"demo"), 4)
+
+        def move(file_id, owner, destination):
+            revisions = {row["id"]: row["revision"] for row in self.store.list()}
+            self.request_json(f"/api/files/{file_id}/update", {
+                "record_revision": revisions[owner], "target_record_id": destination, "target_revision": revisions[destination],
+            }, "POST")
+
+        move(kept, source, target)
+        move(returned, source, target)
+        move(returned, target, source)
+        record = next(row for row in self.store.list() if row["id"] == source)
+        self.store.save({**record, "project_id": "demo"}, source)
+
+        before = self.request_json("/api/history")["file_events"]
+        expected = [dict(event, sample_id="Destination") for event in before
+                    if event["action"] == "move" or event["file_id"] == kept]
+        self.assertEqual([event["action"] for event in expected], ["move", "move", "move", "upload"])
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 13, "deleted_files": 5})
+        for query in ("", f"?record_id={target}", "?project_id=default"):
+            with self.subTest(query=query):
+                self.assertEqual(self.request_json("/api/history" + query)["file_events"], expected)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM file_events").fetchone()[0], len(expected))
+        self.assertEqual(self.request(f"/api/files/{kept}")[1], b"keep")
+        self.assertFalse((self.store.files / returned).exists())
 
     def test_demo_file_publication_rolls_back_with_database(self):
         with patch.object(self.store, "log_history", side_effect=RuntimeError("test rollback")):
@@ -2938,19 +2974,20 @@ class Milestone3Tests(unittest.TestCase):
                 writer = csv.writer(source, delimiter=delimiter)
                 writer.writerow(["样品编号", "", "备注"])
                 writer.writerow(["实验 A", "250 °C", "两行; a, b\n第二行"])
-                writer.writerows([[str(index), "1", ""] for index in range(20)])
+                writer.writerows([[str(index), "1", ""] for index in range(49)])
                 data = self.parse_upload("试验.CSV", source.getvalue().encode(encoding))
                 self.assertEqual((data["format"], data["sheets"], data["sheet"]), ("csv", [], ""))
                 self.assertEqual(data["columns"], ["样品编号", "列 2", "备注"])
                 self.assertEqual(data["rows"][0], ["实验 A", "250 °C", "两行; a, b\n第二行"])
-                self.assertEqual((data["total_rows"], len(data["rows"])), (21, 20))
+                self.assertEqual((data["total_rows"], len(data["rows"])), (50, 20))
                 self.assertRegex(data["upload_id"], r"^[0-9a-f]{32}$")
 
-        for data in (b"x\n" + b"row\n" * 2001, b"x\n" + b"a," * 100 + b"a", b"a," * 100 + b"a\n"):
+        comma_sample = b"x,\n" * 50
+        for data in (b"x\n" + b"row\n" * 2001, comma_sample + b"a," * 100 + b"a", b"a," * 100 + b"a\n"):
             self.assertEqual(self.parse_upload("large.csv", data, status=400),
                              {"error": "表格最多 2000 行、100 列，请拆分后再导入。"})
-        boundary = self.parse_upload("limit.csv", b"x\n" + (b"a," * 99 + b"a\n") * 2000)
-        self.assertEqual((boundary["total_rows"], len(boundary["columns"])), (2000, 100))
+        boundary = self.parse_upload("limit.csv", comma_sample + (b"a," * 99 + b"a\n") * 1951)
+        self.assertEqual((boundary["total_rows"], len(boundary["columns"]), boundary["columns"][-1]), (2000, 100, "列 100"))
         for name, data in (("test.csv", b"\xff"), ("test.csv", b'a,b\n"unclosed'), ("test.csv", b""),
                            ("test.xlsx", b"a,b\n"), ("test.xls", b"a,b\n")):
             self.assertEqual(self.parse_upload(name, data, status=400),
@@ -2960,6 +2997,21 @@ class Milestone3Tests(unittest.TestCase):
         status, payload, _ = self.request(route, b"", "POST",
                                           headers={"Content-Length": str(5 * 1024 * 1024 + 1)})
         self.assertEqual((status, json.loads(payload)), (413, {"error": "请求过大或长度无效。"}))
+
+    def test_record_import_csv_delimiter_uses_consistency_then_header_width_and_order(self):
+        parsed = self.parse_upload("Semicolons.csv", b"Sample ID;Notes;Temperature, C\nA1;washed, dried;25\nA2;rinsed, spun;40\n")
+        self.assertEqual(parsed["columns"], ["Sample ID", "Notes", "Temperature, C"])
+        self.assertEqual(parsed["rows"], [["A1", "washed, dried", "25"], ["A2", "rinsed, spun", "40"]])
+
+        header = b"ID,Notes;Status;Unit\n"
+        more_consistent = self.parse_upload("Consistency.csv", header + b"A,ready;OK;C\n" * 20 + b"B,waiting;Hold\n" * 29)
+        self.assertEqual(more_consistent["columns"], ["ID", "Notes;Status;Unit"])
+        first_fifty = self.parse_upload("Sample.csv", header + b"A,ready;OK;C\n" * 49 + b"B,ready\n" * 60)
+        self.assertEqual(first_fifty["columns"], ["ID,Notes", "Status", "Unit"])
+        tied = self.parse_upload("Tie.csv", b"ID,Notes;Status\tUnit\nA,ready;OK\tC\n")
+        self.assertEqual(tied["columns"], ["ID", "Notes;Status\tUnit"])
+        single_column = self.parse_upload("Notes.csv", b"Notes\nwashed, dried\nrinsed, spun\n")
+        self.assertEqual((single_column["columns"], single_column["rows"]), (["Notes"], [["washed, dried"], ["rinsed, spun"]]))
 
     def test_record_import_xlsx_shared_inline_formulas_dates_and_sheet_selection(self):
         ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -3027,18 +3079,43 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.parse_upload("Blank first sheet.xlsx", blank, "Second sheet")["rows"], selected["rows"])
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             path = "xl/workbook.xml"
-            workbook = archive.read(path).replace(b"<sheets>", b'<workbookPr date1904="1"/><sheets>')
-        shifted = self.parse_upload("1904.xlsx", replace_xlsx_parts({path: workbook}))
+            workbook = archive.read(path)
+        shifted = self.parse_upload("1904.xlsx", replace_xlsx_parts({
+            path: workbook.replace(b"<sheets>", b'<workbookPr date1904="1"/><sheets>'),
+        }))
         self.assertEqual(shifted["rows"][0][2], "2028-01-02")
-        for body in ('<row r="1"><c r="CW1"><v>1</v></c></row>',
-                     "".join(f'<row r="{i}"><c><v>{i}</v></c></row>' for i in range(1, 2003))):
-            oversized = replace_xlsx_parts({"xl/worksheets/sheet1.xml": f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'})
-            self.assertEqual(self.parse_upload("Oversized.xlsx", oversized, status=400),
-                             {"error": "表格最多 2000 行、100 列，请拆分后再导入。"})
+        workbook = workbook.replace("主表".encode("utf-8"), b"Overview").replace(b"Second sheet", b"Samples")
+        for body, message in (
+            ('<row r="1"><c r="CW1"><v>1</v></c></row>', "表格最多 2000 行、100 列，请拆分后再导入。"),
+            ("".join(f'<row r="{i}"><c><v>{i}</v></c></row>' for i in range(1, 2003)), "表格最多 2000 行、100 列，请拆分后再导入。"),
+            ("<row>", "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"),
+        ):
+            invalid = replace_xlsx_parts({
+                path: workbook,
+                "xl/worksheets/sheet1.xml": f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>',
+            })
+            expected = {"error": message, "sheets": ["Overview", "Samples"], "sheet": "Overview"}
+            self.assertEqual(self.parse_upload("Retry.xlsx", invalid, status=400), expected)
+            self.assertEqual(self.parse_upload("Retry.xlsx", invalid, "Overview", status=400), expected)
+            self.assertEqual(self.parse_upload("Retry.xlsx", invalid, "Samples")["rows"], selected["rows"])
+
+        sparse = replace_xlsx_parts({"xl/worksheets/sheet2.xml": f'<worksheet xmlns="{ns}"><sheetData>'
+                                     '<row><c r="A1" t="str"><v>Sample ID</v></c><c r="B1" t="str"><v>Temperature</v></c></row>'
+                                     '<row><c r="A5" t="str"><v>Sample 5</v></c><c><v>2 K</v></c></row>'
+                                     '<row><c t="str"><v>Sample 6</v></c></row>'
+                                     '<row><c t="str"><v>Sample 9</v></c><c r="B9"><v>25</v></c></row>'
+                                     '</sheetData></worksheet>'})
+        upload = self.parse_upload("Sparse.xlsx", sparse, "Second sheet")
+        preview = self.request_json("/api/import/records/preview", {
+            "upload_id": upload["upload_id"], "project_id": "default", "existing": "skip",
+            "mapping": {"0": "sample_id", "1": "temperature"},
+        }, "POST")
+        self.assertEqual([row["row"] for row in preview["rows"]], [4, 5, 8])
+        self.assertEqual(preview["rows"][0]["errors"], ["第 4 行 温度 不是有效的数值。"])
 
     def import_payload(self, targets, rows, project="default", existing="skip"):
         source = io.StringIO(newline="")
-        writer = csv.writer(source)
+        writer = csv.writer(source, quoting=csv.QUOTE_ALL)
         writer.writerow([target or "unmapped" for target in targets])
         writer.writerows(rows)
         upload = self.parse_upload("records.csv", source.getvalue().encode("utf-8"))
@@ -3081,19 +3158,25 @@ class Milestone3Tests(unittest.TestCase):
                        "lab_data": {"template_revision": 1, "values": {"0": "Glass", "1": 120, "2": ["Fast", "Slow"]}}},
         })
         self.assertEqual(rows[1]["errors"], [
-            "实验日期格式应为 YYYY-MM-DD。", "请选择最多 20 项前驱体，每个名称最多 250 个字符。", "第 2 行 温度 不是有效的数值。",
-            "duration 必须是 0 到 100000 范围内的有限数值，未知时留空。", "notes 格式不正确或内容过长。",
-            "Substrate：请选择模板中已有的选项。", "第 2 行 Thickness 不是有效的数值。", "Ramps：请选择模板中已有的选项。",
-            "自定义条件的名称、数值和单位应为简短文本。",
+            "第 2 行 实验日期：实验日期格式应为 YYYY-MM-DD。",
+            "第 2 行 前驱体：请选择最多 20 项前驱体，每个名称最多 250 个字符。",
+            "第 2 行 温度 不是有效的数值。",
+            "第 2 行 反应/取样时间：duration 必须是 0 到 100000 范围内的有限数值，未知时留空。",
+            "第 2 行 备注：notes 格式不正确或内容过长。",
+            "第 2 行 Substrate：请选择模板中已有的选项。",
+            "第 2 行 Thickness 不是有效的数值。",
+            "第 2 行 Ramps：请选择模板中已有的选项。",
+            "第 2 行 压力：自定义条件的名称、数值和单位应为简短文本。",
         ])
-        self.assertEqual((rows[2]["errors"], rows[2]["values"]["experiment_date"]), (["同一文件中样品编号重复。"], "2024-02-29"))
+        self.assertEqual(rows[2]["errors"], ["第 3 行 样品编号：同一文件中样品编号重复。"])
+        self.assertEqual(rows[2]["values"]["experiment_date"], "2024-02-29")
         self.assertEqual((rows[3]["action"], rows[3]["errors"]), ("skip", []))
-        self.assertEqual(rows[4]["errors"], ["同一文件中样品编号重复。"])
-        self.assertEqual(rows[5]["errors"], ["请填写样品编号。"])
+        self.assertEqual(rows[4]["errors"], ["第 5 行 样品编号：同一文件中样品编号重复。"])
+        self.assertEqual(rows[5]["errors"], ["第 6 行 样品编号：请填写样品编号。"])
         fail = self.request_json(path, {**body, "existing": "fail"}, "POST")
         duplicate = "该项目内样品编号已存在（含已归档记录）。请使用不同编号。"
-        self.assertEqual(fail["rows"][3]["errors"], ["第 4 行 温度 不是有效的数值。", duplicate])
-        self.assertEqual(fail["rows"][4]["errors"], ["同一文件中样品编号重复。", duplicate])
+        self.assertEqual(fail["rows"][3]["errors"], ["第 4 行 温度 不是有效的数值。", f"第 4 行 样品编号：{duplicate}"])
+        self.assertEqual(fail["rows"][4]["errors"], ["第 5 行 样品编号：同一文件中样品编号重复。", f"第 5 行 样品编号：{duplicate}"])
         self.assertNotEqual(fail["token"], preview["token"])
         self.assertEqual(self.request_json("/api/import/records/commit", {**body, "token": preview["token"]}, "POST", 400),
                          {"error": "还有 4 行有错误，请修正后再导入。"})
