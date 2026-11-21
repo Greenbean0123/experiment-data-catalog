@@ -2964,8 +2964,9 @@ class Milestone3Tests(unittest.TestCase):
             self.assertIsNone(self.store.setting(db, "demo_project_id"))
             self.assertIsNone(self.store.setting(db, "demo_contents"))
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
-        self.assertEqual(self.request_json(route, {}, "POST", 201), created)
-        self.assertEqual(content([row for row in self.store.list() if row["project_id"] == "demo"]), original)
+        recreated = self.request_json(route, {}, "POST", 201)
+        self.assertEqual(recreated, {**created, "project_id": "demo-2"})
+        self.assertEqual(content([row for row in self.store.list() if row["project_id"] == recreated["project_id"]]), original)
 
     def test_demo_deletion_keeps_a_new_sample_and_allows_a_new_demo(self):
         route = "/api/demo"
@@ -3054,6 +3055,83 @@ class Milestone3Tests(unittest.TestCase):
         with self.store.connect() as db:
             review = db.execute("SELECT record_id, project_id FROM review_items WHERE id=?", (review_id,)).fetchone()
             self.assertEqual(tuple(review), (record_id, "default"))
+
+    def test_demo_deletion_keeps_unlinked_folder_review(self):
+        demo_id = self.request_json("/api/demo", {}, "POST", 201)["project_id"]
+        folder_file = {"path": "Example folder/unmatched.csv", "sample_id": "M3 Unmatched", "kind": "XRD", "size": 10}
+        plan, = self.request_json("/api/folder-import/preview", {
+            "project_id": demo_id, "create": False, "files": [folder_file],
+        }, "POST")["rows"]
+        self.assertEqual((plan["action"], plan["reason"]), ("review", "sample"))
+        self.assertEqual(self.request_json("/api/folder-import/issues", {
+            "project_id": demo_id, "batch_id": "a" * 32, "issues": [plan],
+        }, "POST", 201), {"created": 1, "pending": 1})
+        review, = [item for item in self.request_json("/api/reviews")["items"] if item["kind"] == "folder_import"]
+        self.assertIsNone(review["record_id"])
+
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 0, "project_kept": True})
+        catalog = self.request_json("/api/experiments")
+        self.assertIsNone(catalog["demo_project_id"])
+        self.assertIn(demo_id, {project["id"] for project in catalog["projects"]})
+        self.assertEqual(self.request_json("/api/reviews")["items"], [review])
+
+    def test_demo_deletion_restores_warning_for_record_moved_out(self):
+        demo_id = self.request_json("/api/demo", {}, "POST", 201)["project_id"]
+        sample = self.request_json("/api/experiments", {
+            "sample_id": "M3 Review Sample", "precursor": "Example precursor", "solvent": "Example solvent", "duration": 10,
+        }, "POST", 201)["record"]
+        path = f"/api/experiments/{sample['id']}"
+        sample = self.request_json(path, {**sample, "project_id": demo_id}, "PUT")["record"]
+        reviews = "/api/reviews"
+        warning, = [item for item in self.request_json(reviews)["items"]
+                    if item["record_id"] == sample["id"] and item["kind"] == "missing_conditions"
+                    and "temperature" in item["missing"]]
+        self.assertEqual(warning["missing"], ["temperature"])
+        review = self.request_json(reviews, {"issue_id": warning["id"]}, "POST", 201)
+        self.request_json(f"{reviews}/{review['id']}/decide", {
+            "preview": False, "revision": review["revision"], "record_revision": sample["revision"],
+            "status": "dismissed", "missing": warning["missing"], "note": "Example decision",
+        }, "POST")
+        self.request_json(path, {**sample, "project_id": "default"}, "PUT")
+        closed = next(item for item in self.request_json(reviews)["items"] if item["id"] == review["id"])
+
+        self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE")
+        items = self.request_json(reviews)["items"]
+        self.assertEqual(next(item for item in items if item["id"] == review["id"]), {**closed, "project_id": "default"})
+        pending = [item["missing"] for item in items if item["record_id"] == sample["id"]
+                   and item["project_id"] == "default" and item["kind"] == "missing_conditions" and item["status"] == "pending"]
+        self.assertEqual(pending, [["temperature"]])
+
+    def test_demo_recreation_keeps_undo_to_deleted_project_blocked(self):
+        route = "/api/demo"
+        demo_id = self.request_json(route, {}, "POST", 201)["project_id"]
+        sample = self.request_json("/api/experiments", {"sample_id": "M3 Undo Sample"}, "POST", 201)["record"]
+        path = f"/api/experiments/{sample['id']}"
+        sample = self.request_json(path, {**sample, "project_id": demo_id}, "PUT")["record"]
+        self.request_json(path, {**sample, "project_id": "default"}, "PUT")
+        batch_id = self.request_json(f"/api/history?record_id={sample['id']}")["batches"][0]["id"]
+        undo = f"/api/history/{batch_id}/undo"
+
+        self.request_json(route, {"confirm": "delete-demo"}, "DELETE")
+        self.request_json(undo, {"preview": True}, "POST", 409)
+        new_id = self.request_json(route, {}, "POST", 201)["project_id"]
+        self.assertEqual(self.request_json(undo, {"preview": True}, "POST", 409),
+                         {"error": "原项目已不存在，无法恢复这次修改。"})
+        self.assertEqual((demo_id, new_id), ("demo", "demo-2"))
+
+    def test_demo_creation_restores_missing_xrd_category(self):
+        self.request_json("/api/categories", {"name": "XRD"}, "DELETE")
+        self.assertNotIn("XRD", self.request_json("/api/experiments")["category_counts"])
+        demo_id = self.request_json("/api/demo", {}, "POST", 201)["project_id"]
+        catalog = self.request_json("/api/experiments")
+        curves = [file for row in catalog["experiments"] if row["project_id"] == demo_id for file in row["files"]]
+        self.assertEqual([file["kind"] for file in curves], ["XRD"] * 4)
+        self.assertTrue(all(file["name"].endswith("-XRD.csv") for file in curves))
+        self.assertEqual(catalog["category_counts"]["XRD"], {"active": 4, "trashed": 0})
+
+        self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE")
+        self.assertEqual(self.request_json("/api/experiments")["category_counts"]["XRD"], {"active": 0, "trashed": 0})
 
     def test_demo_deletion_rejects_cross_moved_files_until_returned(self):
         self.store.create_demo()

@@ -1887,8 +1887,6 @@ class Store:
             if payload[key] is None:
                 del payload[key]
         validate(payload)
-        if not db.execute("SELECT 1 FROM projects WHERE id=?", (state["project_id"],)).fetchone():
-            raise Problem("原项目已不存在，无法恢复这次修改。", 409)
         self.validate_lab_data(db, state["project_id"], record_id, payload["lab_data"], state["status"], is_dataset(state))
         self.check_child_links(db, record_id, state["project_id"], is_dataset(state))
 
@@ -1939,6 +1937,8 @@ class Store:
                     if before["lab_data"] != after["lab_data"]:
                         changed["lab_data"] = restore_lab_fields(before["lab_data"], after["lab_data"], current["lab_data"])
                     restored = {**state, **changed}
+                    if not db.execute("SELECT 1 FROM projects WHERE id=?", (restored["project_id"],)).fetchone():
+                        raise Problem("原项目已不存在，无法恢复这次修改。", 409)
                     if restored["project_id"] != current["project_id"] and json.loads(restored["lab_data"]).get("template_revision"):
                         raise Problem("此样品使用当前项目的模板，无法撤销到其他项目。", 409)
                     try:
@@ -2308,10 +2308,11 @@ class Store:
                 project_ids = {row["id"] for row in projects}
                 if self.setting(db, "demo_project_id") in project_ids:
                     raise Problem("示例实验库已存在。", 409)
-                project_id, suffix = DEMO_PROJECT, 1
+                demo_number = self.setting(db, "demo_number", 0) + 1
+                project_id = DEMO_PROJECT if demo_number == 1 else f"{DEMO_PROJECT}-{demo_number}"
                 while project_id in project_ids:
-                    suffix += 1
-                    project_id = f"{DEMO_PROJECT}-{suffix}"
+                    demo_number += 1
+                    project_id = f"{DEMO_PROJECT}-{demo_number}"
                 names = {row["name"].casefold() for row in projects}
                 name, suffix = DEMO_NAME, 1
                 while name.casefold() in names:
@@ -2319,6 +2320,7 @@ class Store:
                     name = f"{DEMO_NAME} {suffix}"
                 db.execute("INSERT INTO projects VALUES (?,?)", (project_id, name))
                 self.write_setting(db, "demo_project_id", project_id)
+                self.write_setting(db, "demo_number", demo_number)
                 template = validate_template({"name": "薄膜制备示例", "fields": [
                     {"label": "基底", "section": "condition", "type": "single", "options": ["玻璃", "硅片"]},
                     {"label": "膜厚", "section": "condition", "type": "number", "unit": "nm"},
@@ -2331,7 +2333,8 @@ class Store:
                 ]}, template)
                 db.execute("INSERT INTO template_versions VALUES (?,1,?)", (project_id, json.dumps(template, ensure_ascii=False)))
                 db.execute("INSERT INTO project_settings VALUES (?,?,1)", (project_id, json.dumps(settings, ensure_ascii=False)))
-                kind = db.execute("SELECT name FROM categories ORDER BY (name='XRD') DESC, rowid LIMIT 1").fetchone()[0]
+                db.execute("INSERT OR IGNORE INTO categories VALUES ('XRD')")
+                kind = db.execute("SELECT name FROM categories WHERE name='XRD'").fetchone()[0]
                 now = timestamp()
                 for index in range(DEMO_RECORD_COUNT):
                     group, sample = divmod(index, 4)
@@ -2428,20 +2431,19 @@ class Store:
                     raise Problem(DEMO_CONTENTS_CONFLICT, 409)
                 kept_records = db.execute(f"SELECT count(*) FROM experiments WHERE project_id=? AND id NOT IN ({record_slots})",
                                           (project_id, *record_ids)).fetchone()[0]
+                project_kept = kept_records > 0 or db.execute(
+                    "SELECT 1 FROM review_items WHERE project_id=? AND record_id IS NULL LIMIT 1", (project_id,)
+                ).fetchone() is not None
                 pending = dict(db.execute(f"SELECT id,size FROM files WHERE id IN ({file_slots})", file_ids))
                 batches = db.execute(f"SELECT DISTINCT batch_id FROM history_entries WHERE record_id IN ({record_slots})",
                                      record_ids).fetchall()
                 db.execute(f"DELETE FROM history_entries WHERE record_id IN ({record_slots})", record_ids)
                 db.executemany("DELETE FROM history_batches WHERE id=? AND NOT EXISTS "
                                "(SELECT 1 FROM history_entries WHERE batch_id=history_batches.id)", batches)
-                review_filter = f"record_id IN ({record_slots})"
-                review_args = record_ids
-                if not kept_records:
-                    review_filter += " OR (project_id=? AND record_id IS NULL)"
-                    review_args += (project_id,)
                 db.execute(f"""UPDATE history_batches SET review_id=NULL,review_revision=NULL
-                               WHERE review_id IN (SELECT id FROM review_items WHERE {review_filter})""", review_args)
-                db.execute(f"DELETE FROM review_items WHERE {review_filter}", review_args)
+                               WHERE review_id IN (SELECT id FROM review_items WHERE record_id IN ({record_slots}))""",
+                           record_ids)
+                db.execute(f"DELETE FROM review_items WHERE record_id IN ({record_slots})", record_ids)
                 db.execute(f"DELETE FROM record_sources WHERE record_id IN ({record_slots})", record_ids)
                 db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({file_slots})", file_ids)
                 db.execute(f"DELETE FROM file_events WHERE file_id IN ({file_slots}) OR record_id IN ({record_slots})",
@@ -2454,19 +2456,23 @@ class Store:
                 db.execute(f"DELETE FROM files WHERE id IN ({file_slots})", file_ids)
                 count = db.execute(f"DELETE FROM experiments WHERE id IN ({record_slots})", record_ids).rowcount
                 self.clear_deleted_demo_links(db, records, files)
-                if not kept_records:
-                    db.execute("""UPDATE review_items SET project_id=(
+                if not project_kept:
+                    db.execute("""UPDATE review_items SET coverage='[]', project_id=(
                                       SELECT project_id FROM experiments WHERE id=review_items.record_id)
                                   WHERE project_id=?""", (project_id,))
                     for table in ("template_versions", "project_settings", "experiment_defaults"):
                         db.execute(f"DELETE FROM {table} WHERE project_id=?", (project_id,))
                     db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+                if self.setting(db, "demo_number") is None:
+                    # Preserve the id of a demo created before the counter was added.
+                    demo_number = 1 if project_id == DEMO_PROJECT else int(project_id.removeprefix(f"{DEMO_PROJECT}-"))
+                    self.write_setting(db, "demo_number", demo_number)
                 db.execute("DELETE FROM app_settings WHERE key IN ('demo_project_id', 'demo_contents')")
                 db.executemany("INSERT OR REPLACE INTO app_settings VALUES (?,?)",
                                ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
             self.unlink_purged_files(pending)
         return {"deleted_records": count, "deleted_files": len(pending),
-                "kept_records": kept_records, "project_kept": bool(kept_records)}
+                "kept_records": kept_records, "project_kept": project_kept}
 
     def expire_record_uploads(self):
         now = monotonic()
