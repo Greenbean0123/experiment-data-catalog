@@ -432,6 +432,7 @@ class StoreTests(unittest.TestCase):
             with self.store.connect() as db:
                 db.execute("UPDATE review_items SET id=?, missing=NULL, coverage=NULL WHERE id=?", (legacy, issue["id"]))
 
+        self.store = Store(self.store.data)
         self.store.save_project_settings("default", {"revision": 1, "settings": {}})
         items = self.store.review_list()["items"]
         for record, (legacy, status) in legacy_ids.items():
@@ -2075,6 +2076,7 @@ class HTTPTests(unittest.TestCase):
         store.add_review({"issue_id": fingerprint})
         with store.connect() as db:
             db.execute("UPDATE review_items SET status='dismissed', missing=NULL, coverage=NULL WHERE id=?", (fingerprint,))
+        self.server.store = Store(store.data)
 
         def issue():
             current, = [item for item in self.request_json("/api/reviews")["items"]
@@ -2263,9 +2265,19 @@ class HTTPTests(unittest.TestCase):
         token = store.shared_defaults("default", numeric)["token"]
         store.save({"sample_id": numeric, "temperature": 240, "shared_token": token})
 
+        catalog = {"notebook_prefixes": ["PUBLISH"], "translations": {"en": {"发布检查": "Publication check"}},
+                   "precursor_aliases": [{"label": "Ni source", "aliases": ["Ni"]}]}
         with patch.object(server.os, "replace", side_effect=PermissionError("conventions file is open")):
-            saved = self.request_json(endpoint, {"revision": old["revision"],
-                                                 "catalog": {"notebook_prefixes": ["PUBLISH"]}}, "PUT")
+            saved = self.request_json(endpoint, {"revision": old["revision"], "catalog": catalog}, "PUT")
+            experiments = self.request_json("/api/experiments")
+            self.assertEqual(experiments["translations"], saved["catalog"]["translations"])
+            self.assertEqual(experiments["conventions"]["precursor_aliases"], catalog["precursor_aliases"])
+            self.assertEqual(experiments["conventions"]["notebook_prefixes"], ["PUBLISH"])
+            editor = self.request_json(endpoint)
+            for key in ("catalog", "revision", "active_prefixes"):
+                self.assertEqual(editor[key], saved[key])
+            catalog["translations"]["en"]["发布检查"] = "Latest convention"
+            saved = self.request_json(endpoint, {"revision": editor["revision"], "catalog": catalog}, "PUT")
         self.assertEqual(path.read_bytes(), previous)
         self.assertIs(saved["publication_pending"], True)
         self.assertEqual(saved["catalog"]["notebook_prefixes"], ["PUBLISH"])
@@ -2275,6 +2287,8 @@ class HTTPTests(unittest.TestCase):
             key, = db.execute("SELECT experiment_key FROM experiment_defaults WHERE experiment_key=?", (roman.lower(),)).fetchone()
             self.assertEqual(key, roman.lower())
         self.assertEqual(saved["revision"], hashlib.sha256(pending).hexdigest())
+        self.assertEqual(self.request_json("/api/experiments")["translations"], saved["catalog"]["translations"])
+        self.assertEqual(path.read_bytes(), pending)
         published = self.request_json(endpoint)
         self.assertEqual(published, {key: value for key, value in saved.items() if key != "publication_pending"})
         self.assertEqual(path.read_bytes(), pending)
@@ -2909,6 +2923,100 @@ class DataSafetyTests(unittest.TestCase):
                 new_roman = self.store.save({"sample_id": roman + "_b"})
                 new_sample = next(row for row in self.store.list() if row["id"] == new_roman)
                 self.assertEqual((set(self.stored_defaults()), new_sample["temperature"]), ({numeric.lower()}, None))
+
+    def test_adding_unrelated_prefix_preserves_legacy_defaults_without_samples(self):
+        number = "XY-1-42"
+        token = self.store.shared_defaults("default", number)["token"]
+        sample = self.store.save({"sample_id": number + "_a", "temperature": 240, "shared_token": token})
+        row, = self.store.list()
+        self.store.save({**row, "experiment_no": "Other experiment"}, sample)
+        with self.store.connect() as db:
+            state = self.store.read_shared_defaults(db, "default", number.lower())
+            del state["origin_keys"]
+            db.execute("UPDATE experiment_defaults SET settings=? WHERE experiment_key=?",
+                       (json.dumps(state, indent=2), number.lower()))
+            db.execute("DELETE FROM app_settings WHERE key='accepted_notebook_prefixes'")
+            db.execute("PRAGMA user_version=2")
+
+        upgraded = Store(self.store.data)
+        query = "SELECT rowid, settings FROM experiment_defaults WHERE project_id='default' AND experiment_key=?"
+        with upgraded.connect() as db:
+            before = db.execute(query, (number.lower(),)).fetchone()
+        self.assertIsNotNone(before)
+        self.assertEqual(upgraded.shared_defaults("default", number)["count"], 0)
+        upgraded.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        with upgraded.connect() as db:
+            self.assertEqual(db.execute(query, (number.lower(),)).fetchone(), before)
+        following = upgraded.save({"sample_id": number + "_b"})
+        self.assertEqual(next(row for row in upgraded.list() if row["id"] == following)["temperature"], 240)
+
+    def legacy_condition_decision(self, record, labels):
+        fingerprint = server.review_fingerprint("conditions-" + record["id"], labels)
+        with self.store.connect() as db:
+            db.execute("""INSERT INTO review_items
+                          (id,record_id,project_id,experiment_no,kind,field,title,sources,status,created_at,updated_at,automatic)
+                          VALUES (?,?,?,?,'missing_conditions','','缺少实验条件','[]','dismissed','','',1)""",
+                       (fingerprint, record["id"], record["project_id"], record["experiment_no"]))
+            db.execute("PRAGMA user_version=2")
+        return fingerprint
+
+    def test_v2_template_review_does_not_follow_record_to_another_project(self):
+        sample = self.store.save({"sample_id": "Moved legacy film"})
+        other_project = self.store.add_catalog_item("projects", {"name": "Other legacy film lab"})["project"]["id"]
+        for project, field_type in (("default", "number"), (other_project, "text")):
+            self.store.save_template({"project_id": project, "revision": 0, "name": "Film", "fields": [
+                {"label": "Pressure", "section": "condition", "type": field_type, "required": True},
+            ]})
+        row, = self.store.list()
+        self.store.save({**row, "lab_data": {"template_revision": 1}}, sample)
+        assignment = self.store.history(sample)["batches"][0]["id"]
+        self.legacy_condition_decision(self.store.list()[0], ["Pressure"])
+        upgraded = Store(self.store.data)
+
+        undo = upgraded.undo_history(assignment, {"preview": True})
+        upgraded.undo_history(assignment, {"preview": False, "revisions": undo["revisions"]})
+        row, = upgraded.list()
+        upgraded.save({**row, "project_id": other_project, "lab_data": {"template_revision": 1}}, sample)
+        issues = [(item["project_id"], item["status"], item["missing"]) for item in upgraded.review_list()["items"]
+                  if item["kind"] == "missing_conditions"]
+        self.assertEqual(issues, [("default", "dismissed", ["Pressure"]), (other_project, "pending", ["Pressure"])])
+
+    def test_v2_builtin_review_fingerprint_can_be_decided_again_in_another_project(self):
+        sample = self.store.save({"sample_id": "Moved legacy sample", "precursor": "Ni source",
+                                  "duration": 5, "solvent": "Water"})
+        other_project = self.store.add_catalog_item("projects", {"name": "Other legacy lab"})["project"]["id"]
+        fingerprint = self.legacy_condition_decision(self.store.list()[0], ["temperature"])
+        upgraded = Store(self.store.data)
+        row, = upgraded.list()
+        upgraded.save({**row, "project_id": other_project}, sample)
+
+        closed, pending = [item for item in upgraded.review_list()["items"] if item["kind"] == "missing_conditions"]
+        self.assertEqual((closed["id"], closed["status"]), (fingerprint, "dismissed"))
+        self.assertEqual((pending["project_id"], pending["status"], pending["missing"]),
+                         (other_project, "pending", ["temperature"]))
+        self.assertNotEqual(pending["id"], fingerprint)
+        revision = upgraded.add_review({"issue_id": pending["id"]})["revision"]
+        upgraded.decide_review(pending["id"], {"preview": False, "status": "resolved", "revision": revision,
+                               "record_revision": pending["record_revision"], "missing": ["temperature"]})
+
+    def test_v2_review_keeps_frozen_coverage_after_one_field_is_filled(self):
+        self.store.save_template({"project_id": "default", "revision": 0, "name": "Film", "fields": [
+            {"label": "temperature", "section": "condition", "type": "number", "required": True},
+            {"label": "Substrate", "section": "condition", "type": "text", "required": True},
+        ]})
+        sample = self.store.save({"sample_id": "Legacy film"})
+        fingerprint = self.legacy_condition_decision(self.store.list()[0], ["temperature", "Substrate"])
+        upgraded = Store(self.store.data)
+
+        row, = upgraded.list()
+        upgraded.save({**row, "lab_data": {**row["lab_data"], "values": {"1": "Glass"}}}, sample)
+        upgraded = Store(self.store.data)
+        issues = [(item["id"], item["status"], item["missing"]) for item in upgraded.review_list()["items"]
+                  if item["kind"] == "missing_conditions"]
+        self.assertEqual(issues, [(fingerprint, "dismissed", ["temperature", "Substrate"])])
+        with upgraded.connect() as db:
+            coverage, = db.execute("SELECT coverage FROM review_items WHERE id=?", (fingerprint,)).fetchone()
+        self.assertEqual(set(json.loads(coverage)), {"temperature", "template:default:1:0", "template:default:1:1"})
 
     def test_schema_three_legacy_review_covers_template_field_named_like_a_builtin(self):
         sample = self.store.save({"sample_id": "Film", "precursor": "Ni source", "duration": 5, "solvent": "Water"})
@@ -3731,6 +3839,11 @@ class DataSafetyTests(unittest.TestCase):
         before = self.stored_defaults()
         with patch.object(server.os, "replace", side_effect=PermissionError("file open")):
             saved = self.store.save_local_catalog({"revision": old["revision"], "catalog": {"notebook_prefixes": ["CD"]}})
+            self.store = Store(self.store.data)
+            self.assertEqual(self.store.notebook_prefixes(), ["CD"])
+            self.assertEqual(self.store.shared_defaults("default", "AB-1-42")["conditions"]["temperature"], 240)
+            _, _, _, conventions = self.store.snapshot_database(self.root / "while-pending.sqlite3")
+            self.assertEqual(json.loads(conventions)["notebook_prefixes"], ["CD"])
         self.assertIs(saved["publication_pending"], True)
         self.assertEqual(path.read_bytes(), content)
         with self.store.connect() as db:
