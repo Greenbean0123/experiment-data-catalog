@@ -2694,7 +2694,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       const body = options.body && typeof options.body === "string" ? JSON.parse(options.body) : null;
       calls.push({url, method: options.method || "GET", body});
       if (url.startsWith("/api/import/records/parse")) {
-        if (url.includes("sheet=Samples")) return reply(200, {upload_id: "u3", format: "xlsx", sheets: ["Overview", "Samples"], sheet: "Samples", columns: ["编号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
+        if (url.includes("sheet=Samples")) return reply(200, {upload_id: "u3", format: "xlsx", sheets: ["Overview", "Samples"], sheet: "Samples", columns: ["序号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
         if (failNext) return reply(400, {error: "表格最多 2000 行、100 列，请拆分后再导入。", sheets: ["Overview", "Samples"], sheet: "Overview"});
         return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "", columns: ["编号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
       }
@@ -2719,12 +2719,13 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal(calls.some(call => call.url === "/api/templates" || call.url.endsWith("/preset") || call.url.endsWith("/settings") && call.method === "PUT"), false, "Configured projects are never overwritten");
       assert.match($("toast").textContent, /kept as they are/);
       if ($("backup-dialog").open) $("close-backup").click();
-      // Specific headers win: "样品编号" is the sample ID even after a generic "编号" column.
+      // Two columns that both fit the sample ID ("编号", "样品编号") are left for the user to map.
       $("records-import-view").click();
       const choose = name => { Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], name)], configurable: true}); $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); };
       choose("a.csv"); for (let i = 0; i < 4; i++) await flush();
-      assert.equal($("ri-mapping").querySelector('[data-import-column="1"]').value, "sample_id");
-      assert.equal($("ri-mapping").querySelector('[data-import-column="0"]').value, "", "A generic header does not claim the sample ID");
+      assert.deepEqual([0, 1].map(index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value), ["", ""], "An ambiguous sample ID is not guessed");
+      const idColumn = $("ri-mapping").querySelector('[data-import-column="1"]');
+      idColumn.value = "sample_id"; idColumn.dispatchEvent(new w.Event("change", {bubbles: true}));
       $("ri-preview-button").click(); for (let i = 0; i < 4; i++) await flush();
       assert.equal($("ri-commit").disabled, false);
       // A replacement file that fails to parse leaves nothing to commit, but offers the workbook's other sheets.
@@ -2804,9 +2805,9 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       field("10", "İletkenlik", "S/m"), field("11", "İletkenlik₂", "S/m"), field("12", "Time", "h"), field("13", "Time", "s", "result")]};
     const cases = {
       "a.csv": [["Sample ID", "Chamber pressure（base）（Pa）", "Chamber pressure (Pa)"], ["sample_id", "template:0", "template:1"]],
-      "b.csv": [["Chamber pressure (base)", "Chamber pressure (base) (Pa)"], ["template:0", ""]],
+      "b.csv": [["Chamber pressure (base)", "Chamber pressure (base) (Pa)"], ["", ""]],
       "c.csv": [["腔体压力 (基压) (Pa)", "Coating thickness (µm)", "Mass fraction (%)", "Chamber pressure (mPa)"], ["template:2", "", "", ""]],
-      "d.csv": [["Anneal time (min)", "Anneal time"], ["template:5", "template:4"]],
+      "d.csv": [["Anneal time (min)", "Anneal time"], ["", ""]],
       "e.csv": [["Temperature (actual) (°C)", "Temperature (°C)", "Stage temperature (K) setpoint", "Bias / mV"], ["template:6", "temperature", "", "template:9"]],
       "f.csv": [["Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], ["", "temperature", "template:12", "duration"]],
       "g.csv": [["温度", "Temperature"], ["", ""]],
@@ -2849,6 +2850,9 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       {key: "1", label: "Temperature", section: "result", type: "number", unit: "°C", options: [], required: false}]}};
     assert.deepEqual(await run(tied, ["Sample ID", "Temp", "Temperature (°C)"]), ["sample_id", "", ""], "A tied built-in still makes the next tier ambiguous");
     assert.deepEqual(await run({}, ["Reaction time", "Duration", "Time"]), ["", "", ""], "A specific tie is not filled by a generic name");
+    const times = {default: {name: "Times", fields: [{key: "0", label: "Time", section: "condition", type: "number", unit: "min", options: [], required: false},
+      {key: "1", label: "Time", section: "result", type: "number", unit: "s", options: [], required: false}]}};
+    assert.deepEqual(await run(times, ["Sample ID", "Time", "Time (min)", "时间 (min)"]), ["sample_id", "", "", ""], "A column that fits two fields keeps both of them contested");
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

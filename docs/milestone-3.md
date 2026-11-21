@@ -202,12 +202,11 @@ demo could then never be deleted.
 
 ### 10.5 Front end (done)
 
-- Import auto-mapping (rounds 2–3) guesses only unambiguous exact matches: a header that is a field name, or a field
-  name followed by that field's own unit in brackets or after `/` (`温度 (°C)`, `Reaction time / min`). Names ignore
-  case, full-width brackets and spacing; units compare exactly, except the listed spellings of °C and min. A column is
-  guessed only when exactly one field fits it and no other column fits that field; exact names are settled before
-  names with units, specific names before generic ones, and a column or field that tied in one tier is not guessed in
-  a later one (a tied field still counts as a candidate there, so it keeps that tier ambiguous). A field without a unit also accepts an empty `()` (as in the catalog's own CSV export). The unit
-  suffix is removed exactly before the name is compared. Everything else is mapped by hand. A template label that
-  itself contains a unit (`Thickness (µm)` on a field stored in nm) is trusted as written.
+- Import auto-mapping (release-check rounds 2–6) guesses only unambiguous exact matches: a header that is a field name,
+  or a field name followed by that field's own unit in brackets or after `/` (`温度 (°C)`, `Reaction time / min`); a
+  field without a unit also accepts an empty `()` (as in the catalog's own CSV export). The unit suffix is removed
+  exactly (case-sensitive, except the listed spellings of °C and min) before the name is compared, ignoring case,
+  full-width brackets and spacing. In one pass every column collects every field it fits by any rule; a column is
+  guessed only when it fits exactly one field and no other column fits that field. Everything else is mapped by hand.
+  A template label that itself contains a unit (`Thickness (µm)` on a field stored in nm) is trusted as written.
 - Confirming a whole-batch undo sends no `record_ids` (the 500-id limit applies to explicit selections only).

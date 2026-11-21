@@ -3230,7 +3230,6 @@ function initialize() {
 
   // ---- Record import (api/import/records/*) ----
   let riUpload = null, riFile = null, riPreview = null, riBusy = false, riDirty = false, riBatch = null, riSheets = [];
-  // Specific names are matched across every column first; generic ones (IMPORT_GENERIC) only fill what is left.
   const IMPORT_GENERIC = {sample_id: ["编号", "样品", "sample", "id"], experiment_no: ["批次", "batch", "experiment"], duration: ["时间", "time"]};
   const IMPORT_GUESSES = {
     sample_id: ["样品编号", "sample id", "sampleid", "sample_id", "sample no", "sample number"],
@@ -3254,7 +3253,7 @@ function initialize() {
   // Auto-mapping guesses only what is unambiguous: a header that is exactly a field name, or a field name followed by that
   // field's own unit ("温度 (°C)", "Reaction time / min"). Names ignore case; units compare exactly except the spellings
   // listed here. A column is guessed only when one field fits it and no other column fits that field; the rest is mapped
-  // by hand. Exact names are settled before names with units, specific names before generic ones.
+  // by hand.
   const UNIT_ALIASES = [["°C", "℃", "°c"], ["min", "Min", "mins", "minute", "minutes", "分钟"]];
   const BUILTIN_UNITS = {temperature: "°C", duration: "min"};
   const normHeader = value => String(value).replace(/（/g, "(").replace(/）/g, ")").replace(/\s+/g, " ").replace(/\s*([()\/])\s*/g, "$1").trim();
@@ -3267,24 +3266,15 @@ function initialize() {
     return bases.some(base => names.some(name => base.toLowerCase() === normHeader(name).toLowerCase()));
   }
   function guessTargets(headers, targets) {
-    // A column or field that tied in one tier is never guessed later; a tied field still counts as a candidate, so it
-    // keeps later tiers ambiguous instead of leaving another field as the only fit.
-    const guesses = headers.map(() => ""), taken = new Set(), tiedFields = new Set(), tiedColumns = new Set();
-    const candidates = table => targets.flatMap(target => {
-      if (target.field) return table === IMPORT_GENERIC ? [] : [{target: target.value, names: [target.field.label], units: unitSpellings(target.field.unit)}];
-      return table[target.value] ? [{target: target.value, names: table[target.value], units: unitSpellings(BUILTIN_UNITS[target.value])}] : [];
+    // One pass: each column collects every field it fits by any rule (exact name, or name plus the field's unit). A
+    // column is guessed only when it fits exactly one field and no other column fits that field.
+    const options = targets.flatMap(target => {
+      const names = target.field ? [target.field.label] : [...(IMPORT_GUESSES[target.value] || []), ...(IMPORT_GENERIC[target.value] || [])];
+      const units = unitSpellings(target.field ? target.field.unit : BUILTIN_UNITS[target.value]);
+      return names.length ? [{target: target.value, names, units}] : [];
     });
-    const tier = (table, withUnit) => {
-      const options = candidates(table).filter(option => !taken.has(option.target));
-      const fits = headers.map((header, index) => guesses[index] || tiedColumns.has(index) ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
-      fits.forEach((list, index) => {
-        if (list.length === 1 && !tiedFields.has(list[0]) && fits.filter(other => other.includes(list[0])).length === 1) guesses[index] = list[0];
-        else if (list.length) { tiedColumns.add(index); for (const target of list) tiedFields.add(target); }
-      });
-      for (const target of guesses) if (target) taken.add(target);
-    };
-    tier(IMPORT_GUESSES, false); tier(IMPORT_GUESSES, true); tier(IMPORT_GENERIC, false); tier(IMPORT_GENERIC, true);
-    return guesses;
+    const fits = headers.map(header => options.filter(option => headerFits(header, option.names, option.units, false) || headerFits(header, option.names, option.units, true)).map(option => option.target));
+    return fits.map(list => list.length === 1 && fits.filter(other => other.includes(list[0])).length === 1 ? list[0] : "");
   }
   function renderImportMapping() {
     const box = $("ri-mapping");
