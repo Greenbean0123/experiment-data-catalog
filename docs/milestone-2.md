@@ -198,3 +198,43 @@ onboarding and imports (M3), packaging (M4).
 - `PUT /api/local-catalog` compares the file bytes immediately before `os.replace`, but Windows offers no atomic
   compare-and-replace, so a hand edit landing in that instant can be overwritten. Edit `local-catalog.json` by hand only
   while the app is stopped (README says so).
+
+## 7. Final amendments (binding; replace §5.4 and the merge rules of §6.1)
+
+### 7.1 One state per experiment group; deterministic merge and split
+
+- Shared defaults and per-sample overrides of an experiment group live in exactly one `experiment_defaults` row per
+  **current** experiment key. There is no propagation to rows of other keys.
+- A prefix change is applied in one transaction together with the rewrite of affected rows:
+  - **Merge** (several current keys become one): allowed only if at most one of them has a stored row, or all stored rows
+    have identical defaults. The merged row takes those defaults and the union of the per-sample overrides; the old rows
+    are deleted. Otherwise 409 (message of §6.1) and nothing changes.
+  - **Split** (one key becomes several): the row is copied to every resulting key; per-sample overrides go with the
+    sample to its new key. No information is lost, and nothing is created for keys that have no samples.
+- When a sample's experiment key changes (edit of its experiment number or sample ID), its per-sample override moves
+  with it to the new group row, or is dropped when the new group has no row.
+
+### 7.2 Accepted notebook prefixes
+
+- The last accepted prefix set is stored in `app_settings` (`accepted_notebook_prefixes`) whenever prefixes are applied.
+- At startup, and whenever the file changes, the file's prefixes are applied only if they do not conflict (§7.1);
+  otherwise the stored accepted set stays active. Only when no accepted set has ever been stored does the service fall
+  back to an empty set.
+
+### 7.3 Error kinds of `GET /api/local-catalog`
+
+- `error_kind`: `"unparsable"` (file cannot be parsed; editor read-only, `PUT` 409) or `"prefix_conflict"` (file parses
+  but its prefixes conflict; the editor stays editable so the user can fix the prefixes; a conflicting `PUT` is 409).
+- Each `GET` re-checks a rejected file against the current defaults and applies it once it no longer conflicts, so the
+  error disappears after the user makes the defaults agree.
+
+### 7.4 Review coverage
+
+- When an automatic missing-condition item is resolved or dismissed, the `missing` fields shown at that moment are stored
+  with the disposition; later coverage uses exactly that set. Items decided before this change keep using the fields of
+  their stored fingerprint (§6.2).
+
+### 7.5 Not changed
+
+- A first shared save in a group still fills blank values of other members with the group's known common value. This is
+  the documented existing behaviour (README: "首次设置也会补入可用的空白条件"), independent of prefixes.
