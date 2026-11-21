@@ -3260,26 +3260,25 @@ function initialize() {
   const normHeader = value => String(value).replace(/（/g, "(").replace(/）/g, ")").replace(/\s+/g, " ").replace(/\s*([()\/])\s*/g, "$1").trim();
   const unitSpellings = unit => unit ? (UNIT_ALIASES.find(group => group.includes(unit)) || [unit]).map(normHeader) : [];
   function headerFits(header, names, units, withUnit) {
-    const text = normHeader(header), lower = text.toLowerCase();
-    return names.some(name => {
-      const key = normHeader(name).toLowerCase();
-      if (!withUnit) return lower === key;
-      if (lower.length <= key.length || !lower.startsWith(key)) return false;
-      const rest = text.slice(key.length);
-      return units.some(unit => rest === `(${unit})` || rest === `/${unit}`);
-    });
+    const text = normHeader(header);
+    // The unit suffix is removed exactly (case-sensitive) before the remaining name is compared without case.
+    const bases = !withUnit ? [text] : (units.length ? units.flatMap(unit => [`(${unit})`, `/${unit}`]) : ["()"])
+      .filter(suffix => text.length > suffix.length && text.endsWith(suffix)).map(suffix => text.slice(0, -suffix.length));
+    return bases.some(base => names.some(name => base.toLowerCase() === normHeader(name).toLowerCase()));
   }
   function guessTargets(headers, targets) {
-    const guesses = headers.map(() => ""), used = new Set();
+    // used: fields already taken or contested; a column or field that tied in one tier stays unguessed in later tiers.
+    const guesses = headers.map(() => ""), used = new Set(), contested = new Set();
     const candidates = table => targets.flatMap(target => {
       if (target.field) return table === IMPORT_GENERIC ? [] : [{target: target.value, names: [target.field.label], units: unitSpellings(target.field.unit)}];
       return table[target.value] ? [{target: target.value, names: table[target.value], units: unitSpellings(BUILTIN_UNITS[target.value])}] : [];
     });
     const tier = (table, withUnit) => {
       const options = candidates(table).filter(option => !used.has(option.target));
-      const fits = headers.map((header, index) => guesses[index] ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
+      const fits = headers.map((header, index) => guesses[index] || contested.has(index) ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
       fits.forEach((list, index) => {
         if (list.length === 1 && fits.filter(other => other.includes(list[0])).length === 1) guesses[index] = list[0];
+        else if (list.length) { contested.add(index); for (const target of list) used.add(target); }
       });
       for (const target of guesses) if (target) used.add(target);
     };

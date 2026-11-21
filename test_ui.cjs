@@ -2800,15 +2800,19 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     const field = (key, label, unit, section = "condition") => ({key, label, section, type: "number", unit, options: [], required: false});
     const template = {name: "Mapping", fields: [field("0", "Chamber pressure (base)", "Pa"), field("1", "Chamber pressure", "Pa"), field("2", "腔体压力（基压）", "Pa"),
       field("3", "Coating thickness", "nm"), field("4", "Anneal time", "min"), field("5", "Anneal time (min)", "min"), field("6", "Temperature (actual)", "°C", "result"),
-      field("7", "Mass fraction", ""), field("8", "Stage temperature setpoint", "°C"), field("9", "Bias", "mV")]};
+      field("7", "Mass fraction", ""), field("8", "Stage temperature setpoint", "°C"), field("9", "Bias", "mV"),
+      field("10", "İletkenlik", "S/m"), field("11", "İletkenlik₂", "S/m"), field("12", "Time", "h"), field("13", "Time", "s", "result")]};
     const cases = {
       "a.csv": [["Sample ID", "Chamber pressure（base）（Pa）", "Chamber pressure (Pa)"], ["sample_id", "template:0", "template:1"]],
       "b.csv": [["Chamber pressure (base)", "Chamber pressure (base) (Pa)"], ["template:0", ""]],
       "c.csv": [["腔体压力 (基压) (Pa)", "Coating thickness (µm)", "Mass fraction (%)", "Chamber pressure (mPa)"], ["template:2", "", "", ""]],
       "d.csv": [["Anneal time (min)", "Anneal time"], ["template:5", "template:4"]],
       "e.csv": [["Temperature (actual) (°C)", "Temperature (°C)", "Stage temperature (K) setpoint", "Bias / mV"], ["template:6", "temperature", "", "template:9"]],
-      "f.csv": [["Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], ["", "temperature", "", "duration"]],
+      "f.csv": [["Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], ["", "temperature", "template:12", "duration"]],
       "g.csv": [["温度", "Temperature"], ["", ""]],
+      "h.csv": [["İletkenlik (S/m)", "İletkenlik₂ (S/m)", "Mass fraction ()"], ["template:10", "template:11", "template:7"]],
+      "i.csv": [["Sample ID", "Time"], ["sample_id", ""]],
+      "j.csv": [["Reaction time", "Duration", "Time (min)"], ["", "", ""]],
     };
     const env = await boot({savedLanguage: "en", readHandler: catalog => reply(200, {...catalog, templates: {default: template}}), m3Handler: url => {
       const name = new URL(url, "http://x").searchParams.get("name");
