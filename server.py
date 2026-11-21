@@ -95,6 +95,9 @@ DB_HISTORY_KEEP = 30
 STALE_BACKUP_DAYS = 7
 DEMO_PROJECT = "demo"
 DEMO_NAME = "示例项目"
+DEMO_RECORD_COUNT = 12
+DEMO_FILE_RECORDS = (0, 3, 4, 8)
+DEMO_CONTENTS_CONFLICT = "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。"
 DUPLICATE_CATALOG_NAME = "该名称已存在，请直接选择或使用其他名称。"
 MAX_RECORD_UPLOAD = 5 * 1024 * 1024
 MAX_WORKBOOK_XML = 64 * 1024 * 1024
@@ -623,11 +626,10 @@ def csv_record_rows(data):
     best, delimiter = (0, 0), ","
     for candidate in (",", ";", "\t"):
         reader = csv.reader(io.StringIO(source, newline=""), delimiter=candidate, strict=True)
-        widths = []
         try:
-            widths.extend(len(row) for row in islice(reader, 50))
+            widths = [len(row) for row in islice(reader, 50)]
         except csv.Error:
-            pass
+            continue
         if widths and widths[0] > 1:
             score = (widths.count(widths[0]), widths[0])
             if score > best:
@@ -1737,11 +1739,33 @@ class Store:
                 raise Problem("项目设置已在其他窗口修改，请刷新后再保存。", 409)
             template = self.project_template(db, project_id)
             settings = validate_project_settings(payload.get("settings"), template)
-            revision += 1
-            db.execute("""INSERT INTO project_settings VALUES (?,?,?)
-                          ON CONFLICT(project_id) DO UPDATE SET settings=excluded.settings, revision=excluded.revision""",
-                       (project_id, json.dumps(settings, ensure_ascii=False), revision))
-            return project_settings_info(settings, revision, template)
+            return self.write_project_settings(db, project_id, settings, revision + 1, template)
+
+    @staticmethod
+    def write_project_settings(db, project_id, settings, revision, template):
+        db.execute("""INSERT INTO project_settings VALUES (?,?,?)
+                      ON CONFLICT(project_id) DO UPDATE SET settings=excluded.settings, revision=excluded.revision""",
+                   (project_id, json.dumps(settings, ensure_ascii=False), revision))
+        return project_settings_info(settings, revision, template)
+
+    def apply_project_preset(self, project_id, payload):
+        if (not isinstance(payload, dict) or type(payload.get("expected_template_revision")) is not int
+                or type(payload.get("expected_settings_revision")) is not int):
+            raise Problem("项目设置格式不正确。")
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise Problem("找不到该项目。", 404)
+            row = db.execute("SELECT revision FROM project_settings WHERE project_id=?", (project_id,)).fetchone()
+            revision = row["revision"] if row else 0
+            if (payload["expected_template_revision"] != 0 or self.project_template(db, project_id)
+                    or payload["expected_settings_revision"] != revision):
+                raise Problem("项目已在其他窗口设置，引导未做修改。", 409)
+            definition = validate_template(payload.get("template"))
+            template = {**definition, "revision": 1}
+            settings = validate_project_settings(payload.get("settings"), template)
+            db.execute("INSERT INTO template_versions VALUES (?,1,?)", (project_id, json.dumps(definition, ensure_ascii=False)))
+            return {"template": template, "settings": self.write_project_settings(db, project_id, settings, revision + 1, template)}
 
     def check_required_fields(self, db, project_id, details, status):
         if status != STATUSES[-1] or not details.get("template_revision"):
@@ -2299,7 +2323,7 @@ class Store:
                 db.execute("INSERT INTO project_settings VALUES (?,?,1)", (DEMO_PROJECT, json.dumps(settings, ensure_ascii=False)))
                 kind = db.execute("SELECT name FROM categories ORDER BY (name='XRD') DESC, rowid LIMIT 1").fetchone()[0]
                 now = timestamp()
-                for index in range(12):
+                for index in range(DEMO_RECORD_COUNT):
                     group, sample = divmod(index, 4)
                     number = f"DEMO-I-{group + 1:02d}"
                     clean = validate({"sample_id": f"{number}-{sample + 1:02d}", "experiment_no": number,
@@ -2308,7 +2332,7 @@ class Store:
                     values = {"0": template["fields"][0]["options"][sample % 2], "1": 80 + 20 * sample,
                               "2": 200 + 50 * group, "3": 110 - 10 * group - 5 * sample}
                     clean.update(project_id=DEMO_PROJECT, lab_data=json.dumps({"template_revision": 1, "values": values}, ensure_ascii=False))
-                    file_id = uuid.uuid4().hex if index in (0, 3, 4, 8) else None
+                    file_id = uuid.uuid4().hex if index in DEMO_FILE_RECORDS else None
                     if file_id:
                         clean["result_summary"] = json.dumps({"evidence_ids": [file_id]})
                     record_id = self.insert_record(db, clean, now)
@@ -2329,12 +2353,52 @@ class Store:
                         db.execute("INSERT INTO files(id,experiment_id,name,kind,size,sha256,source,created_at) VALUES (?,?,?,?,?,?,?,?)",
                                    (file_id, record_id, name, kind, len(data), hashlib.sha256(data).hexdigest(), "demo", now))
                         self.log_file_event(db, "upload", None, {"id": file_id, "experiment_id": record_id, "name": name, "kind": kind}, now)
+                self.write_setting(db, "demo_contents", {"records": list(records), "files": [path.name for path in files]})
                 self.log_history(db, records, "create", source="demo", created_at=now)
         except Exception:
             for path in files:
                 path.unlink(missing_ok=True)
             raise
         return {"project_id": DEMO_PROJECT, "records": len(records), "files": len(files)}
+
+    def demo_generated_ids(self, db):
+        try:
+            contents = self.setting(db, "demo_contents")
+            if contents is not None:
+                records, files = set(contents["records"]), set(contents["files"])
+            else:
+                # Older demos recorded the original attachment IDs as result evidence in the creation batch.
+                records, files = set(), set()
+                for entry in db.execute("""SELECT record_id, after_state FROM history_entries e
+                                          JOIN history_batches b ON b.id=e.batch_id
+                                          WHERE b.source='demo' AND b.action='create' AND e.before_state IS NULL"""):
+                    records.add(entry["record_id"])
+                    state = decoded_state(json.loads(entry["after_state"]))
+                    files.update(state["result_summary"].get("evidence_ids", []))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise Problem(DEMO_CONTENTS_CONFLICT, 409) from None
+        if len(records) != DEMO_RECORD_COUNT or len(files) != len(DEMO_FILE_RECORDS):
+            raise Problem(DEMO_CONTENTS_CONFLICT, 409)
+        return records, files
+
+    def check_demo_contents(self, db, records, files):
+        generated_records, generated_files = self.demo_generated_ids(db)
+        slots = ",".join("?" for _ in generated_files)
+        if (not records <= generated_records or not files <= generated_files
+                or db.execute(f"SELECT count(*) FROM files WHERE id IN ({slots})",
+                              tuple(generated_files)).fetchone()[0] != len(files)):
+            raise Problem(DEMO_CONTENTS_CONFLICT, 409)
+        events = db.execute(f"""SELECT file_id, record_id, action, after FROM file_events
+                               WHERE file_id IN ({slots}) OR action='move'
+                               OR record_id IN (SELECT id FROM experiments WHERE project_id=?)""",
+                            (*generated_files, DEMO_PROJECT))
+        for event in events:
+            # A move stores its original owner in record_id and its destination in after.
+            generated = event["file_id"] in generated_files
+            if generated != (event["record_id"] in records):
+                raise Problem(DEMO_CONTENTS_CONFLICT, 409)
+            if event["action"] == "move" and generated != (json.loads(event["after"])["record_id"] in records):
+                raise Problem(DEMO_CONTENTS_CONFLICT, 409)
 
     def delete_demo(self, payload):
         if not isinstance(payload, dict) or payload.get("confirm") != "delete-demo":
@@ -2348,7 +2412,9 @@ class Store:
                 demo_records = "SELECT id FROM experiments WHERE project_id=?"
                 demo_files = f"SELECT id FROM files WHERE experiment_id IN ({demo_records})"
                 args = (DEMO_PROJECT,)
+                records = {row["id"] for row in db.execute(demo_records, args)}
                 pending = dict(db.execute(f"SELECT id,size FROM files WHERE id IN ({demo_files})", args))
+                self.check_demo_contents(db, records, pending.keys())
                 batches = db.execute(f"SELECT DISTINCT batch_id FROM history_entries WHERE record_id IN ({demo_records})", args).fetchall()
                 db.execute(f"DELETE FROM history_entries WHERE record_id IN ({demo_records})", args)
                 db.executemany("DELETE FROM history_batches WHERE id=? AND NOT EXISTS "
@@ -2358,20 +2424,13 @@ class Store:
                 db.execute(f"DELETE FROM review_items WHERE id IN ({reviews})", args * 2)
                 db.execute(f"DELETE FROM record_sources WHERE record_id IN ({demo_records})", args)
                 db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({demo_files})", args)
-                real_records = {row["id"] for row in db.execute("SELECT id FROM experiments WHERE project_id<>?", args)}
-                events = db.execute("""SELECT e.id, e.after, f.experiment_id AS owner_id FROM file_events e
-                    LEFT JOIN experiments r ON r.id=e.record_id LEFT JOIN files f ON f.id=e.file_id
-                    WHERE r.project_id=? OR r.id IS NULL""", args)
-                # The event's record_id is the before owner when a before state exists.
-                demo_events = [(event["id"],) for event in events if event["owner_id"] not in real_records
-                               and (not event["after"] or json.loads(event["after"])["record_id"] not in real_records)]
-                db.executemany("DELETE FROM file_events WHERE id=?", demo_events)
+                db.execute(f"DELETE FROM file_events WHERE record_id IN ({demo_records})", args)
                 db.execute(f"DELETE FROM files WHERE id IN ({demo_files})", args)
                 count = db.execute("DELETE FROM experiments WHERE project_id=?", args).rowcount
                 for table in ("template_versions", "project_settings", "experiment_defaults"):
                     db.execute(f"DELETE FROM {table} WHERE project_id=?", args)
                 db.execute("DELETE FROM projects WHERE id=?", args)
-                db.execute("DELETE FROM app_settings WHERE key='demo_project_id'")
+                db.execute("DELETE FROM app_settings WHERE key IN ('demo_project_id', 'demo_contents')")
                 db.executemany("INSERT OR REPLACE INTO app_settings VALUES (?,?)",
                                ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
             self.unlink_purged_files(pending)
@@ -3005,8 +3064,10 @@ class Store:
                                     FROM history_entries JOIN experiments ON experiments.id=history_entries.record_id
                                     WHERE batch_id=? ORDER BY history_entries.rowid""", (batch_id,)).fetchall()
             unchanged = {row["id"]: row for row in records if not row["archived"] and row["revision"] == row["imported_revision"]}
+            already_archived = sum(bool(row["archived"]) for row in records)
             self.archive_records(db, unchanged)
-        return {"archived": len(unchanged), "kept": len(records) - len(unchanged)}
+        return {"archived": len(unchanged), "kept": len(records) - len(unchanged) - already_archived,
+                "already_archived": already_archived}
 
     def preview_folder(self, payload):
         if (not isinstance(payload, dict) or not isinstance(payload.get("project_id"), str)
@@ -4079,6 +4140,9 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     store.backup_guard.release()
         if self.command == "POST":
+            preset_match = re.fullmatch(r"/api/projects/([^/]+)/preset", path)
+            if preset_match:
+                return self.send_json(store.apply_project_preset(preset_match[1], self.json_body()))
             if path == "/api/onboarding/done":
                 self.json_body()
                 store.put_setting("onboarding_done", True)

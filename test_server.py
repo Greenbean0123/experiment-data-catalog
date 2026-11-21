@@ -2845,6 +2845,48 @@ class Milestone3Tests(unittest.TestCase):
             self.assertIs(reopened.setting(db, "onboarding_done"), True)
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], server.SCHEMA_VERSION)
 
+    def test_onboarding_preset_checks_revisions_and_saves_atomically(self):
+        route = "/api/projects/default/preset"
+        settings_route = "/api/projects/default/settings"
+        initial = self.request_json(settings_route)
+        self.assertEqual(initial["revision"], 0)
+        key = {"section": "condition", "label": "Thickness", "check_missing": True}
+        payload = {
+            "expected_template_revision": 0, "expected_settings_revision": initial["revision"],
+            "template": {"name": "Thin films", "fields": [
+                {"section": "condition", "label": "Thickness", "type": "number", "unit": "nm"},
+            ]},
+            "settings": {"key_fields": [key]},
+        }
+        saved = self.request_json(settings_route, {"revision": 0, "settings": {"phase_presets": ["Other tab"]}}, "PUT")
+        self.assertEqual(saved["revision"], 1)
+        conflict = {"error": "项目已在其他窗口设置，引导未做修改。"}
+        self.assertEqual(self.request_json(route, payload, "POST", 409), conflict)
+        self.assertNotIn("default", self.request_json("/api/experiments")["templates"])
+        self.assertEqual(self.request_json(settings_route), saved)
+
+        fresh = {**payload, "expected_settings_revision": saved["revision"]}
+        invalid = {**fresh, "settings": {"key_fields": [{**key, "label": "Missing"}]}}
+        self.assertEqual(self.request_json(route, invalid, "POST", 400), {"error": "关键字段必须来自当前实验模板。"})
+        self.assertNotIn("default", self.request_json("/api/experiments")["templates"])
+        self.assertEqual(self.request_json(settings_route), saved)
+
+        with patch.object(self.store, "write_project_settings", side_effect=RuntimeError("test rollback")):
+            with self.assertRaisesRegex(RuntimeError, "test rollback"):
+                self.store.apply_project_preset("default", fresh)
+        self.assertNotIn("default", self.request_json("/api/experiments")["templates"])
+        self.assertEqual(self.request_json(settings_route), saved)
+
+        result = self.request_json(route, fresh, "POST")
+        self.assertEqual(result["template"]["revision"], 1)
+        self.assertEqual(result["settings"]["revision"], 2)
+        self.assertEqual(result["settings"]["fields"], [{
+            **key, "id": "key:condition:thickness", "available": True, "type": "number", "unit": "nm", "options": [],
+        }])
+        self.assertEqual(self.request_json("/api/experiments")["templates"]["default"], result["template"])
+        self.assertEqual(self.request_json(settings_route), result["settings"])
+        self.assertEqual(self.request_json(route, {**fresh, "expected_settings_revision": 2}, "POST", 409), conflict)
+
     def test_demo_determinism_and_scoped_deletion(self):
         route = "/api/demo"
         created = {"project_id": "demo", "records": 12, "files": 4}
@@ -2869,6 +2911,10 @@ class Milestone3Tests(unittest.TestCase):
         self.assertTrue(all("Synthetic demo data." in row["notes"] for row in demo))
         demo_files = {file["id"] for row in demo for file in row["files"]}
         self.assertEqual(len(demo_files), 4)
+        with self.store.connect() as db:
+            contents = self.store.setting(db, "demo_contents")
+            self.assertEqual(set(contents["records"]), {row["id"] for row in demo})
+            self.assertEqual(set(contents["files"]), demo_files)
         backup = self.data / "demo-backup.zip"
         self.assertEqual(self.store.backup(backup)["files"], 4)
         with zipfile.ZipFile(backup) as archive:
@@ -2877,17 +2923,14 @@ class Milestone3Tests(unittest.TestCase):
         real_id = self.store.save({"sample_id": "M3-real"})
         real_file = self.store.add_file(real_id, "real.csv", "XRD", io.BytesIO(b"real"), 4)
         real_review = self.store.add_review({"record_id": real_id, "title": "Keep this real review"})["id"]
-        sample = demo[0]
-        receipt = "a" * 32
-        imported_file = self.store.add_file(sample["id"], "folder.csv", "XRD", io.BytesIO(b"demo"), 4, receipt=receipt,
-                                            folder_target=("demo", sample["sample_id"], sample["experiment_no"]))["id"]
-        self.store.change_file(imported_file, "delete", {"record_revision": sample["revision"] + 1})
-        demo_files.add(imported_file)
+        sample = next(row for row in demo if row["files"])
+        self.store.change_file(sample["files"][0]["id"], "delete", {"record_revision": sample["revision"]})
         demo_review = self.store.add_review({"record_id": sample["id"], "title": "Remove this demo review"})["id"]
         revisions = {row["id"]: row["revision"] for row in self.store.list()}
         self.store.bulk_update({"preview": False, "records": [{"id": key, "revision": revisions[key]} for key in (sample["id"], real_id)],
                                 "changes": {"duration": {"mode": "set", "value": 10}}})
         bulk_batch = self.request_json("/api/history")["batches"][0]["id"]
+        self.store.archive(sample["id"], {"archived": True, "revision": revisions[sample["id"]] + 1})
         with self.store.connect() as db:
             self.store.write_shared_defaults(db, "demo", sample["experiment_no"].lower(), server.EMPTY_SHARED_STATE)
             self.store.write_shared_defaults(db, "default", "m3-real", server.EMPTY_SHARED_STATE)
@@ -2896,7 +2939,7 @@ class Milestone3Tests(unittest.TestCase):
             preserved = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE {key}=?", (with_data[key],))]
                          for table, key in tables.items()}
         real = next(row for row in self.store.list() if row["id"] == real_id)
-        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"), {"deleted_records": 12, "deleted_files": 5})
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"), {"deleted_records": 12, "deleted_files": 4})
         self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE", 404), {"error": "没有示例实验库。"})
         self.assertEqual(self.store.list(), [real])
         remaining = self.request_json(f"/api/history/{bulk_batch}")
@@ -2910,47 +2953,88 @@ class Milestone3Tests(unittest.TestCase):
             for table in ("project_settings", "template_versions", "experiment_defaults", "review_items"):
                 self.assertIsNone(db.execute(f"SELECT 1 FROM {table} WHERE project_id='demo'").fetchone())
             self.assertIsNone(db.execute("SELECT 1 FROM history_batches WHERE source='demo'").fetchone())
-            self.assertIsNone(db.execute("SELECT 1 FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone())
             self.assertFalse({row["file_id"] for row in db.execute("SELECT file_id FROM file_events")} & demo_files)
             self.assertIsNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (demo_review,)).fetchone())
             self.assertIsNotNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (real_review,)).fetchone())
             self.assertIsNone(self.store.setting(db, "demo_project_id"))
+            self.assertIsNone(self.store.setting(db, "demo_contents"))
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(self.request_json(route, {}, "POST", 201), created)
         self.assertEqual(content([row for row in self.store.list() if row["project_id"] == "demo"]), original)
 
-    def test_demo_deletion_preserves_file_events_with_surviving_records_or_files(self):
+    def test_demo_deletion_rejects_real_record_with_attachment_moved_out(self):
         self.store.create_demo()
         source = self.store.save({"sample_id": "Source"})
         target = self.store.save({"sample_id": "Destination"})
-        kept = self.store.add_file(source, "kept.csv", "XRD", io.BytesIO(b"keep"), 4)
-        returned = self.store.add_file(source, "returned.csv", "XRD", io.BytesIO(b"demo"), 4)
+        file_id = self.store.add_file(source, "kept.csv", "XRD", io.BytesIO(b"keep"), 4)
+        self.request_json(f"/api/files/{file_id}/update", {
+            "record_revision": 2, "target_record_id": target, "target_revision": 1,
+        }, "POST")
+        source_record = next(row for row in self.store.list() if row["id"] == source)
+        self.assertEqual(source_record["files"], [])
+        self.store.save({**source_record, "project_id": "demo"}, source)
 
-        def move(file_id, owner, destination):
+        before = (self.request_json("/api/experiments"), self.request_json("/api/history"))
+        file_ids = {path.name for path in self.store.files.iterdir()}
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE", 409),
+                         {"error": "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。"})
+        self.assertEqual((self.request_json("/api/experiments"), self.request_json("/api/history")), before)
+        self.assertEqual({path.name for path in self.store.files.iterdir()}, file_ids)
+        self.assertEqual(self.request(f"/api/files/{file_id}")[1], b"keep")
+
+    def test_demo_deletion_rejects_generated_file_moved_to_real_record(self):
+        self.store.create_demo()
+        sample = next(row for row in self.store.list() if row["files"])
+        owner, file_id = sample["id"], sample["files"][0]["id"]
+        real = self.store.save({"sample_id": "Real record"})
+
+        def move_real_record(project_id):
+            record = next(row for row in self.store.list() if row["id"] == real)
+            self.store.save({**record, "project_id": project_id}, real)
+
+        def move_file(source, target):
             revisions = {row["id"]: row["revision"] for row in self.store.list()}
-            self.request_json(f"/api/files/{file_id}/update", {
-                "record_revision": revisions[owner], "target_record_id": destination, "target_revision": revisions[destination],
-            }, "POST")
+            self.store.change_file(file_id, "update", {
+                "record_revision": revisions[source], "target_record_id": target, "target_revision": revisions[target],
+            })
 
-        move(kept, source, target)
-        move(returned, source, target)
-        move(returned, target, source)
-        record = next(row for row in self.store.list() if row["id"] == source)
-        self.store.save({**record, "project_id": "demo"}, source)
+        for source, target in ((owner, real), (real, owner)):
+            with self.subTest(owner=target):
+                move_real_record("demo")
+                move_file(source, target)
+                move_real_record("default")
+                before = self.store.list(), self.store.history()
+                self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE", 409),
+                                 {"error": server.DEMO_CONTENTS_CONFLICT})
+                self.assertEqual((self.store.list(), self.store.history()), before)
+                self.assertEqual(self.request(f"/api/files/{file_id}")[0], 200)
 
-        before = self.request_json("/api/history")["file_events"]
-        expected = [dict(event, sample_id="Destination") for event in before
-                    if event["action"] == "move" or event["file_id"] == kept]
-        self.assertEqual([event["action"] for event in expected], ["move", "move", "move", "upload"])
-        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
-                         {"deleted_records": 13, "deleted_files": 5})
-        for query in ("", f"?record_id={target}", "?project_id=default"):
-            with self.subTest(query=query):
-                self.assertEqual(self.request_json("/api/history" + query)["file_events"], expected)
+    def test_legacy_demo_deletion_recovers_generated_ids(self):
+        self.store.create_demo()
         with self.store.connect() as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM file_events").fetchone()[0], len(expected))
-        self.assertEqual(self.request(f"/api/files/{kept}")[1], b"keep")
-        self.assertFalse((self.store.files / returned).exists())
+            db.execute("DELETE FROM app_settings WHERE key='demo_contents'")
+        sample = next(row for row in self.store.list() if row["files"])
+        self.store.save({**sample, "sample_id": "Renamed demo sample"}, sample["id"])
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4})
+
+    def test_legacy_demo_deletion_rejects_trashed_nongenerated_file(self):
+        self.store.create_demo()
+        with self.store.connect() as db:
+            db.execute("DELETE FROM app_settings WHERE key='demo_contents'")
+        sample = self.store.list()[0]
+        receipt = "a" * 32
+        file_id = self.store.add_file(sample["id"], "folder.csv", "XRD", io.BytesIO(b"real"), 4, receipt=receipt,
+                                      folder_target=("demo", sample["sample_id"], sample["experiment_no"]))["id"]
+        self.store.change_file(file_id, "delete", {"record_revision": sample["revision"] + 1})
+        before = self.store.trash(), self.store.history()
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE", 409),
+                         {"error": server.DEMO_CONTENTS_CONFLICT})
+        self.assertEqual((self.store.trash(), self.store.history()), before)
+        self.assertEqual((self.store.files / file_id).read_bytes(), b"real")
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT file_id FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone()[0],
+                             file_id)
 
     def test_demo_file_publication_rolls_back_with_database(self):
         with patch.object(self.store, "log_history", side_effect=RuntimeError("test rollback")):
@@ -2959,6 +3043,8 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.store.list(), [])
         self.assertEqual(list(self.store.files.iterdir()), [])
         self.assertFalse(any(project["id"] == "demo" for project in self.store.catalog()["projects"]))
+        with self.store.connect() as db:
+            self.assertIsNone(self.store.setting(db, "demo_contents"))
 
     def parse_upload(self, name, data, sheet=None, status=200):
         query = {"name": name}
@@ -3009,6 +3095,17 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(first_fifty["columns"], ["ID,Notes", "Status", "Unit"])
         tied = self.parse_upload("Tie.csv", b"ID,Notes;Status\tUnit\nA,ready;OK\tC\n")
         self.assertEqual(tied["columns"], ["ID", "Notes;Status\tUnit"])
+
+    def test_record_import_csv_disqualifies_delimiter_on_sampling_error(self):
+        data = (b"Sample ID,Precursors,Notes; handling; wash; dry\n"
+                b"A,Ni;Se;Cd;S,ready\n"
+                b"B,Ni;Se;Cd;S,ready,extra\n"
+                b'"washed, dried",Ni;Se;Cd;S,ready\n')
+        parsed = self.parse_upload("Films.csv", data)
+        self.assertEqual(parsed["columns"], ["Sample ID", "Precursors", "Notes; handling; wash; dry", "列 4"])
+        self.assertEqual(parsed["rows"], [["A", "Ni;Se;Cd;S", "ready", ""],
+                                          ["B", "Ni;Se;Cd;S", "ready", "extra"],
+                                          ["washed, dried", "Ni;Se;Cd;S", "ready", ""]])
 
     def test_record_import_csv_uneven_rows_and_multiline_field(self):
         parsed = self.parse_upload("Uneven.csv", b'ID,Value,Notes\nA,1\nB,2,"first line\nsecond line"\n')
@@ -3265,8 +3362,8 @@ class Milestone3Tests(unittest.TestCase):
         changed = by_id["new2"]
         self.store.save({**changed, "notes": "User edited notes"}, changed["id"])
         route = f"/api/import/batches/{batch_id}/archive"
-        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 3, "kept": 1})
-        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 0, "kept": 4})
+        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 3, "kept": 1, "already_archived": 0})
+        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 0, "kept": 1, "already_archived": 3})
         records = {row["id"]: row for row in self.store.list()}
         self.assertEqual({row["sample_id"] for row in records.values() if row["archived"]}, {"new1", "new3", "new4"})
         self.assertFalse(records[base]["archived"])
@@ -3283,6 +3380,17 @@ class Milestone3Tests(unittest.TestCase):
         result = self.request_json(undo, {"preview": False, "revisions": reversions["revisions"]}, "POST")
         self.assertEqual(result["updated"], 3)
         self.assertFalse(any(row["archived"] for row in self.store.list()))
+
+    def test_archive_import_batch_counts_already_archived_on_repeat(self):
+        payload = self.import_payload(["sample_id"], [["first"], ["second"]])
+        preview = self.request_json("/api/import/records/preview", payload, "POST")
+        result = self.request_json("/api/import/records/commit", {**payload, "token": preview["token"]}, "POST", 201)
+        route = f"/api/import/batches/{result['batch_id']}/archive"
+        first = self.request_json(route, {}, "POST")
+        history = self.request_json("/api/history")
+        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 0, "kept": 0, "already_archived": 2})
+        self.assertEqual(first, {"archived": 2, "kept": 0, "already_archived": 0})
+        self.assertEqual(self.request_json("/api/history"), history)
 
     def test_record_import_tokens_and_transaction_rollback(self):
         group = self.store.save({"sample_id": "known", "experiment_no": "Group", "temperature": 160})
