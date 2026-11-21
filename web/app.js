@@ -471,7 +471,7 @@ function initialize() {
   let dashboardTab = "overview";
   let backupStatus = null, backupTimer = null, backupStarting = false;
   let trashCount = 0, trashItems = [], trashTotal = 0, trashBusy = false, trashSelected = new Set(), trashRenaming = "";
-  let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false, categoryCounts = null;
+  let fileTarget = null, fileSaving = false, historyFileEvents = [], sessionExpired = false, categoryCounts = null, demoProjectId;
   let trashLoadVersion = 0, trashScope = null, trashDrafts = new Map();
   let keyFilterSignature = "", keyFilterState = new Map(), bulkActive = [], bulkKeyInfos = new Map();
   let listScrolledTo = "";
@@ -1097,6 +1097,8 @@ function initialize() {
     if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
     categoryCounts = result.category_counts && typeof result.category_counts === "object" ? result.category_counts : null;
     const onboarding = result.onboarding;
+    // undefined = an older server without the field; then the demo is recognised by its fixed id.
+    demoProjectId = Object.hasOwn(result, "demo_project_id") ? result.demo_project_id : undefined;
     if (projectId && !projects.some(project => project.id === projectId)) projectId = "default";
     loaded = true;
     loadError = null;
@@ -3117,7 +3119,8 @@ function initialize() {
   });
 
   // ---- Demo catalog (POST / DELETE api/demo) ----
-  const demoExists = () => projects.some(project => project.id === "demo");
+  const currentDemo = () => demoProjectId === undefined ? (projects.some(project => project.id === "demo") ? "demo" : null) : demoProjectId;
+  const demoExists = () => Boolean(currentDemo());
   async function createDemo() {
     const result = await api("api/demo", {method: "POST", body: "{}"});
     await load();
@@ -3126,16 +3129,17 @@ function initialize() {
   $("demo-view").addEventListener("click", async () => {
     try {
       if (demoExists()) {
-        if (!confirm(t("永久删除示例实验库？“示例项目”中的全部样品和附件都会删除，其他项目不受影响。"))) return;
+        if (!confirm(t("删除示例实验库？程序生成的示例样品和附件会永久删除；你自己添加的样品会保留。其他项目不受影响。"))) return;
+        const demo = currentDemo();
         const result = await api("api/demo", {method: "DELETE", body: JSON.stringify({confirm: "delete-demo"})});
-        if (projectId === "demo") projectId = "default";
+        if (projectId === demo && !result.project_kept) projectId = "default";
         await load();
-        toast(t("已删除示例实验库（{count} 条样品）。", {count: result.deleted_records}));
+        toast(result.project_kept
+          ? t("已删除示例数据（{count} 条样品）。你添加的 {kept} 条样品保留在“{name}”中，可以在项目设置里改名。", {count: result.deleted_records, kept: result.kept_records, name: projectLabel(demo)})
+          : t("已删除示例实验库（{count} 条样品）。", {count: result.deleted_records}));
       } else {
         const result = await createDemo();
-        projectId = result.project_id || "demo";
-        try { localStorage.setItem("catalog-project", projectId); } catch {}
-        render();
+        selectProject(result.project_id || "demo");
         toast(t("已载入示例实验库：{count} 条虚构样品，可随时删除。", {count: result.records}));
       }
     } catch (error) { toast(I18n.translateError(error.message, language)); }

@@ -2,6 +2,9 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "已删除示例数据（{count} 条样品）。你添加的 {kept} 条样品保留在“{name}”中，可以在项目设置里改名。": "Demo data deleted ({count} samples). The {kept} samples you added stay in “{name}”; you can rename it in Project settings.",
+    "删除示例实验库？程序生成的示例样品和附件会永久删除；你自己添加的样品会保留。其他项目不受影响。": "Delete the demo catalog? The generated demo samples and attachments are removed permanently; samples you added are kept. Other projects are not affected.",
+    "示例样品和其他样品之间移动过附件，无法自动区分。请先把这些附件移回原来的样品。": "Attachments were moved between demo samples and other samples, so they cannot be told apart automatically. Move those attachments back to their original samples first.",
     "另有 {count} 条此前已归档。": "{count} were already archived.",
     "同一文件中样品编号重复。": "The sample ID appears more than once in this file.",
     "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。": "The demo project contains samples or attachments that were not generated for the demo, so it cannot be deleted as a whole. Move them to another project first.",
@@ -711,7 +714,7 @@ const CatalogI18n = (() => {
     if (language !== "en") return value;
     if (field === "notes") return notesText(value, language);
     if (field === "project_name" && record.project_id === "default" && value === "默认项目") return "Default project";
-    if (field === "project_name" && record.project_id === "demo" && value === "示例项目") return "Demo project";
+    if (field === "project_name" && value === "示例项目") return "Demo project";
     if (field === "series") return categories[value] ?? value;
     const generated = record.notes?.startsWith("批量导入：local-") || record.series === "导入报告 / Import report";
     if (field === "sample_id" && generated && value.startsWith("资料集-")) {

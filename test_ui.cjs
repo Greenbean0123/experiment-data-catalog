@@ -2769,5 +2769,29 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.match($("toast").textContent, /kept as they are/);
     } finally { env.dom.window.close(); }
   }
+  {
+    // §9: the demo is identified by the server's demo_project_id; deleting it can keep the user's own samples.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    let demoId = "demo-2";
+    const calls = [];
+    const env = await boot({savedLanguage: "en", extraProjects: [{id: "demo", name: "示例项目"}, {id: "demo-2", name: "示例项目"}],
+      m3Handler: (url, options) => {
+        calls.push(`${options.method || "GET"} ${url}`);
+        if (url === "/api/demo" && options.method === "DELETE") { demoId = null; return reply(200, {deleted_records: 12, deleted_files: 4, kept_records: 1, project_kept: true}); }
+        if (url === "/api/demo" && options.method === "POST") { demoId = "demo-3"; return reply(201, {project_id: "demo-3", records: 12, files: 4}); }
+        throw new Error("Unhandled " + url);
+      },
+      readHandler: catalog => reply(200, {...catalog, demo_project_id: demoId, projects: demoId === "demo-3" ? [...catalog.projects, {id: "demo-3", name: "示例项目"}] : catalog.projects})});
+    try {
+      const {$, w} = env;
+      w.confirm = () => true;
+      $("demo-view").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.deepEqual(calls, ["DELETE /api/demo"], "A kept 'demo' project is not mistaken for the current demo");
+      assert.match($("toast").textContent, /The 1 samples you added stay in “Demo project”/);
+      $("demo-view").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.deepEqual(calls, ["DELETE /api/demo", "POST /api/demo"], "Without a current demo the entry creates one");
+      assert.equal($("project-select").value, "demo-3", "The new demo project id comes from the server");
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
