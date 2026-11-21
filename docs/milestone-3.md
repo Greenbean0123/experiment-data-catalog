@@ -122,3 +122,33 @@ packaging (M4).
 - Mapping guesses use specific headers (e.g. `样品编号`, `sample id`) across all columns before generic ones (`编号`).
 - Import batches in Change history offer "Undo this import (archive)" using the batch archive endpoint; the result toast
   mentions it.
+
+## 8. Release-check amendments (binding)
+
+### 8.1 Demo deletion only deletes generated content
+
+- When the demo is created, the ids of its generated records and files are stored in `app_settings`
+  (`demo_contents`).
+- `DELETE /api/demo` is allowed only when the demo project contains nothing but generated records, each holding only
+  generated files, and no generated file has been moved to a record outside the demo project (and no outside file into
+  a demo record). Otherwise 409 `示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。` and nothing changes.
+  Edits, archiving and trashing of generated content are fine.
+- Because only generated content can be deleted, every file event and history entry of the deleted records is demo-only
+  and is removed with them; nothing outside the demo is touched. This replaces the mixed-history rules of §7.
+
+### 8.2 CSV delimiter candidates that fail to parse are disqualified
+
+- A candidate whose sampling raises `csv.Error` does not compete, whatever score it accumulated before failing.
+
+### 8.3 Onboarding preset is applied atomically
+
+- `POST /api/projects/{id}/preset` `{"template": {name, fields}, "settings": Settings, "expected_template_revision": 0,
+  "expected_settings_revision": int}` → 200 `{"template", "settings": {settings, revision, fields}}`. In one transaction
+  it checks that the project's current template revision is 0 and its settings revision equals the expected one, then
+  saves the template (revision 1) and the settings (key fields validated against that new template). Any mismatch →
+  409 `项目已在其他窗口设置，引导未做修改。` and nothing changes.
+
+### 8.4 Archive counts
+
+- `POST /api/import/batches/{id}/archive` also returns `"already_archived": int`; `kept` counts only records that changed
+  since the import and are not archived.
