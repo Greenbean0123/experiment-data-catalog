@@ -327,3 +327,9 @@ onboarding and imports (M3), packaging (M4).
   locked), every endpoint serves the committed settings from the database (translations, conventions, active prefixes)
   and retries publication later; no request fails because of it.
 - Deferred to M3 (low): recovery of a first-time folder backup interrupted while publishing its history file.
+
+## 11. Released with known limitations
+
+M2 was released after release check 3. Its three remaining findings concern upgrades of v2 catalogs only, never change
+stored sample records, and err towards showing information again (a prefilled default visible before saving, dismissed
+issues shown as pending again). They are tracked in `docs/backlog.md` together with the deferred low-severity items.
