@@ -602,3 +602,14 @@ body.sidebar-collapsed{grid-template-columns:var(--sidebar-icon-width) minmax(0,
 .records-import-source .field-label{display:block;font-size:12px;margin-bottom:6px}
 .import-mapping select{min-width:180px}.import-preview .import-error td{color:var(--destructive)}.import-preview .import-skip td{color:var(--muted-foreground)}
 .settings-rename{display:flex;gap:8px;align-items:end;margin:4px 0 6px;flex-wrap:wrap}.settings-rename label{display:grid;gap:6px;flex:1 1 220px;max-width:320px}
+/* Scrollbars: slim rounded thumb on a clear track; it widens on hover and takes the accent colour while dragged. */
+:root{--scroll-thumb:rgba(28,32,40,.2);--scroll-thumb-hover:rgba(28,32,40,.38);--scroll-thumb-active:color-mix(in srgb,var(--action-primary) 72%,transparent)}
+:root.dark{--scroll-thumb:rgba(232,236,244,.18);--scroll-thumb-hover:rgba(232,236,244,.36);--scroll-thumb-active:color-mix(in srgb,var(--action-primary) 85%,white 5%)}
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-button{display:none;width:0;height:0}
+::-webkit-scrollbar-thumb{min-height:44px;min-width:44px;border:4px solid transparent;border-radius:999px;background-color:var(--scroll-thumb);background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{border-width:3px;background-color:var(--scroll-thumb-hover)}
+::-webkit-scrollbar-thumb:active{border-width:3px;background-color:var(--scroll-thumb-active)}
+@supports not selector(::-webkit-scrollbar){html,*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent}}
+@media(forced-colors:active){::-webkit-scrollbar-thumb{background-color:CanvasText}}
