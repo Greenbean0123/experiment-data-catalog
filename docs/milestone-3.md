@@ -172,3 +172,36 @@ demo could then never be deleted.
   `project_id` in its response is authoritative.
 - `GET /api/experiments` adds `"demo_project_id": str | null` (the current demo project, if any). The front end uses it to
   decide between creating and deleting the demo; it never guesses from project ids.
+
+## 10. Release check round 1 (binding)
+
+### 10.1 Unlinked review items keep the demo project
+
+- A review item in the demo project without a record (for example an unmatched folder-import file, `record_id` null)
+  was created by the user. `DELETE /api/demo` never deletes it. The project is kept (as in §9) when any record **or**
+  any such review item remains: `project_kept = kept_records > 0 or unlinked reviews remain`. `kept_records` still
+  counts records only.
+
+### 10.2 Reassigned review items do not hide warnings
+
+- When demo deletion moves a review item of a record that now lives in another project to that project, the item keeps
+  its status, resolution, sources and history, but its `coverage` becomes `[]`: it no longer covers any missing
+  condition, so the new project's missing-condition warnings appear as they would without it.
+
+### 10.3 A demo id is never reused
+
+- Each `POST /api/demo` uses a demo id that no earlier demo used: the first demo gets `demo` (if free), later ones
+  `demo-2`, `demo-3`, ... A counter in `app_settings` (kept when the demo is deleted) records the highest number used;
+  ids of existing projects are skipped as before. Undo entries that refer to a deleted demo therefore keep answering 409
+  `原项目已不存在，无法恢复这次修改。` after a new demo is created.
+
+### 10.4 The demo always has its XRD category
+
+- If the category `XRD` does not exist, `POST /api/demo` adds it (as an ordinary category, in the same transaction) and
+  files its curves under it. The category stays after the demo is deleted.
+
+### 10.5 Front end (done)
+
+- Import auto-mapping skips a header whose stated unit (`Temperature (°F)`, `Time (h)`) differs from the target's unit;
+  the user can still map it by hand.
+- Confirming a whole-batch undo sends no `record_ids` (the 500-id limit applies to explicit selections only).

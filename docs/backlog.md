@@ -17,6 +17,11 @@ user can hit in normal use that lose or silently change stored data, show wrong 
   a database but no marker, and a retry answers 409 until the folder is emptied. Make the interrupted publication
   recoverable on retry.
 
+## From the M3 release checks (low)
+
+- **English import errors keep Chinese built-in labels**, e.g. `Row 2: 温度 is not a valid number`; the invalid-mapping
+  and missing-import-batch errors have no English entry yet. Translate built-in labels in import errors.
+
 ## Accepted residual risks (documented in the contracts)
 
 - Hand edits of `local-catalog.json` while the app runs can be overwritten by a save in the same instant (M2 §6.4).
@@ -25,6 +30,5 @@ user can hit in normal use that lose or silently change stored data, show wrong 
 
 ## Planned
 
-- M3: onboarding wizard, demo catalog, Excel/CSV import of existing records.
 - M4: installer and updates, code signing, replace the AGPL-derived theme.
 - Rebuild the Windows desktop package from current code (the existing build predates the data-folder lock and session).
