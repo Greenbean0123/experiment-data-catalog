@@ -170,3 +170,5 @@ demo could then never be deleted.
 - Response: `{"deleted_records", "deleted_files", "kept_records": int, "project_kept": bool}`.
 - After a demo whose project was kept, `POST /api/demo` creates a new demo project with a fresh id (`demo`, `demo-2`, ...);
   `project_id` in its response is authoritative.
+- `GET /api/experiments` adds `"demo_project_id": str | null` (the current demo project, if any). The front end uses it to
+  decide between creating and deleting the demo; it never guesses from project ids.
