@@ -152,3 +152,21 @@ packaging (M4).
 
 - `POST /api/import/batches/{id}/archive` also returns `"already_archived": int`; `kept` counts only records that changed
   since the import and are not archived.
+
+## 9. Demo deletion keeps what the user added (binding; replaces the refusal rule of §8.1)
+
+Found in the end-to-end run: after loading the demo the page switches to the demo project, so a new sample is easily
+created there; it gets the demo template and, like every templated sample, cannot move to another project. With §8.1 the
+demo could then never be deleted.
+
+- `DELETE /api/demo` deletes only **generated** content (records and files recorded in `demo_contents`, or recovered
+  for legacy demos) together with their file events, history entries, review items and stored copies.
+- Records and files the user added to the demo project stay. If any record remains, the project stays as an ordinary
+  project (same id and name, the demo marker `demo_project_id` is cleared, its template and settings are kept); if none
+  remains, the project and its template/settings/defaults are removed as before.
+- It is still refused, with 409 `示例样品和其他样品之间移动过附件，无法自动区分。请先把这些附件移回原来的样品。` and no change, when any
+  generated file (active or trashed) belongs to a non-generated record, or any non-generated file belongs to a generated
+  record.
+- Response: `{"deleted_records", "deleted_files", "kept_records": int, "project_kept": bool}`.
+- After a demo whose project was kept, `POST /api/demo` creates a new demo project with a fresh id (`demo`, `demo-2`, ...);
+  `project_id` in its response is authoritative.
