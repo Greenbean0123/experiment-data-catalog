@@ -279,3 +279,36 @@ onboarding and imports (M3), packaging (M4).
 - §6.4 hand-edit race; and a crash in the instant between publishing a folder backup's database and its conventions
   file can leave that one backup with the previous conventions file. Low-severity review findings after this round are
   recorded for M3 instead of blocking the M2 release.
+
+## 9. Release-check amendments (binding)
+
+### 9.1 Upgrade scope
+
+- Schema v3 was never released (the published edition is at v2). Upgrade guarantees cover v1/v2 catalogs and fresh v4
+  catalogs. Development catalogs at the v3 layout must still open without data loss, using the same legacy rules as v2.
+
+### 9.2 Legacy rows and legacy review decisions
+
+- `experiment_defaults` rows that existed before v4 have **unknown** origin. A split copies such a row only to resulting
+  keys that have samples; it never invents an origin key. Origin keys are recorded only for rows written under v4.
+- Review decisions made before v4 (no stored display list) cover each label in their fingerprint for every field kind it
+  can name on that record (built-in and template fields with that label), so an unchanged catalog never shows the same
+  issue as both decided and pending after upgrade.
+- Automatic missing-condition items always carry `missing` as a list (possibly empty) in `GET /api/reviews`, including
+  legacy items; decide requests send it back unchanged, so legacy items can be reopened and decided.
+
+### 9.3 Template coverage identity
+
+- Template coverage entries are `template:{project_id}:{template_revision}:{field_key}`.
+
+### 9.4 Folder backup publication order
+
+- The database-history copy is written and verified before the mirror's database is replaced; any failure before the
+  database replacement leaves the previous backup generation (database, history, conventions, marker) unchanged.
+
+### 9.5 Committed but not yet published conventions
+
+- If `PUT /api/local-catalog` commits the database transaction but cannot replace the file (e.g. the file is held open),
+  it answers 200 with the new `catalog`, `revision`, `active_prefixes` and `"publication_pending": true`. The change is
+  accepted and will be published automatically (§8.2). The UI tells the user that the conventions were saved and the file
+  will be written shortly. A failure before commit still returns an error and changes nothing.
