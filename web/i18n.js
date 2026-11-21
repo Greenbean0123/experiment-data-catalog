@@ -2,6 +2,7 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "已删除示例数据（{count} 条样品）。“{name}”中还有你添加的待核对事项，项目已保留，可以在项目设置里改名。": "Demo data deleted ({count} samples). “{name}” still holds review items you added, so it was kept; you can rename it in Project settings.",
     "已删除示例数据（{count} 条样品）。你添加的 {kept} 条样品保留在“{name}”中，可以在项目设置里改名。": "Demo data deleted ({count} samples). The {kept} samples you added stay in “{name}”; you can rename it in Project settings.",
     "删除示例实验库？程序生成的示例样品和附件会永久删除；你自己添加的样品会保留。其他项目不受影响。": "Delete the demo catalog? The generated demo samples and attachments are removed permanently; samples you added are kept. Other projects are not affected.",
     "示例样品和其他样品之间移动过附件，无法自动区分。请先把这些附件移回原来的样品。": "Attachments were moved between demo samples and other samples, so they cannot be told apart automatically. Move those attachments back to their original samples first.",

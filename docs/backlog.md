@@ -27,6 +27,8 @@ user can hit in normal use that lose or silently change stored data, show wrong 
 - Hand edits of `local-catalog.json` while the app runs can be overwritten by a save in the same instant (M2 §6.4).
 - A crash between publishing a folder backup's database and its conventions file can leave that one backup with the
   previous conventions file (M2 §8.5).
+- A data folder used with an unreleased pre-counter M3 build that deleted its demo there can reuse the id `demo` once
+  (M3 §10.3 applies from the released build on).
 
 ## Planned
 

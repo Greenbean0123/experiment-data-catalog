@@ -2811,5 +2811,26 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.deepEqual(mapped, ["sample_id", "", "temperature", "", "duration"], "Only headers in the stored unit are guessed");
     } finally { env.dom.window.close(); }
   }
+  {
+    // A bracketed part of a template label is not a unit: each column goes to the field whose full label it carries.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const template = {name: "Vacuum", fields: [
+      {key: "0", label: "Chamber pressure (base)", section: "condition", type: "number", unit: "Pa", options: [], required: false},
+      {key: "1", label: "Chamber pressure", section: "condition", type: "number", unit: "Pa", options: [], required: false},
+      {key: "2", label: "Bias", section: "condition", type: "number", unit: "V", options: [], required: false}]};
+    const env = await boot({savedLanguage: "en", readHandler: catalog => reply(200, {...catalog, templates: {default: template}}), m3Handler: url => {
+      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "",
+        columns: ["Sample ID", "Chamber pressure (base)", "Chamber pressure (Pa)", "Bias (mV)"], rows: [["S-1", "1", "25", "5"]], total_rows: 1});
+      throw new Error("Unhandled " + url);
+    }});
+    try {
+      const {$, w} = env;
+      $("records-import-view").click();
+      Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], "vacuum.csv")], configurable: true});
+      $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+      const mapped = [0, 1, 2, 3].map(index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value);
+      assert.deepEqual(mapped, ["sample_id", "template:0", "template:1", ""], "Full labels win; a different unit is not guessed");
+    } finally { env.dom.window.close(); }
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -3136,7 +3136,9 @@ function initialize() {
         const result = await api("api/demo", {method: "DELETE", body: JSON.stringify({confirm: "delete-demo"})});
         if (projectId === demo && !result.project_kept) projectId = "default";
         await load();
-        toast(result.project_kept
+        toast(result.project_kept && !result.kept_records
+          ? t("已删除示例数据（{count} 条样品）。“{name}”中还有你添加的待核对事项，项目已保留，可以在项目设置里改名。", {count: result.deleted_records, name: projectLabel(demo)})
+          : result.project_kept
           ? t("已删除示例数据（{count} 条样品）。你添加的 {kept} 条样品保留在“{name}”中，可以在项目设置里改名。", {count: result.deleted_records, kept: result.kept_records, name: projectLabel(demo)})
           : t("已删除示例实验库（{count} 条样品）。", {count: result.deleted_records}));
       } else {
@@ -3269,11 +3271,20 @@ function initialize() {
       return false;
     };
     headers.forEach((header, index) => offer(IMPORT_GUESSES, index, headerKey(header)));
-    headers.forEach((header, index) => {
+    // Template fields: the full label first ("Chamber pressure (base)" is a label, not a unit), optionally followed by the
+    // field's own unit; then labels without brackets, where anything bracketed in the header lies beyond the label.
+    const fullKey = value => String(value).toLowerCase().replace(/（/g, "(").replace(/）/g, ")").replace(/\s+/g, " ").trim();
+    const exactLabel = (header, field) => {
+      const key = fullKey(header), label = fullKey(field.label), suffix = key.match(/^(.*?)\s*\(([^()]*)\)$/);
+      return key === label || Boolean(field.unit && suffix && suffix[1] === label && unitKey(suffix[2]) === unitKey(field.unit));
+    };
+    const offerTemplate = test => headers.forEach((header, index) => {
       if (guesses[index]) return;
-      const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === headerKey(header) && unitFits(header, item));
+      const template = targets.find(item => item.field && !used.has(item.value) && test(header, item));
       if (template) { guesses[index] = template.value; used.add(template.value); }
     });
+    offerTemplate((header, item) => exactLabel(header, item.field));
+    offerTemplate((header, item) => !/[（(]/.test(item.field.label) && headerKey(item.field.label) === headerKey(header) && unitFits(header, item));
     headers.forEach((header, index) => { if (!guesses[index]) offer(IMPORT_GENERIC, index, headerKey(header)); });
     return guesses;
   }
