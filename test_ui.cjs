@@ -2459,8 +2459,9 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     const env = await boot({savedLanguage: "en", extraProjects: [{id: "other-lab", name: "Other lab"}],
       extraRows: [sample("HIDDEN", {temperature: 250, precursor: "SecretPrecursor"}), sample("SHOWN", {project_id: "other-lab", project_name: "Other lab", temperature: 250})],
       readHandler: catalog => reply(200, {...catalog, project_settings: settings}),
-      settingsHandler: url => reply(200, {catalog: {notebook_prefixes: [], precursor_aliases: [{label: "Compound", aliases: ["Foo\nBar"]}], translations: {}}, revision: "r1",
-        ...(url.includes("local-catalog") && env.broken ? {error: "local-catalog.json 无法解析，请先修复文件或删除后再编辑。"} : {})})});
+      settingsHandler: url => reply(200, {catalog: {notebook_prefixes: [], precursor_aliases: env.conflict ? [] : [{label: "Compound", aliases: ["Foo\nBar"]}], translations: {}}, revision: "r1",
+        ...(url.includes("local-catalog") && env.broken ? {error: "local-catalog.json 无法解析，请先修复文件或删除后再编辑。", error_kind: "unparsable"} : {}),
+        ...(url.includes("local-catalog") && env.conflict ? {error: "以下实验在新的编号前缀下会合并，但共用条件不一致：AB-1-42、AB-I-42。请先统一这些实验的共用条件，再修改前缀。", error_kind: "prefix_conflict"} : {})})});
     try {
       const {$, w} = env;
       const choose = value => { $("project-select").value = value; $("project-select").dispatchEvent(new w.Event("change", {bubbles: true})); };
@@ -2477,6 +2478,9 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal([...$("filter-precursor").options].some(option => option.value === "SecretPrecursor"), false);
       $("search").value = "SecretPrecursor"; $("search").dispatchEvent(new w.Event("input", {bubbles: true}));
       assert.equal(w.document.querySelector('[data-expand="experiment:default:hidden"]'), null, "Text search ignores switched-off fields");
+      $("global-search").value = "SecretPrecursor"; $("global-search").dispatchEvent(new w.Event("input", {bubbles: true}));
+      assert.equal($("global-results").querySelectorAll("[data-global-key]").length, 0, "Ctrl+K search ignores switched-off fields too");
+      $("global-search").value = ""; $("global-search").dispatchEvent(new w.Event("input", {bubbles: true}));
       $("clear-filters").click();
       // A reversed range entered while temperature was visible does not empty the list once it is hidden everywhere.
       $("temp-min").value = "300"; $("temp-max").value = "100"; $("temp-min").dispatchEvent(new w.Event("input", {bubbles: true}));
@@ -2487,8 +2491,15 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.equal($("filter-error").hidden, true);
       // Conventions: an alias with a line break is split visibly; an unreadable file blocks saving.
       $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
-      assert.match($("conventions-error").textContent, /contain line breaks/);
+      assert.match($("conventions-error").textContent, /control characters/);
+      assert.equal($("save-conventions").disabled, true, "Values the form cannot represent are never rewritten");
       $("close-conventions").click();
+      env.conflict = true;
+      $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
+      assert.match($("conventions-error").textContent, /would merge/);
+      assert.equal($("save-conventions").disabled, false, "A prefix conflict can be fixed in the editor");
+      $("close-conventions").click();
+      env.conflict = false;
       env.broken = true;
       $("conventions-view").click(); for (let i = 0; i < 3; i++) await flush();
       assert.match($("conventions-error").textContent, /cannot be read/);

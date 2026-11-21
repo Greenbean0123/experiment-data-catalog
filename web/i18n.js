@@ -2,6 +2,7 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "有名称或别名包含换行等控制字符，无法在这里编辑。请先停止程序，手工修改 local-catalog.json。": "Some names or aliases contain line breaks or other control characters and cannot be edited here. Stop the app and edit local-catalog.json by hand.",
     "无单位": "no unit",
     "有别名包含换行，编辑器已把它拆成多个别名。请核对后再保存。": "Some aliases contain line breaks; the editor has split them into separate aliases. Check them before saving.",
     "每组一个显示名称，别名每行一个。只影响显示、筛选和排序（按列出的顺序），保存的原值不变。": "One display name per group, one alias per line. Affects display, filtering and sort order (as listed) only; stored values stay unchanged.",

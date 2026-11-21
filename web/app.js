@@ -632,9 +632,9 @@ function initialize() {
     $("overview-view").hidden = workspaceView;
     $("experiment-workspace").hidden = !workspaceView;
     const pageTitle = workspaceView ? t("实验工作台") : archived ? t("已归档实验") : kind && kind !== "none" ? t("{kind} 数据", {kind: I18n.dataKind(kind, language)}) : t("实验管理");
-    $("page-title").textContent = t(pageTitle);
-    $("breadcrumb-current").textContent = t(pageTitle);
-    document.title = `${t("实验数据目录")} · ${t(pageTitle)}`;
+    $("page-title").textContent = pageTitle;
+    $("breadcrumb-current").textContent = pageTitle;
+    document.title = `${t("实验数据目录")} · ${pageTitle}`;
     for (const [id, activeView] of [["active-view", !workspaceView && !archived && (!kind || kind === "none")], ["archived-view", !workspaceView && archived], ["experiment-view", workspaceView]]) {
       $(id).classList.toggle("active", activeView);
       $(id).setAttribute("aria-pressed", String(activeView));
@@ -3003,15 +3003,16 @@ function initialize() {
   let conventionsBlocked = false;
   function fillConventions(result) {
     const catalog = result?.catalog || {};
-    conventionsBlocked = Boolean(result?.error);
-    if (conventionsBlocked) showError("conventions-error", result.error);
+    const unrepresentable = (Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : [])
+      .some(entry => [entry.label, ...(entry.aliases || [])].some(value => /[\u0000-\u001f\u007f]/.test(String(value))));
+    conventionsBlocked = result?.error_kind === "unparsable" || (Boolean(result?.error) && result?.error_kind !== "prefix_conflict") || unrepresentable;
+    if (result?.error) showError("conventions-error", result.error);
+    else if (unrepresentable) showError("conventions-error", "有名称或别名包含换行等控制字符，无法在这里编辑。请先停止程序，手工修改 local-catalog.json。");
     conventionsRevision = typeof result?.revision === "string" ? result.revision : "";
     $("conventions-prefixes").value = (catalog.notebook_prefixes || []).join(", ");
     const aliasEntries = Array.isArray(catalog.precursor_aliases) ? catalog.precursor_aliases : [];
     renderAliasRows(aliasEntries);
-    if (!conventionsBlocked && aliasEntries.some(entry => (entry.aliases || []).some(alias => /[\r\n]/.test(alias)))) {
-      showError("conventions-error", "有别名包含换行，编辑器已把它拆成多个别名。请核对后再保存。");
-    }
+
     const translations = catalog.translations || {};
     $("conventions-translations").value = Object.keys(translations).some(key => Object.keys(translations[key] || {}).length) ? JSON.stringify(translations, null, 2) : "";
     conventionsDirty = false;
@@ -3792,14 +3793,15 @@ function initialize() {
   function renderGlobalResults() {
     const query = $("global-search").value.trim().toLocaleLowerCase();
     const scoped = records.filter(record => !record.archived && (!projectId || (record.project_id || "default") === projectId));
-    globalMatches = query ? groupRecords(scoped).filter(group => !group.dataset && [group.number, ...group.records.flatMap(record => [record.sample_id, ...conditionMembers(record, "precursor")])]
+    const precursors = record => builtinEnabled(record.project_id, "precursor") ? conditionMembers(record, "precursor") : [];
+    globalMatches = query ? groupRecords(scoped).filter(group => !group.dataset && [group.number, ...group.records.flatMap(record => [record.sample_id, ...precursors(record)])]
       .some(value => String(value || "").toLocaleLowerCase().includes(query))).slice(0, 8) : [];
     globalIndex = Math.min(globalIndex, Math.max(0, globalMatches.length - 1));
     const list = $("global-results");
     list.hidden = !query;
     $("global-search").setAttribute("aria-expanded", String(!list.hidden));
     list.innerHTML = globalMatches.map((group, index) => {
-      const precursor = [...new Set(group.records.flatMap(record => conditionMembers(record, "precursor")).filter(Boolean))].join(" / ") || t("尚未记录");
+      const precursor = [...new Set(group.records.flatMap(precursors).filter(Boolean))].join(" / ") || t("尚未记录");
       return `<button type="button" role="option" id="global-option-${index}" class="global-option ${index === globalIndex ? "active" : ""}" aria-selected="${index === globalIndex}" data-global-key="${escape(group.key)}"><strong>${escape(group.number)}</strong><small>${escape(t("{count} 条样品 · {precursor}", {count: group.records.length, precursor}))}${!projectId ? " · " + escape(projectLabel(group.projectId)) : ""}</small></button>`;
     }).join("") || `<p class="global-empty">${t("没有匹配的实验")}</p>`;
     if (globalMatches.length) $("global-search").setAttribute("aria-activedescendant", `global-option-${globalIndex}`); else $("global-search").removeAttribute("aria-activedescendant");
