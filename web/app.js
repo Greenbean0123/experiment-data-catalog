@@ -3267,20 +3267,21 @@ function initialize() {
     return bases.some(base => names.some(name => base.toLowerCase() === normHeader(name).toLowerCase()));
   }
   function guessTargets(headers, targets) {
-    // used: fields already taken or contested; a column or field that tied in one tier stays unguessed in later tiers.
-    const guesses = headers.map(() => ""), used = new Set(), contested = new Set();
+    // A column or field that tied in one tier is never guessed later; a tied field still counts as a candidate, so it
+    // keeps later tiers ambiguous instead of leaving another field as the only fit.
+    const guesses = headers.map(() => ""), taken = new Set(), tiedFields = new Set(), tiedColumns = new Set();
     const candidates = table => targets.flatMap(target => {
       if (target.field) return table === IMPORT_GENERIC ? [] : [{target: target.value, names: [target.field.label], units: unitSpellings(target.field.unit)}];
       return table[target.value] ? [{target: target.value, names: table[target.value], units: unitSpellings(BUILTIN_UNITS[target.value])}] : [];
     });
     const tier = (table, withUnit) => {
-      const options = candidates(table).filter(option => !used.has(option.target));
-      const fits = headers.map((header, index) => guesses[index] || contested.has(index) ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
+      const options = candidates(table).filter(option => !taken.has(option.target));
+      const fits = headers.map((header, index) => guesses[index] || tiedColumns.has(index) ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
       fits.forEach((list, index) => {
-        if (list.length === 1 && fits.filter(other => other.includes(list[0])).length === 1) guesses[index] = list[0];
-        else if (list.length) { contested.add(index); for (const target of list) used.add(target); }
+        if (list.length === 1 && !tiedFields.has(list[0]) && fits.filter(other => other.includes(list[0])).length === 1) guesses[index] = list[0];
+        else if (list.length) { tiedColumns.add(index); for (const target of list) tiedFields.add(target); }
       });
-      for (const target of guesses) if (target) used.add(target);
+      for (const target of guesses) if (target) taken.add(target);
     };
     tier(IMPORT_GUESSES, false); tier(IMPORT_GUESSES, true); tier(IMPORT_GENERIC, false); tier(IMPORT_GENERIC, true);
     return guesses;

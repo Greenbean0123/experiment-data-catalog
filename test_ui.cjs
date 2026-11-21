@@ -2829,5 +2829,26 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       }
     } finally { env.dom.window.close(); }
   }
+  {
+    // Ties stay unguessed in later tiers: a tied field keeps the next tier ambiguous; without a template no generic guess fills a tie.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const run = async (templates, columns) => {
+      const env = await boot({savedLanguage: "en", readHandler: catalog => reply(200, {...catalog, templates}), m3Handler: url => {
+        if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "", columns, rows: [columns.map(() => "1")], total_rows: 1});
+        throw new Error("Unhandled " + url);
+      }});
+      try {
+        const {$, w} = env;
+        $("records-import-view").click();
+        Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], "t.csv")], configurable: true});
+        $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+        return columns.map((_, index) => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value);
+      } finally { env.dom.window.close(); }
+    };
+    const tied = {default: {name: "Tie", fields: [{key: "0", label: "Temp", section: "condition", type: "text", unit: "", options: [], required: false},
+      {key: "1", label: "Temperature", section: "result", type: "number", unit: "°C", options: [], required: false}]}};
+    assert.deepEqual(await run(tied, ["Sample ID", "Temp", "Temperature (°C)"]), ["sample_id", "", ""], "A tied built-in still makes the next tier ambiguous");
+    assert.deepEqual(await run({}, ["Reaction time", "Duration", "Time"]), ["", "", ""], "A specific tie is not filled by a generic name");
+  }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
