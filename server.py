@@ -97,7 +97,7 @@ DEMO_PROJECT = "demo"
 DEMO_NAME = "示例项目"
 DEMO_RECORD_COUNT = 12
 DEMO_FILE_RECORDS = (0, 3, 4, 8)
-DEMO_CONTENTS_CONFLICT = "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。"
+DEMO_CONTENTS_CONFLICT = "示例样品和其他样品之间移动过附件，无法自动区分。请先把这些附件移回原来的样品。"
 DUPLICATE_CATALOG_NAME = "该名称已存在，请直接选择或使用其他名称。"
 MAX_RECORD_UPLOAD = 5 * 1024 * 1024
 MAX_WORKBOOK_XML = 64 * 1024 * 1024
@@ -2304,11 +2304,21 @@ class Store:
         try:
             with self.lock, self.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                if db.execute("SELECT 1 FROM projects WHERE id=?", (DEMO_PROJECT,)).fetchone():
+                projects = db.execute("SELECT id, name FROM projects").fetchall()
+                project_ids = {row["id"] for row in projects}
+                if self.setting(db, "demo_project_id") in project_ids:
                     raise Problem("示例实验库已存在。", 409)
-                self.check_project_name(db, DEMO_NAME)
-                db.execute("INSERT INTO projects VALUES (?,?)", (DEMO_PROJECT, DEMO_NAME))
-                self.write_setting(db, "demo_project_id", DEMO_PROJECT)
+                project_id, suffix = DEMO_PROJECT, 1
+                while project_id in project_ids:
+                    suffix += 1
+                    project_id = f"{DEMO_PROJECT}-{suffix}"
+                names = {row["name"].casefold() for row in projects}
+                name, suffix = DEMO_NAME, 1
+                while name.casefold() in names:
+                    suffix += 1
+                    name = f"{DEMO_NAME} {suffix}"
+                db.execute("INSERT INTO projects VALUES (?,?)", (project_id, name))
+                self.write_setting(db, "demo_project_id", project_id)
                 template = validate_template({"name": "薄膜制备示例", "fields": [
                     {"label": "基底", "section": "condition", "type": "single", "options": ["玻璃", "硅片"]},
                     {"label": "膜厚", "section": "condition", "type": "number", "unit": "nm"},
@@ -2319,8 +2329,8 @@ class Store:
                     {"section": "condition", "label": "膜厚", "check_missing": True},
                     {"section": "result", "label": "方阻", "check_missing": True},
                 ]}, template)
-                db.execute("INSERT INTO template_versions VALUES (?,1,?)", (DEMO_PROJECT, json.dumps(template, ensure_ascii=False)))
-                db.execute("INSERT INTO project_settings VALUES (?,?,1)", (DEMO_PROJECT, json.dumps(settings, ensure_ascii=False)))
+                db.execute("INSERT INTO template_versions VALUES (?,1,?)", (project_id, json.dumps(template, ensure_ascii=False)))
+                db.execute("INSERT INTO project_settings VALUES (?,?,1)", (project_id, json.dumps(settings, ensure_ascii=False)))
                 kind = db.execute("SELECT name FROM categories ORDER BY (name='XRD') DESC, rowid LIMIT 1").fetchone()[0]
                 now = timestamp()
                 for index in range(DEMO_RECORD_COUNT):
@@ -2331,7 +2341,7 @@ class Store:
                                       "notes": "仅供演示的合成数据。 / Synthetic demo data.", "status": STATUSES[-1]})
                     values = {"0": template["fields"][0]["options"][sample % 2], "1": 80 + 20 * sample,
                               "2": 200 + 50 * group, "3": 110 - 10 * group - 5 * sample}
-                    clean.update(project_id=DEMO_PROJECT, lab_data=json.dumps({"template_revision": 1, "values": values}, ensure_ascii=False))
+                    clean.update(project_id=project_id, lab_data=json.dumps({"template_revision": 1, "values": values}, ensure_ascii=False))
                     file_id = uuid.uuid4().hex if index in DEMO_FILE_RECORDS else None
                     if file_id:
                         clean["result_summary"] = json.dumps({"evidence_ids": [file_id]})
@@ -2359,7 +2369,7 @@ class Store:
             for path in files:
                 path.unlink(missing_ok=True)
             raise
-        return {"project_id": DEMO_PROJECT, "records": len(records), "files": len(files)}
+        return {"project_id": project_id, "records": len(records), "files": len(files)}
 
     def demo_generated_ids(self, db):
         try:
@@ -2381,24 +2391,23 @@ class Store:
             raise Problem(DEMO_CONTENTS_CONFLICT, 409)
         return records, files
 
-    def check_demo_contents(self, db, records, files):
-        generated_records, generated_files = self.demo_generated_ids(db)
-        slots = ",".join("?" for _ in generated_files)
-        if (not records <= generated_records or not files <= generated_files
-                or db.execute(f"SELECT count(*) FROM files WHERE id IN ({slots})",
-                              tuple(generated_files)).fetchone()[0] != len(files)):
-            raise Problem(DEMO_CONTENTS_CONFLICT, 409)
-        events = db.execute(f"""SELECT file_id, record_id, action, after FROM file_events
-                               WHERE file_id IN ({slots}) OR action='move'
-                               OR record_id IN (SELECT id FROM experiments WHERE project_id=?)""",
-                            (*generated_files, DEMO_PROJECT))
-        for event in events:
-            # A move stores its original owner in record_id and its destination in after.
-            generated = event["file_id"] in generated_files
-            if generated != (event["record_id"] in records):
-                raise Problem(DEMO_CONTENTS_CONFLICT, 409)
-            if event["action"] == "move" and generated != (json.loads(event["after"])["record_id"] in records):
-                raise Problem(DEMO_CONTENTS_CONFLICT, 409)
+    @staticmethod
+    def clear_deleted_demo_links(db, records, files):
+        now = timestamp()
+        for row in db.execute("SELECT id, lab_data, result_summary FROM experiments").fetchall():
+            lab_data, result_summary = row["lab_data"], row["result_summary"]
+            details, result = json.loads(lab_data), json.loads(result_summary)
+            if details.get("parent_id") in records:
+                del details["parent_id"]
+                lab_data = json.dumps(details, ensure_ascii=False)
+            evidence = result.get("evidence_ids", [])
+            kept = [file_id for file_id in evidence if file_id not in files]
+            if kept != evidence:
+                result["evidence_ids"] = kept
+                result_summary = json.dumps(result, ensure_ascii=False)
+            if lab_data != row["lab_data"] or result_summary != row["result_summary"]:
+                db.execute("UPDATE experiments SET lab_data=?, result_summary=?, revision=revision+1, updated_at=? WHERE id=?",
+                           (lab_data, result_summary, now, row["id"]))
 
     def delete_demo(self, payload):
         if not isinstance(payload, dict) or payload.get("confirm") != "delete-demo":
@@ -2406,35 +2415,58 @@ class Store:
         with self.file_copy_lock:
             with self.lock, self.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                if (self.setting(db, "demo_project_id") != DEMO_PROJECT
-                        or not db.execute("SELECT 1 FROM projects WHERE id=?", (DEMO_PROJECT,)).fetchone()):
+                project_id = self.setting(db, "demo_project_id")
+                if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
                     raise Problem("没有示例实验库。", 404)
-                demo_records = "SELECT id FROM experiments WHERE project_id=?"
-                demo_files = f"SELECT id FROM files WHERE experiment_id IN ({demo_records})"
-                args = (DEMO_PROJECT,)
-                records = {row["id"] for row in db.execute(demo_records, args)}
-                pending = dict(db.execute(f"SELECT id,size FROM files WHERE id IN ({demo_files})", args))
-                self.check_demo_contents(db, records, pending.keys())
-                batches = db.execute(f"SELECT DISTINCT batch_id FROM history_entries WHERE record_id IN ({demo_records})", args).fetchall()
-                db.execute(f"DELETE FROM history_entries WHERE record_id IN ({demo_records})", args)
+                records, files = self.demo_generated_ids(db)
+                record_ids, file_ids = tuple(records), tuple(files)
+                record_slots = ",".join("?" for _ in record_ids)
+                file_slots = ",".join("?" for _ in file_ids)
+                if db.execute(f"""SELECT 1 FROM files
+                                  WHERE (id IN ({file_slots})) <> (experiment_id IN ({record_slots})) LIMIT 1""",
+                              (*file_ids, *record_ids)).fetchone():
+                    raise Problem(DEMO_CONTENTS_CONFLICT, 409)
+                kept_records = db.execute(f"SELECT count(*) FROM experiments WHERE project_id=? AND id NOT IN ({record_slots})",
+                                          (project_id, *record_ids)).fetchone()[0]
+                pending = dict(db.execute(f"SELECT id,size FROM files WHERE id IN ({file_slots})", file_ids))
+                batches = db.execute(f"SELECT DISTINCT batch_id FROM history_entries WHERE record_id IN ({record_slots})",
+                                     record_ids).fetchall()
+                db.execute(f"DELETE FROM history_entries WHERE record_id IN ({record_slots})", record_ids)
                 db.executemany("DELETE FROM history_batches WHERE id=? AND NOT EXISTS "
                                "(SELECT 1 FROM history_entries WHERE batch_id=history_batches.id)", batches)
-                reviews = f"SELECT id FROM review_items WHERE project_id=? OR record_id IN ({demo_records})"
-                db.execute(f"UPDATE history_batches SET review_id=NULL,review_revision=NULL WHERE review_id IN ({reviews})", args * 2)
-                db.execute(f"DELETE FROM review_items WHERE id IN ({reviews})", args * 2)
-                db.execute(f"DELETE FROM record_sources WHERE record_id IN ({demo_records})", args)
-                db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({demo_files})", args)
-                db.execute(f"DELETE FROM file_events WHERE record_id IN ({demo_records})", args)
-                db.execute(f"DELETE FROM files WHERE id IN ({demo_files})", args)
-                count = db.execute("DELETE FROM experiments WHERE project_id=?", args).rowcount
-                for table in ("template_versions", "project_settings", "experiment_defaults"):
-                    db.execute(f"DELETE FROM {table} WHERE project_id=?", args)
-                db.execute("DELETE FROM projects WHERE id=?", args)
+                review_filter = f"record_id IN ({record_slots})"
+                review_args = record_ids
+                if not kept_records:
+                    review_filter += " OR (project_id=? AND record_id IS NULL)"
+                    review_args += (project_id,)
+                db.execute(f"""UPDATE history_batches SET review_id=NULL,review_revision=NULL
+                               WHERE review_id IN (SELECT id FROM review_items WHERE {review_filter})""", review_args)
+                db.execute(f"DELETE FROM review_items WHERE {review_filter}", review_args)
+                db.execute(f"DELETE FROM record_sources WHERE record_id IN ({record_slots})", record_ids)
+                db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({file_slots})", file_ids)
+                db.execute(f"DELETE FROM file_events WHERE file_id IN ({file_slots}) OR record_id IN ({record_slots})",
+                           (*file_ids, *record_ids))
+                # Edits that move a file store the destination in the event's after state.
+                moved_events = [(event["id"],) for event in db.execute(
+                    "SELECT id, after FROM file_events WHERE action IN ('move', 'rename', 'recategorize')")
+                    if json.loads(event["after"])["record_id"] in records]
+                db.executemany("DELETE FROM file_events WHERE id=?", moved_events)
+                db.execute(f"DELETE FROM files WHERE id IN ({file_slots})", file_ids)
+                count = db.execute(f"DELETE FROM experiments WHERE id IN ({record_slots})", record_ids).rowcount
+                self.clear_deleted_demo_links(db, records, files)
+                if not kept_records:
+                    db.execute("""UPDATE review_items SET project_id=(
+                                      SELECT project_id FROM experiments WHERE id=review_items.record_id)
+                                  WHERE project_id=?""", (project_id,))
+                    for table in ("template_versions", "project_settings", "experiment_defaults"):
+                        db.execute(f"DELETE FROM {table} WHERE project_id=?", (project_id,))
+                    db.execute("DELETE FROM projects WHERE id=?", (project_id,))
                 db.execute("DELETE FROM app_settings WHERE key IN ('demo_project_id', 'demo_contents')")
                 db.executemany("INSERT OR REPLACE INTO app_settings VALUES (?,?)",
                                ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
             self.unlink_purged_files(pending)
-        return {"deleted_records": count, "deleted_files": len(pending)}
+        return {"deleted_records": count, "deleted_files": len(pending),
+                "kept_records": kept_records, "project_kept": bool(kept_records)}
 
     def expire_record_uploads(self):
         now = monotonic()
@@ -4065,6 +4097,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
                               "translations": store.local_translations(local), "conventions": conventions,
                               "project_settings": project_settings, "onboarding": store.onboarding(db),
+                              "demo_project_id": store.setting(db, "demo_project_id"),
                               "trash_count": store.trash_count(db), "category_counts": store.category_counts(db)}
                 return self.send_json(result)
             if path == "/api/trash":

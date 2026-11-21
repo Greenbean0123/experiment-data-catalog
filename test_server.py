@@ -2896,6 +2896,7 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.request_json(route, method="DELETE", status=400), {"error": "请确认删除示例实验库。"})
         catalog = self.request_json("/api/experiments")
         self.assertEqual(catalog["onboarding"], {"done": False, "empty": True})
+        self.assertEqual(catalog["demo_project_id"], "demo")
         self.assertIn({"id": "demo", "name": "示例项目"}, catalog["projects"])
         self.assertEqual([field["unit"] for field in catalog["templates"]["demo"]["fields"]], ["", "nm", "°C", "Ω/sq"])
         self.assertEqual(len(catalog["project_settings"]["demo"]["fields"]), 2)
@@ -2939,12 +2940,16 @@ class Milestone3Tests(unittest.TestCase):
             preserved = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE {key}=?", (with_data[key],))]
                          for table, key in tables.items()}
         real = next(row for row in self.store.list() if row["id"] == real_id)
-        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"), {"deleted_records": 12, "deleted_files": 4})
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 0, "project_kept": False})
         self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE", 404), {"error": "没有示例实验库。"})
         self.assertEqual(self.store.list(), [real])
         remaining = self.request_json(f"/api/history/{bulk_batch}")
         self.assertEqual((remaining["action"], [row["id"] for row in remaining["rows"]]), ("bulk", [real_id]))
-        self.assertEqual(self.request_json("/api/experiments")["onboarding"], {"done": False, "empty": False})
+        catalog = self.request_json("/api/experiments")
+        self.assertEqual(catalog["onboarding"], {"done": False, "empty": False})
+        self.assertIsNone(catalog["demo_project_id"])
+        self.assertNotIn("demo", {project["id"] for project in catalog["projects"]})
         self.assertEqual((self.store.files / real_file).read_bytes(), b"real")
         self.assertFalse(any((self.store.files / file_id).exists() for file_id in demo_files))
         with self.store.connect() as db:
@@ -2962,7 +2967,65 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.request_json(route, {}, "POST", 201), created)
         self.assertEqual(content([row for row in self.store.list() if row["project_id"] == "demo"]), original)
 
-    def test_demo_deletion_rejects_real_record_with_attachment_moved_out(self):
+    def test_demo_deletion_keeps_a_new_sample_and_allows_a_new_demo(self):
+        route = "/api/demo"
+        self.request_json(route, {}, "POST", 201)
+        before = self.request_json("/api/experiments")
+        samples_route = "/api/experiments"
+        demo = before["experiments"]
+        generated_records = {row["id"] for row in demo}
+        generated_files = {file["id"] for row in demo for file in row["files"]}
+        user = self.request_json(samples_route, {"project_id": "demo", "sample_id": "REAL-IN-DEMO",
+                                 "lab_data": {"parent_id": demo[0]["id"], "treatment": "User treatment"},
+                                 "notes": "User notes"}, "POST", 201)["record"]
+        self.assertEqual(user["lab_data"]["template_revision"], 1)
+        self.assertEqual(self.request_json(f"{samples_route}/{user['id']}", {**user, "project_id": "default"}, "PUT", 409),
+                         {"error": "使用项目模板的样品不能移到其他项目。"})
+        user_file = self.store.add_file(user["id"], "user.csv", "XRD", io.BytesIO(b"keep"), 4)
+        user_review = self.store.add_review({"record_id": user["id"], "title": "User review"})["id"]
+        demo_review = self.store.add_review({"record_id": demo[0]["id"], "title": "Demo review"})["id"]
+        with self.store.connect() as db:
+            self.store.write_shared_defaults(db, "demo", "real", server.EMPTY_SHARED_STATE)
+
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 1, "project_kept": True})
+        catalog = self.request_json(samples_route)
+        self.assertIsNone(catalog["demo_project_id"])
+        self.assertFalse(catalog["onboarding"]["empty"])
+        self.assertEqual(catalog["projects"], before["projects"])
+        self.assertEqual(catalog["templates"], before["templates"])
+        self.assertEqual(catalog["project_settings"], before["project_settings"])
+        [kept] = catalog["experiments"]
+        self.assertEqual((kept["id"], kept["sample_id"], kept["project_id"], kept["notes"]),
+                         (user["id"], "REAL-IN-DEMO", "demo", "User notes"))
+        self.assertEqual(kept["lab_data"], {"template_revision": 1, "treatment": "User treatment"})
+        self.assertEqual([file["id"] for file in kept["files"]], [user_file])
+        self.assertEqual({path.name for path in self.store.files.iterdir()}, {user_file})
+        self.assertEqual(self.request(f"/api/files/{user_file}")[1], b"keep")
+        with self.store.connect() as db:
+            self.assertIsNone(self.store.setting(db, "demo_contents"))
+            self.assertEqual(self.store.read_shared_defaults(db, "demo", "real"), server.EMPTY_SHARED_STATE)
+            for table, column, ids in (("history_entries", "record_id", generated_records),
+                                       ("file_events", "file_id", generated_files)):
+                self.assertFalse({row[column] for row in db.execute(f"SELECT {column} FROM {table}")} & ids)
+            self.assertEqual({row["id"] for row in db.execute("SELECT id FROM review_items")}, {user_review})
+            self.assertIsNone(db.execute("SELECT id FROM review_items WHERE id=?", (demo_review,)).fetchone())
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+        updated = self.request_json(f"{samples_route}/{user['id']}", {**kept, "notes": "Still editable"}, "PUT")["record"]
+        self.assertEqual(updated["notes"], "Still editable")
+        self.assertEqual(self.request_json(route, {}, "POST", 201), {"project_id": "demo-2", "records": 12, "files": 4})
+        self.assertEqual(self.request_json(route, {}, "POST", 409), {"error": "示例实验库已存在。"})
+        catalog = self.request_json(samples_route)
+        self.assertEqual(catalog["demo_project_id"], "demo-2")
+        self.assertIn({"id": "demo", "name": "示例项目"}, catalog["projects"])
+        self.assertIn({"id": "demo-2", "name": "示例项目 2"}, catalog["projects"])
+        self.assertEqual({row["id"] for row in catalog["experiments"] if row["project_id"] == "demo"}, {user["id"]})
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 0, "project_kept": False})
+        self.assertEqual(self.store.list(), [updated])
+
+    def test_demo_deletion_keeps_archived_real_record_with_attachment_moved_out(self):
         self.store.create_demo()
         source = self.store.save({"sample_id": "Source"})
         target = self.store.save({"sample_id": "Destination"})
@@ -2973,41 +3036,72 @@ class Milestone3Tests(unittest.TestCase):
         source_record = next(row for row in self.store.list() if row["id"] == source)
         self.assertEqual(source_record["files"], [])
         self.store.save({**source_record, "project_id": "demo"}, source)
-
-        before = (self.request_json("/api/experiments"), self.request_json("/api/history"))
-        file_ids = {path.name for path in self.store.files.iterdir()}
-        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE", 409),
-                         {"error": "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。"})
-        self.assertEqual((self.request_json("/api/experiments"), self.request_json("/api/history")), before)
-        self.assertEqual({path.name for path in self.store.files.iterdir()}, file_ids)
+        self.store.archive(source, {"archived": True, "revision": source_record["revision"] + 1})
+        kept = [row for row in self.store.list() if row["id"] in {source, target}]
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 1, "project_kept": True})
+        self.assertEqual(self.store.list(), kept)
         self.assertEqual(self.request(f"/api/files/{file_id}")[1], b"keep")
 
-    def test_demo_deletion_rejects_generated_file_moved_to_real_record(self):
+    def test_demo_deletion_preserves_review_for_record_moved_out(self):
+        self.store.create_demo()
+        record_id = self.store.save({"sample_id": "Real review"})
+        self.store.save({"sample_id": "Real review", "project_id": "demo", "revision": 1}, record_id)
+        review_id = self.store.add_review({"record_id": record_id, "title": "User review"})["id"]
+        self.store.save({"sample_id": "Real review", "project_id": "default", "revision": 2}, record_id)
+        self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 0, "project_kept": False})
+        with self.store.connect() as db:
+            review = db.execute("SELECT record_id, project_id FROM review_items WHERE id=?", (review_id,)).fetchone()
+            self.assertEqual(tuple(review), (record_id, "default"))
+
+    def test_demo_deletion_rejects_cross_moved_files_until_returned(self):
         self.store.create_demo()
         sample = next(row for row in self.store.list() if row["files"])
-        owner, file_id = sample["id"], sample["files"][0]["id"]
-        real = self.store.save({"sample_id": "Real record"})
+        demo_id, demo_file = sample["id"], sample["files"][0]["id"]
+        user_id = self.store.save({"sample_id": "Real record", "project_id": "demo"})
+        user_file = self.store.add_file(user_id, "user.csv", "XRD", io.BytesIO(b"keep"), 4)
 
-        def move_real_record(project_id):
-            record = next(row for row in self.store.list() if row["id"] == real)
-            self.store.save({**record, "project_id": project_id}, real)
+        def record(record_id):
+            return next(row for row in self.store.list() if row["id"] == record_id)
 
-        def move_file(source, target):
-            revisions = {row["id"]: row["revision"] for row in self.store.list()}
-            self.store.change_file(file_id, "update", {
-                "record_revision": revisions[source], "target_record_id": target, "target_revision": revisions[target],
-            })
+        def move_file(file_id, source, target):
+            self.request_json(f"/api/files/{file_id}/update", {
+                "record_revision": record(source)["revision"], "target_record_id": target,
+                "target_revision": record(target)["revision"],
+            }, "POST")
 
-        for source, target in ((owner, real), (real, owner)):
-            with self.subTest(owner=target):
-                move_real_record("demo")
-                move_file(source, target)
-                move_real_record("default")
-                before = self.store.list(), self.store.history()
-                self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE", 409),
-                                 {"error": server.DEMO_CONTENTS_CONFLICT})
-                self.assertEqual((self.store.list(), self.store.history()), before)
-                self.assertEqual(self.request(f"/api/files/{file_id}")[0], 200)
+        def snapshot():
+            with self.store.connect() as db:
+                return list(db.iterdump()), {path.name: path.read_bytes() for path in self.store.files.iterdir()}
+
+        conflict = {"error": "示例样品和其他样品之间移动过附件，无法自动区分。请先把这些附件移回原来的样品。"}
+        confirm = {"confirm": "delete-demo"}
+        for file_id, source, target in ((demo_file, demo_id, user_id), (user_file, user_id, demo_id)):
+            with self.subTest(file=file_id):
+                move_file(file_id, source, target)
+                if file_id == demo_file:
+                    self.store.save({**record(user_id), "result_summary": {
+                        "conclusion": "User conclusion", "evidence_ids": [file_id],
+                    }}, user_id)
+                before = snapshot()
+                self.assertEqual(self.request_json("/api/demo", confirm, "DELETE", 409), conflict)
+                self.assertEqual(snapshot(), before)
+                self.store.change_file(file_id, "delete", {"record_revision": record(target)["revision"]})
+                before = snapshot()
+                self.assertEqual(self.request_json("/api/demo", confirm, "DELETE", 409), conflict)
+                self.assertEqual(snapshot(), before)
+                self.store.change_file(file_id, "restore", {"record_revision": record(target)["revision"]})
+                move_file(file_id, target, source)
+
+        self.assertEqual(self.request_json("/api/demo", confirm, "DELETE"),
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 1, "project_kept": True})
+        self.assertEqual({path.name for path in self.store.files.iterdir()}, {user_file})
+        with self.store.connect() as db:
+            events = [tuple(row) for row in db.execute("SELECT file_id, record_id, action FROM file_events")]
+            self.assertEqual(events, [(user_file, user_id, "upload")])
+            result = json.loads(db.execute("SELECT result_summary FROM experiments WHERE id=?", (user_id,)).fetchone()[0])
+            self.assertEqual((result["conclusion"], result["evidence_ids"]), ("User conclusion", []))
 
     def test_legacy_demo_deletion_recovers_generated_ids(self):
         self.store.create_demo()
@@ -3015,8 +3109,11 @@ class Milestone3Tests(unittest.TestCase):
             db.execute("DELETE FROM app_settings WHERE key='demo_contents'")
         sample = next(row for row in self.store.list() if row["files"])
         self.store.save({**sample, "sample_id": "Renamed demo sample"}, sample["id"])
+        user = self.store.save({"sample_id": "Real record", "project_id": "demo"})
         self.assertEqual(self.request_json("/api/demo", {"confirm": "delete-demo"}, "DELETE"),
-                         {"deleted_records": 12, "deleted_files": 4})
+                         {"deleted_records": 12, "deleted_files": 4, "kept_records": 1, "project_kept": True})
+        self.assertEqual([row["id"] for row in self.store.list()], [user])
+        self.assertEqual(list(self.store.files.iterdir()), [])
 
     def test_legacy_demo_deletion_rejects_trashed_nongenerated_file(self):
         self.store.create_demo()
