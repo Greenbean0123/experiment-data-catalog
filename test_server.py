@@ -346,6 +346,33 @@ class StoreTests(unittest.TestCase):
                     "builtin": {"temperature": {"enabled": enabled}}}})
                 self.assertEqual([(item["id"], item["status"]) for item in issues()], [(original["id"], "resolved")])
 
+    def test_legacy_builtin_review_dispositions_cover_only_their_fields(self):
+        self.store.save_project_settings("default", {"revision": 0, "settings": {
+            "builtin": {"temperature": {"enabled": False}}}})
+        legacy_ids = {}
+        for status in ("resolved", "dismissed"):
+            record = self.store.save({"sample_id": status, "duration": 5, "solvent": "Water"})
+            issue = next(item for item in self.store.review_list()["items"]
+                         if item["record_id"] == record and item["kind"] == "missing_conditions")
+            self.assertEqual(issue["missing"], ["precursor"])
+            revision = self.store.add_review({"issue_id": issue["id"]})["revision"]
+            self.store.decide_review(issue["id"], {"preview": False, "status": status, "revision": revision,
+                                     "record_revision": issue["record_revision"], "note": "Checked notebook"})
+            fingerprint = json.dumps(["conditions-" + record, ["precursor"]]).encode()
+            legacy = hashlib.sha256(fingerprint).hexdigest()[:32]
+            legacy_ids[record] = (legacy, status)
+            with self.store.connect() as db:
+                db.execute("UPDATE review_items SET id=? WHERE id=?", (legacy, issue["id"]))
+
+        self.store.save_project_settings("default", {"revision": 1, "settings": {}})
+        items = self.store.review_list()["items"]
+        for record, (legacy, status) in legacy_ids.items():
+            with self.subTest(status=status):
+                closed, pending = [item for item in items if item["record_id"] == record
+                                   and item["kind"] == "missing_conditions"]
+                self.assertEqual((closed["id"], closed["status"]), (legacy, status))
+                self.assertEqual((pending["status"], pending["missing"]), ("pending", ["temperature"]))
+
     def test_key_field_review_disposition_survives_casing_only_rename(self):
         field = dict(section="condition", label="Substrate", type="text")
         template = dict(project_id="default", name="Film", revision=0, fields=[field])
@@ -2027,6 +2054,70 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(problem.exception.status, 409)
             self.assertEqual([row["temperature"] for row in store.list() if row["id"] in (a, b)], [None, None])
 
+    def test_conflicting_prefix_merge_rejects_put_and_hand_edit(self):
+        endpoint = "/api/local-catalog"
+        store = self.server.store
+        path = store.data / "local-catalog.json"
+        self.addCleanup(path.unlink, missing_ok=True)
+        active = self.request_json(endpoint, {"revision": "", "catalog": {"notebook_prefixes": ["KEEP"]}}, "PUT")
+        original = path.read_bytes()
+        numbers = {"CLASH-I-42": 240, "CLASH-1-42": 260}
+
+        def defaults(number):
+            return store.shared_defaults("default", number)
+
+        for number, temperature in numbers.items():
+            store.save({"sample_id": number, "temperature": temperature,
+                        "shared_token": defaults(number)["token"]})
+        separate = {number: defaults(number) for number in numbers}
+        candidate = {"notebook_prefixes": ["KEEP", "CLASH"]}
+        message = ("以下实验在新的编号前缀下会合并，但共用条件不一致：CLASH-I-42。"
+                   "请先统一这些实验的共用条件，再修改前缀。")
+
+        with self.subTest(source="PUT"):
+            self.assertEqual(self.request_json(endpoint, {"revision": active["revision"], "catalog": candidate},
+                                              "PUT", 409), {"error": message})
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(self.request_json(endpoint), active)
+            self.assertEqual({number: defaults(number) for number in numbers}, separate)
+
+        path.write_bytes(original)
+        self.assertEqual(store.notebook_prefixes(), ["KEEP"])
+        hand_edit = json.dumps(candidate).encode()
+        path.write_bytes(hand_edit)
+        with self.subTest(source="hand edit"):
+            blocked = self.request_json(endpoint)
+            self.assertEqual(blocked.get("error"), message)
+            self.assertEqual(blocked["revision"], hashlib.sha256(hand_edit).hexdigest())
+            self.assertEqual(blocked["catalog"]["notebook_prefixes"], candidate["notebook_prefixes"])
+            self.assertEqual(self.request_json("/api/experiments")["conventions"]["notebook_prefixes"], ["KEEP"])
+            self.assertEqual({number: defaults(number) for number in numbers}, separate)
+            self.assertEqual(path.read_bytes(), hand_edit)
+
+        repaired = self.request_json(endpoint, {"revision": hashlib.sha256(hand_edit).hexdigest(),
+                                                "catalog": active["catalog"]}, "PUT")
+        self.assertEqual(repaired, active)
+        self.assertEqual(self.request_json(endpoint), active)
+
+    def test_local_catalog_rejects_control_characters(self):
+        endpoint = "/api/local-catalog"
+        path = self.server.store.data / "local-catalog.json"
+        self.addCleanup(path.unlink, missing_ok=True)
+        for catalog in (
+            {"precursor_aliases": [{"label": "Source", "aliases": ["Foo\nBar"]}]},
+            {"precursor_aliases": [{"label": "Source\tA", "aliases": []}]},
+            {"notebook_prefixes": ["AB\n"]},
+            {"translations": {"en": {"A\x7f": "B"}}},
+            {"translations": {"noteLines": {"A": "B\u2028C"}}},
+        ):
+            with self.subTest(catalog=catalog):
+                try:
+                    result = self.request_json(endpoint, {"revision": "", "catalog": catalog}, "PUT", 400)
+                    self.assertTrue(result["error"].startswith("本地约定格式不正确："))
+                    self.assertFalse(path.exists())
+                finally:
+                    path.unlink(missing_ok=True)
+
     def test_unparsable_local_catalog_is_reported_and_preserved(self):
         path = self.server.store.data / "local-catalog.json"
         self.addCleanup(path.unlink, missing_ok=True)
@@ -2971,53 +3062,107 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(restored.shared_defaults("default", "QZ-I-42")["count"], 2)
         self.assertEqual(restored.shared_defaults("default", "XY-I-42")["count"], 1)
 
-    def test_prefix_merge_keeps_latest_defaults_and_both_override_sets(self):
-        def edit_shared(record, number, **changes):
-            row = next(row for row in self.store.list() if row["id"] == record)
-            token = self.store.shared_defaults("default", number)["token"]
-            self.store.save({**row, **changes, "shared_token": token}, record)
+    def test_equal_prefix_merge_preserves_defaults_and_override_ownership(self):
+        numbers = ("AB-I-42", "AB-1-42")
+        ids = [[self.store.save({"sample_id": f"{number}_{suffix}", "temperature": 240,
+                                "precursor": "Old", "solvent": "Water"}) for suffix in ("a", "b")]
+               for number in numbers]
 
-        def build_group(number, temperature):
-            anchor = self.store.save({"sample_id": number + "_a", "temperature": 90})
-            fixed = self.store.save({"sample_id": number + "_b", "temperature": 90})
-            edit_shared(anchor, number, temperature=90)
-            row = next(row for row in self.store.list() if row["id"] == fixed)
-            self.store.save({**row, "temperature": 100}, fixed)
-            edit_shared(anchor, number, temperature=temperature)
-            return anchor, fixed
+        def rows():
+            return {row["id"]: row for row in self.store.list()}
 
-        revision = ""
-        for prefix, later, edit_on_disk in (("AB", "I", False), ("CD", "1", True)):
-            with self.subTest(later=later, edit_on_disk=edit_on_disk):
-                earlier = "1" if later == "I" else "I"
-                other, other_fixed = build_group(f"{prefix}-{earlier}-42", 130)
-                anchor, fixed = build_group(f"{prefix}-{later}-42", 100)
-                if edit_on_disk:
-                    # Earlier builds recorded shared saves in history but did not timestamp default rows.
-                    with self.store.connect() as db:
-                        for row in db.execute("SELECT experiment_key,settings FROM experiment_defaults WHERE experiment_key LIKE 'cd-%'").fetchall():
-                            settings = json.loads(row["settings"])
-                            del settings["updated_at"]
-                            db.execute("UPDATE experiment_defaults SET settings=? WHERE project_id='default' AND experiment_key=?",
-                                       (json.dumps(settings), row["experiment_key"]))
-                old_token = self.store.shared_defaults("default", f"{prefix}-I-42")["token"]
-                if edit_on_disk:
-                    (self.store.data / "local-catalog.json").write_text(json.dumps({"notebook_prefixes": [prefix]}), encoding="utf-8")
-                else:
-                    revision = self.store.save_local_catalog({"revision": revision,
-                                  "catalog": {"notebook_prefixes": [prefix]}})["revision"]
-                merged = self.store.shared_defaults("default", f"{prefix}-I-42")
-                self.assertEqual((merged["count"], merged["conditions"]["temperature"]), (4, 100))
-                self.assertNotEqual(merged["token"], old_token)
-                edit_shared(anchor, f"{prefix}-I-42", temperature=110)
-                rows = {row["id"]: row["temperature"] for row in self.store.list()}
-                self.assertEqual([rows[key] for key in (anchor, fixed, other, other_fixed)], [110, 100, 130, 100])
-                if not edit_on_disk:
-                    edit_shared(anchor, f"{prefix}-I-42", temperature=100)
-                    revision = self.store.save_local_catalog({"revision": revision, "catalog": {}})["revision"]
-                    edit_shared(other, f"{prefix}-{earlier}-42", temperature=120)
-                    restored = next(row for row in self.store.list() if row["id"] == other_fixed)
-                    self.assertEqual(restored["temperature"], 100)
+        def defaults(number):
+            return self.store.shared_defaults("default", number)
+
+        def shared(record, number, **changes):
+            self.store.save({**rows()[record], **changes, "shared_token": defaults(number)["token"]}, record)
+
+        for (anchor, follower), number in zip(ids, numbers):
+            shared(anchor, number)
+            self.store.save({**rows()[follower], "precursors": []}, follower)
+        roman, numeric = ids[0][0], ids[1][0]
+        self.store.save({**rows()[numeric], "temperature": 255}, numeric)
+        before = defaults(numbers[0])
+        merged = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        self.assertEqual((defaults(numbers[0])["conditions"], defaults(numbers[0])["count"]), (before["conditions"], 4))
+        self.assertNotEqual(defaults(numbers[0])["token"], before["token"])
+        self.store.save_project_settings("default", {"revision": 0, "settings": {
+            "builtin": {"temperature": {"enabled": False}}}})
+        shared(roman, numbers[0], precursors=["New"], temperature=999)
+        self.assertEqual([(rows()[anchor]["precursor"], rows()[fixed]["precursor"]) for anchor, fixed in ids],
+                         [("New", ""), ("New", "")])
+        self.assertEqual((rows()[roman]["temperature"], rows()[numeric]["temperature"]), (240, 255))
+        shared(ids[0][1], numbers[0], precursors=["New"])
+
+        self.store.save_local_catalog({"revision": merged["revision"], "catalog": {}})
+        for number in numbers:
+            self.assertEqual((defaults(number)["count"], defaults(number)["conditions"]),
+                             (2, {**before["conditions"], "precursors": ["New"]}))
+        shared(numeric, numbers[1], precursors=["After split"])
+        self.assertEqual((rows()[roman]["precursor"], rows()[ids[1][1]]["precursor"]), ("New", ""))
+        shared(roman, numbers[0], precursors=["Roman only"])
+        self.assertEqual(rows()[ids[0][1]]["precursor"], "Roman only")
+
+    def test_merged_shared_save_does_not_copy_unchanged_defaults_to_another_key(self):
+        numeric, roman = "AB-1-43", "AB-I-43"
+
+        def defaults(number):
+            return self.store.shared_defaults("default", number)
+
+        a = self.store.save({"sample_id": numeric, "temperature": 240, "precursor": "Old",
+                             "solvent": "Water", "shared_token": defaults(numeric)["token"]})
+        b = self.store.save({"sample_id": roman, "temperature": 260, "precursor": "Old", "solvent": "Water"})
+
+        def rows():
+            return {row["id"]: row for row in self.store.list()}
+
+        def stored():
+            with self.store.connect() as db:
+                return {row["experiment_key"]: json.loads(row["settings"]) for row in
+                        db.execute("SELECT experiment_key, settings FROM experiment_defaults")}
+
+        before = stored()
+        enabled = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
+        self.assertEqual(stored(), before)
+        self.assertEqual(defaults(roman)["conditions"]["temperature"], 240)
+        with self.subTest(save="individual"):
+            self.store.save({**rows()[b], "precursors": []}, b)
+            self.assertEqual(rows()[a]["precursor"], "Old")
+            self.assertEqual(stored()[numeric.lower()], before[numeric.lower()])
+            self.assertEqual(stored()[roman.lower()]["conditions"], {})
+            self.assertEqual(stored()[roman.lower()]["overrides"], {b: ["precursors"]})
+
+        self.store.save_project_settings("default", {"revision": 0, "settings": {
+            "builtin": {"temperature": {"enabled": False}}}})
+        self.store.save({**rows()[a], "precursors": ["New"], "shared_token": defaults(roman)["token"]}, a)
+        with self.subTest(save="shared"):
+            self.assertEqual(stored()[roman.lower()]["conditions"], {"precursors": ["New"]})
+            self.assertEqual(stored()[numeric.lower()]["conditions"],
+                             {**before[numeric.lower()]["conditions"], "precursors": ["New"]})
+            self.assertEqual(rows()[b]["precursor"], "")
+
+        self.store.save_local_catalog({"revision": enabled["revision"], "catalog": {}})
+        self.assertEqual([defaults(number)["conditions"]["temperature"] for number in (numeric, roman)], [240, 260])
+        self.assertEqual([defaults(number)["conditions"]["precursors"] for number in (numeric, roman)], [["New"], ["New"]])
+
+    def test_moved_sample_leaves_conflicting_saved_defaults_in_both_notebooks(self):
+        first, second = "MOVE-1-42", "MOVE-I-42"
+
+        def defaults(number):
+            return self.store.shared_defaults("default", number)
+
+        sample = self.store.save({"sample_id": "Moved sample", "experiment_no": first, "temperature": 200,
+                                  "shared_token": defaults(first)["token"]})
+        row, = self.store.list()
+        self.store.save({**row, "experiment_no": second}, sample)
+        row, = self.store.list()
+        self.store.save({**row, "temperature": 250, "shared_token": defaults(second)["token"]}, sample)
+        self.assertEqual([defaults(number)["conditions"]["temperature"] for number in (first, second)], [200, 250])
+        with self.assertRaises(Problem) as conflict:
+            self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["MOVE"]}})
+        self.assertEqual(conflict.exception.status, 409)
+        self.assertEqual(self.store.notebook_prefixes(), [])
+        self.assertEqual([defaults(number)["count"] for number in (first, second)], [0, 1])
 
     def test_folder_import_reloads_prefix_and_uses_the_only_stored_defaults(self):
         numeric = self.store.save({"sample_id": "AB-1-42_a"})
@@ -3063,7 +3208,7 @@ class DataSafetyTests(unittest.TestCase):
 
     def test_precursor_aliases_use_exact_javascript_whitespace(self):
         alias = {"label": "AB", "aliases": []}
-        whitespace = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+        whitespace = " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\ufeff"
         for char in whitespace:
             with self.subTest(char=repr(char)):
                 label = {"label": f"A{char}b", "aliases": []}
@@ -3072,10 +3217,6 @@ class DataSafetyTests(unittest.TestCase):
                 self.assertEqual((problem.exception.status, str(problem.exception)),
                                  (400, "本地约定格式不正确：同一别名不能属于不同前驱体。"))
                 self.assertFalse((self.store.data / "local-catalog.json").exists())
-        # Python's regex whitespace class includes these extra control characters.
-        with self.subTest(char="Python-only whitespace"):
-            self.store.save_local_catalog({"revision": "", "catalog": {"precursor_aliases": [
-                alias, {"label": "A\u0085B", "aliases": ["\u001cC\u001f"]}]}})
 
     def test_local_catalog_rejects_invalid_entries_without_changing_file(self):
         valid = self.store.save_local_catalog({"revision": "", "catalog": {"notebook_prefixes": ["AB"]}})
