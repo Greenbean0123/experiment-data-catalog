@@ -89,6 +89,9 @@ CATALOG_EDITOR_KEYS = {"notebook_prefixes", "precursor_aliases", "translations"}
 MAX_CATALOG_JSON = 512 * 1024 * 1024  # The translation maps can contain 32 million characters, even before JSON escaping.
 DB_HISTORY_KEEP = 30
 STALE_BACKUP_DAYS = 7
+DEMO_PROJECT = "demo"
+DEMO_NAME = "示例项目"
+DUPLICATE_CATALOG_NAME = "该名称已存在，请直接选择或使用其他名称。"
 
 
 class Problem(Exception):
@@ -275,6 +278,14 @@ def validate_condition_option(payload):
             raise Problem("常用温度或时间必须是有效范围内的数值。")
         name = format(value, ".15g")
     return field, name
+
+
+def validate_catalog_name(payload):
+    name = payload.get("name") if isinstance(payload, dict) else None
+    if (not isinstance(name, str) or not name.strip() or len(name) > 80
+            or any(ord(char) < 32 or 0xd800 <= ord(char) <= 0xdfff for char in name)):
+        raise Problem("名称不能为空，最多 80 个字符，不能包含控制字符。")
+    return name.strip()
 
 
 def validate_result_summary(value):
@@ -832,6 +843,8 @@ class Store:
                 db.execute("ALTER TABLE review_items ADD COLUMN coverage TEXT")
             db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT OR IGNORE INTO app_settings VALUES ('catalog_id', ?)", (json.dumps(uuid.uuid4().hex),))
+            db.execute("""INSERT OR IGNORE INTO app_settings VALUES ('onboarding_done',
+                          CASE WHEN EXISTS (SELECT 1 FROM experiments) THEN 'true' ELSE 'false' END)""")
             self.grouping_prefixes = frozenset(self.setting(db, "accepted_notebook_prefixes", []))
             db.execute("""CREATE TABLE IF NOT EXISTS project_settings (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id), settings TEXT NOT NULL, revision INTEGER NOT NULL
@@ -1132,6 +1145,11 @@ class Store:
     def write_setting(self, db, key, value):
         db.execute("INSERT INTO app_settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                    (key, json.dumps(value, ensure_ascii=False)))
+
+    def onboarding(self, db):
+        demo_id = self.setting(db, "demo_project_id", "")
+        empty = not db.execute("SELECT 1 FROM experiments WHERE project_id<>? LIMIT 1", (demo_id,)).fetchone()
+        return {"done": self.setting(db, "onboarding_done", False), "empty": empty}
 
     @contextmanager
     def connect(self):
@@ -1867,26 +1885,135 @@ class Store:
         if condition:
             field, name = validate_condition_option(payload)
         else:
-            name = payload.get("name") if isinstance(payload, dict) else None
-            if not isinstance(name, str) or not name.strip() or len(name) > 80 or any(ord(c) < 32 for c in name):
-                raise Problem("名称不能为空，最多 80 个字符，不能包含控制字符。")
-            name = name.strip()
+            name = validate_catalog_name(payload)
         if collection == "categories" and name.casefold() == "none":
             raise Problem("none 是筛选保留名称，请使用其他类别名称。")
         with self.lock, self.connect() as db:
             if condition:
                 if db.execute("SELECT 1 FROM condition_options WHERE field=? AND name=? AND hidden=0", (field, name)).fetchone():
-                    raise Problem("该名称已存在，请直接选择或使用其他名称。", 409)
+                    raise Problem(DUPLICATE_CATALOG_NAME, 409)
                 db.execute("INSERT INTO condition_options(field,name,hidden) VALUES (?,?,0) ON CONFLICT(field,name) DO UPDATE SET hidden=0", (field, name))
                 return {"field": field, "name": name}
-            if any(row["name"].casefold() == name.casefold() for row in db.execute(f"SELECT name FROM {collection}")):
-                raise Problem("该名称已存在，请直接选择或使用其他名称。", 409)
             if collection == "projects":
                 project = {"id": uuid.uuid4().hex, "name": name}
+                self.check_project_name(db, name)
                 db.execute("INSERT INTO projects VALUES (?,?)", (project["id"], name))
                 return {"project": project}
+            if any(row["name"].casefold() == name.casefold() for row in db.execute("SELECT name FROM categories")):
+                raise Problem(DUPLICATE_CATALOG_NAME, 409)
             db.execute("INSERT INTO categories VALUES (?)", (name,))
             return {"kind": name}
+
+    @staticmethod
+    def check_project_name(db, name, project_id=""):
+        if any(row["name"].casefold() == name.casefold()
+               for row in db.execute("SELECT name FROM projects WHERE id<>?", (project_id,))):
+            raise Problem(DUPLICATE_CATALOG_NAME, 409)
+
+    def rename_project(self, project_id, payload):
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise Problem("找不到该项目。", 404)
+            name = validate_catalog_name(payload)
+            self.check_project_name(db, name, project_id)
+            db.execute("UPDATE projects SET name=? WHERE id=?", (name, project_id))
+        return {"project": {"id": project_id, "name": name}}
+
+    def create_demo(self):
+        files, records = [], {}
+        try:
+            with self.lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("SELECT 1 FROM projects WHERE id=?", (DEMO_PROJECT,)).fetchone():
+                    raise Problem("示例实验库已存在。", 409)
+                self.check_project_name(db, DEMO_NAME)
+                db.execute("INSERT INTO projects VALUES (?,?)", (DEMO_PROJECT, DEMO_NAME))
+                self.write_setting(db, "demo_project_id", DEMO_PROJECT)
+                template = validate_template({"name": "薄膜制备示例", "fields": [
+                    {"label": "基底", "section": "condition", "type": "single", "options": ["玻璃", "硅片"]},
+                    {"label": "膜厚", "section": "condition", "type": "number", "unit": "nm"},
+                    {"label": "退火温度", "section": "condition", "type": "number", "unit": "°C"},
+                    {"label": "方阻", "section": "result", "type": "number", "unit": "Ω/sq"},
+                ]})
+                settings = validate_project_settings({"key_fields": [
+                    {"section": "condition", "label": "膜厚", "check_missing": True},
+                    {"section": "result", "label": "方阻", "check_missing": True},
+                ]}, template)
+                db.execute("INSERT INTO template_versions VALUES (?,1,?)", (DEMO_PROJECT, json.dumps(template, ensure_ascii=False)))
+                db.execute("INSERT INTO project_settings VALUES (?,?,1)", (DEMO_PROJECT, json.dumps(settings, ensure_ascii=False)))
+                kind = db.execute("SELECT name FROM categories ORDER BY (name='XRD') DESC, rowid LIMIT 1").fetchone()[0]
+                now = timestamp()
+                for index in range(12):
+                    group, sample = divmod(index, 4)
+                    number = f"DEMO-I-{group + 1:02d}"
+                    clean = validate({"sample_id": f"{number}-{sample + 1:02d}", "experiment_no": number,
+                                      "series": "薄膜制备 / Thin films", "experiment_date": f"2026-01-0{group + 1}",
+                                      "notes": "仅供演示的合成数据。 / Synthetic demo data.", "status": STATUSES[-1]})
+                    values = {"0": template["fields"][0]["options"][sample % 2], "1": 80 + 20 * sample,
+                              "2": 200 + 50 * group, "3": 110 - 10 * group - 5 * sample}
+                    clean.update(project_id=DEMO_PROJECT, lab_data=json.dumps({"template_revision": 1, "values": values}, ensure_ascii=False))
+                    file_id = uuid.uuid4().hex if index in (0, 3, 4, 8) else None
+                    if file_id:
+                        clean["result_summary"] = json.dumps({"evidence_ids": [file_id]})
+                    record_id = self.insert_record(db, clean, now)
+                    records[record_id] = None
+                    if file_id:
+                        name = clean["sample_id"] + "-XRD.csv"
+                        lines = ["two_theta_deg,intensity_counts"]
+                        for step in range(241):
+                            angle = 15 + step / 4
+                            counts = 20 + step % 7 + sum(height * math.exp(-((angle - center) / width) ** 2)
+                                        for center, height, width in ((28 + group, 500 + 40 * sample, 0.55), (44, 200, 0.75), (56, 90, 0.8)))
+                            lines.append(f"{angle:.2f},{counts:.2f}")
+                        data = ("\n".join(lines) + "\n").encode("ascii")
+                        destination = self.files / file_id
+                        with prepare_file_replacement(destination, data) as part:
+                            part.replace(destination)
+                            files.append(destination)
+                        db.execute("INSERT INTO files(id,experiment_id,name,kind,size,sha256,source,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                   (file_id, record_id, name, kind, len(data), hashlib.sha256(data).hexdigest(), "demo", now))
+                        self.log_file_event(db, "upload", None, {"id": file_id, "experiment_id": record_id, "name": name, "kind": kind}, now)
+                self.log_history(db, records, "create", source="demo", created_at=now)
+        except Exception:
+            for path in files:
+                path.unlink(missing_ok=True)
+            raise
+        return {"project_id": DEMO_PROJECT, "records": len(records), "files": len(files)}
+
+    def delete_demo(self, payload):
+        if not isinstance(payload, dict) or payload.get("confirm") != "delete-demo":
+            raise Problem("请确认删除示例实验库。")
+        with self.file_copy_lock:
+            with self.lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if (self.setting(db, "demo_project_id") != DEMO_PROJECT
+                        or not db.execute("SELECT 1 FROM projects WHERE id=?", (DEMO_PROJECT,)).fetchone()):
+                    raise Problem("没有示例实验库。", 404)
+                demo_records = "SELECT id FROM experiments WHERE project_id=?"
+                demo_files = f"SELECT id FROM files WHERE experiment_id IN ({demo_records})"
+                args = (DEMO_PROJECT,)
+                pending = dict(db.execute(f"SELECT id,size FROM files WHERE id IN ({demo_files})", args))
+                batches = db.execute(f"SELECT DISTINCT batch_id FROM history_entries WHERE record_id IN ({demo_records})", args).fetchall()
+                db.execute(f"DELETE FROM history_entries WHERE record_id IN ({demo_records})", args)
+                db.executemany("DELETE FROM history_batches WHERE id=? AND NOT EXISTS "
+                               "(SELECT 1 FROM history_entries WHERE batch_id=history_batches.id)", batches)
+                reviews = f"SELECT id FROM review_items WHERE project_id=? OR record_id IN ({demo_records})"
+                db.execute(f"UPDATE history_batches SET review_id=NULL,review_revision=NULL WHERE review_id IN ({reviews})", args * 2)
+                db.execute(f"DELETE FROM review_items WHERE id IN ({reviews})", args * 2)
+                db.execute(f"DELETE FROM record_sources WHERE record_id IN ({demo_records})", args)
+                db.execute(f"DELETE FROM folder_import_receipts WHERE file_id IN ({demo_files})", args)
+                db.execute(f"DELETE FROM file_events WHERE record_id IN ({demo_records}) OR file_id IN ({demo_files})", args * 2)
+                db.execute(f"DELETE FROM files WHERE id IN ({demo_files})", args)
+                count = db.execute("DELETE FROM experiments WHERE project_id=?", args).rowcount
+                for table in ("template_versions", "project_settings", "experiment_defaults"):
+                    db.execute(f"DELETE FROM {table} WHERE project_id=?", args)
+                db.execute("DELETE FROM projects WHERE id=?", args)
+                db.execute("DELETE FROM app_settings WHERE key='demo_project_id'")
+                db.executemany("INSERT OR REPLACE INTO app_settings VALUES (?,?)",
+                               ((PENDING_PURGE_PREFIX + file_id, json.dumps(size)) for file_id, size in pending.items()))
+            self.unlink_purged_files(pending)
+        return {"deleted_records": count, "deleted_files": len(pending)}
 
     def delete_condition_option(self, payload):
         field, name = validate_condition_option(payload)
@@ -3297,6 +3424,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(store.get_project_settings(settings_match[1]))
         if settings_match and self.command == "PUT":
             return self.send_json(store.save_project_settings(settings_match[1], self.json_body()))
+        project_match = re.fullmatch(r"/api/projects/([^/]+)", path)
+        if project_match and self.command == "PUT":
+            return self.send_json(store.rename_project(project_match[1], self.json_body()))
         if self.command == "GET":
             if path == "/":
                 if self.scoped:
@@ -3337,7 +3467,7 @@ class Handler(BaseHTTPRequestHandler):
                                                          for project, entry in project_settings.items() if entry["revision"]})
                     result = {"experiments": store.list(), **store.catalog(), "backup": store.backup_status(),
                               "translations": store.local_translations(local), "conventions": conventions,
-                              "project_settings": project_settings,
+                              "project_settings": project_settings, "onboarding": store.onboarding(db),
                               "trash_count": store.trash_count(db), "category_counts": store.category_counts(db)}
                 return self.send_json(result)
             if path == "/api/trash":
@@ -3413,6 +3543,13 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     store.backup_guard.release()
         if self.command == "POST":
+            if path == "/api/onboarding/done":
+                self.json_body()
+                store.put_setting("onboarding_done", True)
+                return self.send_json({"done": True})
+            if path == "/api/demo":
+                self.json_body()
+                return self.send_json(store.create_demo(), 201)
             match = re.fullmatch(r"/api/files/([a-f0-9]{32})/(update|delete)", path)
             if match:
                 return self.send_json(store.change_file(*match.groups(), self.json_body()))
@@ -3457,6 +3594,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(store.delete_category(self.json_body()))
         if self.command == "DELETE" and path == "/api/condition-options":
             return self.send_json(store.delete_condition_option(self.json_body()))
+        if self.command == "DELETE" and path == "/api/demo":
+            return self.send_json(store.delete_demo(self.json_body()))
         if self.command == "POST" and path == "/api/experiments":
             return self.save_experiment()
         if self.command == "POST" and path == "/api/shutdown":

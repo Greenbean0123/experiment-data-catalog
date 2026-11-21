@@ -2792,6 +2792,137 @@ class HTTPTests(unittest.TestCase):
                 thread.join()
 
 
+class Milestone3Tests(unittest.TestCase):
+    request = HTTPTests.request
+    request_json = HTTPTests.request_json
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.data = Path(folder.name)
+        self.server = make_server(self.data / "catalog", 0)
+        self.addCleanup(self.server.server_close)
+        service = serving(self.server)
+        service.__enter__()
+        self.addCleanup(service.__exit__, None, None, None)
+        self.store = self.server.store
+        self.address = f"http://127.0.0.1:{self.server.server_port}"
+        self.cookie = session_cookie(self.server)
+
+    def test_project_rename_and_onboarding(self):
+        before = self.request_json("/api/experiments")
+        self.assertEqual(before["onboarding"], {"done": False, "empty": True})
+        self.request_json("/api/projects", {"name": "Straße"}, "POST", 201)
+        path = "/api/projects/default"
+        self.assertEqual(self.request_json(path, {"name": "STRASSE"}, "PUT", 409),
+                         {"error": "该名称已存在，请直接选择或使用其他名称。"})
+        self.assertEqual(self.request_json("/api/projects/missing", {"name": "Test"}, "PUT", 404),
+                         {"error": "找不到该项目。"})
+        self.assertEqual(self.request_json(path, {"name": " "}, "PUT", 400),
+                         {"error": "名称不能为空，最多 80 个字符，不能包含控制字符。"})
+        record = self.request_json("/api/experiments", {"sample_id": "M3-onboarding"}, "POST", 201)["record"]
+        history = self.request_json("/api/history")
+        for name in ("My project", "MY PROJECT"):
+            self.assertEqual(self.request_json(path, {"name": " " + name + " "}, "PUT"),
+                             {"project": {"id": "default", "name": name}})
+        catalog = self.request_json("/api/experiments")
+        self.assertEqual((catalog["experiments"][0]["id"], catalog["experiments"][0]["project_name"]),
+                         (record["id"], "MY PROJECT"))
+        self.assertEqual(self.request_json("/api/history"), history)
+        self.assertEqual(catalog["onboarding"], {"done": False, "empty": False})
+        self.assertEqual(self.request("/api/onboarding/done", {}, "POST", authenticate=False)[0], 401)
+        for _ in range(2):
+            self.assertEqual(self.request_json("/api/onboarding/done", {}, "POST"), {"done": True})
+        self.assertEqual(self.request_json("/api/experiments")["onboarding"], {"done": True, "empty": False})
+
+        # Remove the M3 setting to model an upgrade from the same schema, with an archived record.
+        self.store.archive(record["id"], {"archived": True, "revision": record["revision"]})
+        with self.store.connect() as db:
+            db.execute("DELETE FROM app_settings WHERE key='onboarding_done'")
+        reopened = Store(self.store.data)
+        with reopened.connect() as db:
+            self.assertEqual(reopened.onboarding(db), {"done": True, "empty": False})
+            self.assertIs(reopened.setting(db, "onboarding_done"), True)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], server.SCHEMA_VERSION)
+
+    def test_demo_determinism_and_scoped_deletion(self):
+        route = "/api/demo"
+        created = {"project_id": "demo", "records": 12, "files": 4}
+        self.assertEqual(self.request_json(route, {}, "POST", 201), created)
+        self.assertEqual(self.request_json(route, {}, "POST", 409), {"error": "示例实验库已存在。"})
+        self.assertEqual(self.request_json(route, {}, "DELETE", 400), {"error": "请确认删除示例实验库。"})
+        catalog = self.request_json("/api/experiments")
+        self.assertEqual(catalog["onboarding"], {"done": False, "empty": True})
+        self.assertIn({"id": "demo", "name": "示例项目"}, catalog["projects"])
+        self.assertEqual([field["unit"] for field in catalog["templates"]["demo"]["fields"]], ["", "nm", "°C", "Ω/sq"])
+        self.assertEqual(len(catalog["project_settings"]["demo"]["fields"]), 2)
+
+        def content(rows):
+            return {row["sample_id"]: (row["experiment_no"], row["experiment_date"], row["notes"], row["lab_data"],
+                                       [(file["name"], file["sha256"], (self.store.files / file["id"]).read_bytes())
+                                        for file in row["files"]]) for row in rows}
+
+        demo = catalog["experiments"]
+        original = content(demo)
+        self.assertEqual(len({row["experiment_no"] for row in demo}), 3)
+        self.assertTrue(all("Synthetic demo data." in row["notes"] for row in demo))
+        demo_files = {file["id"] for row in demo for file in row["files"]}
+        self.assertEqual(len(demo_files), 4)
+        backup = self.data / "demo-backup.zip"
+        self.assertEqual(self.store.backup(backup)["files"], 4)
+        with zipfile.ZipFile(backup) as archive:
+            self.assertTrue({"data/files/" + file_id for file_id in demo_files} <= set(archive.namelist()))
+
+        real_id = self.store.save({"sample_id": "M3-real"})
+        real_file = self.store.add_file(real_id, "real.csv", "XRD", io.BytesIO(b"real"), 4)
+        real_review = self.store.add_review({"record_id": real_id, "title": "Keep this real review"})["id"]
+        sample = demo[0]
+        receipt = "a" * 32
+        imported_file = self.store.add_file(sample["id"], "folder.csv", "XRD", io.BytesIO(b"demo"), 4, receipt=receipt,
+                                            folder_target=("demo", sample["sample_id"], sample["experiment_no"]))["id"]
+        self.store.change_file(imported_file, "delete", {"record_revision": sample["revision"] + 1})
+        demo_files.add(imported_file)
+        demo_review = self.store.add_review({"record_id": sample["id"], "title": "Remove this demo review"})["id"]
+        revisions = {row["id"]: row["revision"] for row in self.store.list()}
+        self.store.bulk_update({"preview": False, "records": [{"id": key, "revision": revisions[key]} for key in (sample["id"], real_id)],
+                                "changes": {"duration": {"mode": "set", "value": 10}}})
+        with self.store.connect() as db:
+            self.store.write_shared_defaults(db, "demo", sample["experiment_no"].lower(), server.EMPTY_SHARED_STATE)
+            self.store.write_shared_defaults(db, "default", "m3-real", server.EMPTY_SHARED_STATE)
+            with_data = {"record_id": real_id, "project_id": "default", "file_id": real_file}
+            tables = {"history_entries": "record_id", "file_events": "file_id", "review_items": "record_id", "experiment_defaults": "project_id"}
+            preserved = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE {key}=?", (with_data[key],))]
+                         for table, key in tables.items()}
+        real = next(row for row in self.store.list() if row["id"] == real_id)
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE"), {"deleted_records": 12, "deleted_files": 5})
+        self.assertEqual(self.request_json(route, {"confirm": "delete-demo"}, "DELETE", 404), {"error": "没有示例实验库。"})
+        self.assertEqual(self.store.list(), [real])
+        self.assertEqual(self.request_json("/api/experiments")["onboarding"], {"done": False, "empty": False})
+        self.assertEqual((self.store.files / real_file).read_bytes(), b"real")
+        self.assertFalse(any((self.store.files / file_id).exists() for file_id in demo_files))
+        with self.store.connect() as db:
+            for table, key in tables.items():
+                self.assertEqual([tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE {key}=?", (with_data[key],))], preserved[table])
+            for table in ("project_settings", "template_versions", "experiment_defaults", "review_items"):
+                self.assertIsNone(db.execute(f"SELECT 1 FROM {table} WHERE project_id='demo'").fetchone())
+            self.assertIsNone(db.execute("SELECT 1 FROM history_batches WHERE source='demo'").fetchone())
+            self.assertIsNone(db.execute("SELECT 1 FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone())
+            self.assertIsNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (demo_review,)).fetchone())
+            self.assertIsNotNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (real_review,)).fetchone())
+            self.assertIsNone(self.store.setting(db, "demo_project_id"))
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(self.request_json(route, {}, "POST", 201), created)
+        self.assertEqual(content([row for row in self.store.list() if row["project_id"] == "demo"]), original)
+
+    def test_demo_file_publication_rolls_back_with_database(self):
+        with patch.object(self.store, "log_history", side_effect=RuntimeError("test rollback")):
+            with self.assertRaisesRegex(RuntimeError, "test rollback"):
+                self.store.create_demo()
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(list(self.store.files.iterdir()), [])
+        self.assertFalse(any(project["id"] == "demo" for project in self.store.catalog()["projects"]))
+
+
 class DataSafetyTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
