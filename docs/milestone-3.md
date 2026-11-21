@@ -104,7 +104,9 @@ packaging (M4).
   deleted. A history batch that still has entries is kept.
 - **CSV delimiter.** For each candidate (`,` `;` tab) parse the first 50 rows with the csv module; choose the delimiter
   whose rows have the most consistent column count (most rows equal to the header width), ties broken by the larger
-  header width, then by the order `,` `;` tab.
+  header width, then by the order `,` `;` tab. Only delimiters that split the header into at least two columns compete;
+  if none does, `,` is used. (A one-column parse is otherwise trivially consistent and would win for files whose rows
+  have uneven widths.)
 - **Sheet list on errors.** When the selected (or default first) XLSX sheet fails validation (limits, unreadable), the
   400 response also carries `"sheets": [...]` and `"sheet": name`, so the UI can offer another sheet.
 - **Row numbers.** Data-row numbers come from explicit cell coordinates when the `<row>` element has no `r`.
