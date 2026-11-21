@@ -238,3 +238,44 @@ onboarding and imports (M3), packaging (M4).
 
 - A first shared save in a group still fills blank values of other members with the group's known common value. This is
   the documented existing behaviour (README: "首次设置也会补入可用的空白条件"), independent of prefixes.
+
+## 8. Last amendments for M2 (binding)
+
+### 8.1 Schema
+
+- `SCHEMA_VERSION = 4`. The v3→v4 step adds the stored review coverage and performs the §7 row remapping, so the existing
+  pre-migration snapshot guard runs for catalogs created at the earlier unreleased v3 layout.
+
+### 8.2 Local-catalog publication is recoverable
+
+- `PUT /api/local-catalog` stores the new file bytes in `app_settings` (`pending_local_catalog`) in the **same**
+  transaction as the accepted prefixes and the experiment-defaults rewrite, then replaces the file, then clears the
+  pending entry. If the process fails in between, startup (and the next grouping-dependent operation) re-publishes the
+  pending bytes before anything else, so the database and the file always agree. A failure before commit changes nothing.
+- Folder backups publish the database snapshot first and the conventions file second; a failure while publishing the
+  database leaves the previous backup generation untouched.
+- `GET /api/local-catalog` returns strings exactly as stored (no trimming) so the editor can detect control characters,
+  and adds `"active_prefixes": [...]` (the prefixes currently applied by the service).
+
+### 8.3 Review decisions are tied to what was shown
+
+- `POST /api/reviews/{id}/decide` for automatic missing-condition items must include `"missing": [...]` exactly as
+  displayed; if the item's current missing set differs, 409 `待核对项已变化，请刷新后再处理。` and nothing changes.
+- Stored coverage entries use field identity: built-ins by name (`temperature`), template fields by
+  `template:{template_revision}:{field_key}`, key fields by their lower-cased id. Coverage of one kind never suppresses
+  another kind with the same label.
+
+### 8.4 Group rows remember where they came from
+
+- Every `experiment_defaults` row records its origin key(s) (the keys whose stored defaults it holds). On a split, a copy
+  goes to every resulting key that has samples **and** to each origin key, even without samples; rows with no samples and
+  no origin are dropped.
+- When undo (or any edit) moves a sample into a group, its per-sample override is recomputed: the sample follows the
+  group when its restored values equal the group's defaults for the shared fields, otherwise it keeps an override for the
+  differing fields. Overrides created by the undone change are not carried along.
+
+### 8.5 Accepted residual risks after M2 (documented)
+
+- §6.4 hand-edit race; and a crash in the instant between publishing a folder backup's database and its conventions
+  file can leave that one backup with the previous conventions file. Low-severity review findings after this round are
+  recorded for M3 instead of blocking the M2 release.
