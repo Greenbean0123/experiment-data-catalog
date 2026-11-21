@@ -94,3 +94,29 @@ table, commit, "archive this import" from the result toast and history), bilingu
 
 Updating existing records from a spreadsheet, deleting real projects, importing attachments together with records,
 packaging (M4).
+
+## 7. Review amendments (binding)
+
+### Backend
+
+- **Demo deletion keeps real history.** File events and history entries that concern any non-demo record (or a file
+  that still belongs to a non-demo record) are kept; only events and entries whose records are all demo records are
+  deleted. A history batch that still has entries is kept.
+- **CSV delimiter.** For each candidate (`,` `;` tab) parse the first 50 rows with the csv module; choose the delimiter
+  whose rows have the most consistent column count (most rows equal to the header width), ties broken by the larger
+  header width, then by the order `,` `;` tab.
+- **Sheet list on errors.** When the selected (or default first) XLSX sheet fails validation (limits, unreadable), the
+  400 response also carries `"sheets": [...]` and `"sheet": name`, so the UI can offer another sheet.
+- **Row numbers.** Data-row numbers come from explicit cell coordinates when the `<row>` element has no `r`.
+- **Translatable row errors.** Template-choice errors use `第 {n} 行 {field}：请选择模板中已有的选项。`; other per-row validation
+  errors follow the same `第 {n} 行 {field}：{message}` shape with the message taken verbatim from the existing validators.
+
+### Front end
+
+- Changing the file or sheet clears the upload, mapping and preview immediately; nothing can be committed until a new
+  file parses and is previewed.
+- Onboarding applies a preset only to a project with no template and no saved settings (revision 0); otherwise it keeps
+  everything and says so.
+- Mapping guesses use specific headers (e.g. `样品编号`, `sample id`) across all columns before generic ones (`编号`).
+- Import batches in Change history offer "Undo this import (archive)" using the batch archive endpoint; the result toast
+  mentions it.
