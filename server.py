@@ -628,7 +628,7 @@ def csv_record_rows(data):
             widths.extend(len(row) for row in islice(reader, 50))
         except csv.Error:
             pass
-        if widths:
+        if widths and widths[0] > 1:
             score = (widths.count(widths[0]), widths[0])
             if score > best:
                 best, delimiter = score, candidate

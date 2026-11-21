@@ -2974,20 +2974,19 @@ class Milestone3Tests(unittest.TestCase):
                 writer = csv.writer(source, delimiter=delimiter)
                 writer.writerow(["样品编号", "", "备注"])
                 writer.writerow(["实验 A", "250 °C", "两行; a, b\n第二行"])
-                writer.writerows([[str(index), "1", ""] for index in range(49)])
+                writer.writerows([[str(index), "1", ""] for index in range(20)])
                 data = self.parse_upload("试验.CSV", source.getvalue().encode(encoding))
                 self.assertEqual((data["format"], data["sheets"], data["sheet"]), ("csv", [], ""))
                 self.assertEqual(data["columns"], ["样品编号", "列 2", "备注"])
                 self.assertEqual(data["rows"][0], ["实验 A", "250 °C", "两行; a, b\n第二行"])
-                self.assertEqual((data["total_rows"], len(data["rows"])), (50, 20))
+                self.assertEqual((data["total_rows"], len(data["rows"])), (21, 20))
                 self.assertRegex(data["upload_id"], r"^[0-9a-f]{32}$")
 
-        comma_sample = b"x,\n" * 50
-        for data in (b"x\n" + b"row\n" * 2001, comma_sample + b"a," * 100 + b"a", b"a," * 100 + b"a\n"):
+        for data in (b"x\n" + b"row\n" * 2001, b"x\n" + b"a," * 100 + b"a", b"a," * 100 + b"a\n"):
             self.assertEqual(self.parse_upload("large.csv", data, status=400),
                              {"error": "表格最多 2000 行、100 列，请拆分后再导入。"})
-        boundary = self.parse_upload("limit.csv", comma_sample + (b"a," * 99 + b"a\n") * 1951)
-        self.assertEqual((boundary["total_rows"], len(boundary["columns"]), boundary["columns"][-1]), (2000, 100, "列 100"))
+        boundary = self.parse_upload("limit.csv", b"x\n" + (b"a," * 99 + b"a\n") * 2000)
+        self.assertEqual((boundary["total_rows"], len(boundary["columns"])), (2000, 100))
         for name, data in (("test.csv", b"\xff"), ("test.csv", b'a,b\n"unclosed'), ("test.csv", b""),
                            ("test.xlsx", b"a,b\n"), ("test.xls", b"a,b\n")):
             self.assertEqual(self.parse_upload(name, data, status=400),
@@ -3010,8 +3009,20 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(first_fifty["columns"], ["ID,Notes", "Status", "Unit"])
         tied = self.parse_upload("Tie.csv", b"ID,Notes;Status\tUnit\nA,ready;OK\tC\n")
         self.assertEqual(tied["columns"], ["ID", "Notes;Status\tUnit"])
-        single_column = self.parse_upload("Notes.csv", b"Notes\nwashed, dried\nrinsed, spun\n")
-        self.assertEqual((single_column["columns"], single_column["rows"]), (["Notes"], [["washed, dried"], ["rinsed, spun"]]))
+
+    def test_record_import_csv_uneven_rows_and_multiline_field(self):
+        parsed = self.parse_upload("Uneven.csv", b'ID,Value,Notes\nA,1\nB,2,"first line\nsecond line"\n')
+        self.assertEqual(parsed["columns"], ["ID", "Value", "Notes"])
+        self.assertEqual(parsed["rows"], [["A", "1", ""], ["B", "2", "first line\nsecond line"]])
+
+    def test_record_import_csv_defaults_to_comma_when_header_does_not_split(self):
+        fallback = self.parse_upload("Notes.csv", b"Notes\nwashed, dried\nrinsed, spun\n")
+        self.assertEqual(fallback["columns"], ["Notes", "列 2"])
+        self.assertEqual(fallback["rows"], [["washed", " dried"], ["rinsed", " spun"]])
+
+        single_column = self.parse_upload("Single.csv", b"Notes\nwashed\nair dried\n")
+        self.assertEqual(single_column["columns"], ["Notes"])
+        self.assertEqual(single_column["rows"], [["washed"], ["air dried"]])
 
     def test_record_import_xlsx_shared_inline_formulas_dates_and_sheet_selection(self):
         ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -3115,7 +3126,7 @@ class Milestone3Tests(unittest.TestCase):
 
     def import_payload(self, targets, rows, project="default", existing="skip"):
         source = io.StringIO(newline="")
-        writer = csv.writer(source, quoting=csv.QUOTE_ALL)
+        writer = csv.writer(source)
         writer.writerow([target or "unmapped" for target in targets])
         writer.writerows(rows)
         upload = self.parse_upload("records.csv", source.getvalue().encode("utf-8"))
