@@ -202,6 +202,10 @@ demo could then never be deleted.
 
 ### 10.5 Front end (done)
 
-- Import auto-mapping skips a header whose stated unit (`Temperature (°F)`, `Time (h)`) differs from the target's unit;
-  the user can still map it by hand.
+- Import auto-mapping (rounds 2–3) guesses only unambiguous exact matches: a header that is a field name, or a field
+  name followed by that field's own unit in brackets or after `/` (`温度 (°C)`, `Reaction time / min`). Names ignore
+  case, full-width brackets and spacing; units compare exactly, except the listed spellings of °C and min. A column is
+  guessed only when exactly one field fits it and no other column fits that field; exact names are settled before
+  names with units, specific names before generic ones. Everything else is mapped by hand. A template label that
+  itself contains a unit (`Thickness (µm)` on a field stored in nm) is trusted as written.
 - Confirming a whole-batch undo sends no `record_ids` (the 500-id limit applies to explicit selections only).

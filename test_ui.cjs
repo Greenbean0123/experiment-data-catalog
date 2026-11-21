@@ -2795,41 +2795,34 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     } finally { env.dom.window.close(); }
   }
   {
-    // Headers that state a different unit are not auto-mapped (Fahrenheit or hours would be stored as °C / min).
+    // Auto-mapping guesses only exact names or names with the field's own unit, and only when unambiguous.
     const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
-    const env = await boot({savedLanguage: "en", m3Handler: url => {
-      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "",
-        columns: ["Sample ID", "Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], rows: [["S-1", "77", "25", "1", "60"]], total_rows: 1});
-      throw new Error("Unhandled " + url);
-    }});
-    try {
-      const {$, w} = env;
-      $("records-import-view").click();
-      Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], "units.csv")], configurable: true});
-      $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
-      const mapped = [0, 1, 2, 3, 4].map(index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value);
-      assert.deepEqual(mapped, ["sample_id", "", "temperature", "", "duration"], "Only headers in the stored unit are guessed");
-    } finally { env.dom.window.close(); }
-  }
-  {
-    // A bracketed part of a template label is not a unit: each column goes to the field whose full label it carries.
-    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
-    const template = {name: "Vacuum", fields: [
-      {key: "0", label: "Chamber pressure (base)", section: "condition", type: "number", unit: "Pa", options: [], required: false},
-      {key: "1", label: "Chamber pressure", section: "condition", type: "number", unit: "Pa", options: [], required: false},
-      {key: "2", label: "Bias", section: "condition", type: "number", unit: "V", options: [], required: false}]};
+    const field = (key, label, unit, section = "condition") => ({key, label, section, type: "number", unit, options: [], required: false});
+    const template = {name: "Mapping", fields: [field("0", "Chamber pressure (base)", "Pa"), field("1", "Chamber pressure", "Pa"), field("2", "腔体压力（基压）", "Pa"),
+      field("3", "Coating thickness", "nm"), field("4", "Anneal time", "min"), field("5", "Anneal time (min)", "min"), field("6", "Temperature (actual)", "°C", "result"),
+      field("7", "Mass fraction", ""), field("8", "Stage temperature setpoint", "°C"), field("9", "Bias", "mV")]};
+    const cases = {
+      "a.csv": [["Sample ID", "Chamber pressure（base）（Pa）", "Chamber pressure (Pa)"], ["sample_id", "template:0", "template:1"]],
+      "b.csv": [["Chamber pressure (base)", "Chamber pressure (base) (Pa)"], ["template:0", ""]],
+      "c.csv": [["腔体压力 (基压) (Pa)", "Coating thickness (µm)", "Mass fraction (%)", "Chamber pressure (mPa)"], ["template:2", "", "", ""]],
+      "d.csv": [["Anneal time (min)", "Anneal time"], ["template:5", "template:4"]],
+      "e.csv": [["Temperature (actual) (°C)", "Temperature (°C)", "Stage temperature (K) setpoint", "Bias / mV"], ["template:6", "temperature", "", "template:9"]],
+      "f.csv": [["Temperature (°F)", "Temperature (℃)", "Time (h)", "Reaction time / min"], ["", "temperature", "", "duration"]],
+      "g.csv": [["温度", "Temperature"], ["", ""]],
+    };
     const env = await boot({savedLanguage: "en", readHandler: catalog => reply(200, {...catalog, templates: {default: template}}), m3Handler: url => {
-      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "",
-        columns: ["Sample ID", "Chamber pressure (base)", "Chamber pressure (Pa)", "Bias (mV)"], rows: [["S-1", "1", "25", "5"]], total_rows: 1});
+      const name = new URL(url, "http://x").searchParams.get("name");
+      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u-" + name, format: "csv", sheets: [], sheet: "", columns: cases[name][0], rows: [cases[name][0].map(() => "1")], total_rows: 1});
       throw new Error("Unhandled " + url);
     }});
     try {
       const {$, w} = env;
       $("records-import-view").click();
-      Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], "vacuum.csv")], configurable: true});
-      $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
-      const mapped = [0, 1, 2, 3].map(index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value);
-      assert.deepEqual(mapped, ["sample_id", "template:0", "template:1", ""], "Full labels win; a different unit is not guessed");
+      for (const [name, [columns, expected]] of Object.entries(cases)) {
+        Object.defineProperty($("ri-file"), "files", {value: [new w.File(["x"], name)], configurable: true});
+        $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+        assert.deepEqual(columns.map((_, index) => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value), expected, `Guesses for ${columns.join(" | ")}`);
+      }
     } finally { env.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");

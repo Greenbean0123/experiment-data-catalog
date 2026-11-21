@@ -3243,7 +3243,6 @@ function initialize() {
     solvents: ["溶剂", "配体", "溶剂 / 配体", "溶剂/配体", "solvent", "solvents", "ligand", "ligands"],
     notes: ["备注", "说明", "notes", "note", "remarks", "comment"],
   };
-  const headerKey = value => String(value).toLowerCase().replace(/[（(][^）)]*[）)]/g, "").replace(/[\/·]\s*(°c|min|℃)\s*$/i, "").replace(/\s+/g, " ").trim();
   function importTargets(project) {
     const builtins = [["sample_id", t("样品编号（必填）")], ["experiment_no", t("实验编号")], ["series", t("实验系列")], ["experiment_date", t("实验日期")],
       ["precursors", builtinCaption(project, "precursor", language), "precursor"], ["temperature", builtinCaption(project, "temperature", language), "temperature"],
@@ -3252,40 +3251,39 @@ function initialize() {
     const template = (templates[project]?.fields || []).map(field => ({value: `template:${field.key}`, label: t("模板：{field}", {field: field.label + (field.unit ? ` (${field.unit})` : "")}), field}));
     return [...builtins, ...template];
   }
-  // A header that states a unit ("Temperature (°F)") is only guessed for a target with the same unit; the user can still map it by hand.
-  const UNIT_ALIASES = [["°c", "℃", "c", "degc", "摄氏度"], ["min", "mins", "minute", "minutes", "分钟"]];
-  const unitKey = value => { const unit = String(value || "").toLowerCase().replace(/\s+/g, ""); return (UNIT_ALIASES.find(names => names.includes(unit)) || [unit])[0]; };
-  const headerUnit = header => { const match = String(header).match(/[（(]([^）)]*)[）)]\s*$/) || String(header).match(/[\/·]\s*(°c|min|℃)\s*$/i); return match ? unitKey(match[1]) : ""; };
-  const BUILTIN_UNITS = {temperature: "°c", duration: "min"};
-  function unitFits(header, target) {
-    const unit = headerUnit(header), expected = target.field ? unitKey(target.field.unit) : BUILTIN_UNITS[target.value] || "";
-    return !unit || !expected || unit === expected;
+  // Auto-mapping guesses only what is unambiguous: a header that is exactly a field name, or a field name followed by that
+  // field's own unit ("温度 (°C)", "Reaction time / min"). Names ignore case; units compare exactly except the spellings
+  // listed here. A column is guessed only when one field fits it and no other column fits that field; the rest is mapped
+  // by hand. Exact names are settled before names with units, specific names before generic ones.
+  const UNIT_ALIASES = [["°C", "℃", "°c"], ["min", "Min", "mins", "minute", "minutes", "分钟"]];
+  const BUILTIN_UNITS = {temperature: "°C", duration: "min"};
+  const normHeader = value => String(value).replace(/（/g, "(").replace(/）/g, ")").replace(/\s+/g, " ").replace(/\s*([()\/])\s*/g, "$1").trim();
+  const unitSpellings = unit => unit ? (UNIT_ALIASES.find(group => group.includes(unit)) || [unit]).map(normHeader) : [];
+  function headerFits(header, names, units, withUnit) {
+    const text = normHeader(header), lower = text.toLowerCase();
+    return names.some(name => {
+      const key = normHeader(name).toLowerCase();
+      if (!withUnit) return lower === key;
+      if (lower.length <= key.length || !lower.startsWith(key)) return false;
+      const rest = text.slice(key.length);
+      return units.some(unit => rest === `(${unit})` || rest === `/${unit}`);
+    });
   }
   function guessTargets(headers, targets) {
     const guesses = headers.map(() => ""), used = new Set();
-    const offer = (table, index, key) => {
-      for (const [target, names] of Object.entries(table)) {
-        const item = targets.find(candidate => candidate.value === target);
-        if (!used.has(target) && item && unitFits(headers[index], item) && names.some(name => headerKey(name) === key)) { guesses[index] = target; used.add(target); return true; }
-      }
-      return false;
-    };
-    headers.forEach((header, index) => offer(IMPORT_GUESSES, index, headerKey(header)));
-    // Template fields: the full label first ("Chamber pressure (base)" is a label, not a unit), optionally followed by the
-    // field's own unit; then labels without brackets, where anything bracketed in the header lies beyond the label.
-    const fullKey = value => String(value).toLowerCase().replace(/（/g, "(").replace(/）/g, ")").replace(/\s+/g, " ").trim();
-    const exactLabel = (header, field) => {
-      const key = fullKey(header), label = fullKey(field.label), suffix = key.match(/^(.*?)\s*\(([^()]*)\)$/);
-      return key === label || Boolean(field.unit && suffix && suffix[1] === label && unitKey(suffix[2]) === unitKey(field.unit));
-    };
-    const offerTemplate = test => headers.forEach((header, index) => {
-      if (guesses[index]) return;
-      const template = targets.find(item => item.field && !used.has(item.value) && test(header, item));
-      if (template) { guesses[index] = template.value; used.add(template.value); }
+    const candidates = table => targets.flatMap(target => {
+      if (target.field) return table === IMPORT_GENERIC ? [] : [{target: target.value, names: [target.field.label], units: unitSpellings(target.field.unit)}];
+      return table[target.value] ? [{target: target.value, names: table[target.value], units: unitSpellings(BUILTIN_UNITS[target.value])}] : [];
     });
-    offerTemplate((header, item) => exactLabel(header, item.field));
-    offerTemplate((header, item) => !/[（(]/.test(item.field.label) && headerKey(item.field.label) === headerKey(header) && unitFits(header, item));
-    headers.forEach((header, index) => { if (!guesses[index]) offer(IMPORT_GENERIC, index, headerKey(header)); });
+    const tier = (table, withUnit) => {
+      const options = candidates(table).filter(option => !used.has(option.target));
+      const fits = headers.map((header, index) => guesses[index] ? [] : options.filter(option => headerFits(header, option.names, option.units, withUnit)).map(option => option.target));
+      fits.forEach((list, index) => {
+        if (list.length === 1 && fits.filter(other => other.includes(list[0])).length === 1) guesses[index] = list[0];
+      });
+      for (const target of guesses) if (target) used.add(target);
+    };
+    tier(IMPORT_GUESSES, false); tier(IMPORT_GUESSES, true); tier(IMPORT_GENERIC, false); tier(IMPORT_GENERIC, true);
     return guesses;
   }
   function renderImportMapping() {
