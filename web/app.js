@@ -2296,6 +2296,8 @@ function initialize() {
     }
   }
 
+  const archiveSummary = result => t("已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。", {archived: result.archived, kept: result.kept})
+    + (result.already_archived ? " " + t("另有 {count} 条此前已归档。", {count: result.already_archived}) : "");
   const isImportBatch = batch => batch?.action === "import" && batch?.source === "import";
   async function archiveImportBatch(id) {
     if (!confirm(t("把这次导入的样品全部归档？导入后被修改过的样品会保留。归档的样品可以恢复。"))) return;
@@ -2304,7 +2306,7 @@ function initialize() {
       const result = await api(`api/import/batches/${encodeURIComponent(id)}/archive`, {method: "POST", body: "{}"});
       await load();
       await loadHistory();
-      toast(t("已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。", {archived: result.archived, kept: result.kept}));
+      toast(archiveSummary(result));
     } catch (error) { showError("history-error", error.message); }
     finally { workflowControls(false); }
   }
@@ -3165,15 +3167,20 @@ function initialize() {
   async function applyPreset(project, preset) {
     if (preset === "solution" || preset === "later") return false;
     const saved = PROJECT_SETTINGS.get(project);
-    if (templates[project] || (Number.isInteger(saved?.revision) && saved.revision > 0)) return true;  // kept as it is
-    templates[project] = await api("api/templates", {method: "PUT", body: JSON.stringify({...exampleTemplate(preset), project_id: project, revision: 0})});
-    const fields = (templates[project].fields || []).filter(field => field.section === "condition").slice(0, 2);
-    const current = PROJECT_SETTINGS.get(project);
+    const settingsRevision = Number.isInteger(saved?.revision) ? saved.revision : 0;
+    if (templates[project] || settingsRevision > 0) return true;  // kept as it is
+    const template = exampleTemplate(preset);
+    const fields = template.fields.filter(field => field.section === "condition").slice(0, 2);
     const off = preset === "film" ? ["precursor", "materials"] : [];
     const builtin = Object.fromEntries(["precursor", "temperature", "duration", "materials"].map(field => [field, {enabled: !off.includes(field), label: {zh: "", en: ""}}]));
-    await api(`api/projects/${encodeURIComponent(project)}/settings`, {method: "PUT", body: JSON.stringify({
-      settings: {builtin, key_fields: fields.map(field => ({section: field.section, label: field.label, check_missing: false})), phase_presets: []},
-      revision: Number.isInteger(current?.revision) ? current.revision : 0})});
+    try {
+      await api(`api/projects/${encodeURIComponent(project)}/preset`, {method: "POST", body: JSON.stringify({template,
+        settings: {builtin, key_fields: fields.map(field => ({section: field.section, label: field.label, check_missing: false})), phase_presets: []},
+        expected_template_revision: 0, expected_settings_revision: settingsRevision})});
+    } catch (error) {
+      if (error.status === 409) return true;  // configured in another window meanwhile: nothing was changed
+      throw error;
+    }
     return false;
   }
   async function finishOnboarding() {
@@ -3382,7 +3389,7 @@ function initialize() {
       const result = await api(`api/import/batches/${encodeURIComponent(riBatch)}/archive`, {method: "POST", body: "{}"});
       riBatch = null;
       await load();
-      $("ri-summary").textContent = t("已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。", {archived: result.archived, kept: result.kept});
+      $("ri-summary").textContent = archiveSummary(result);
     } catch (error) { showError("records-import-error", error.message); }
     finally { riBusy = false; syncImportControls(); }
   });

@@ -43,7 +43,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     if (typeof url === "string" && url.startsWith("api/")) url = "/" + url;  // The page uses relative URLs under /s/{instance}/.
     if (offline) throw new Error("Offline");
     if (workflowHandler && (url.startsWith("/api/history") || url.startsWith("/api/reviews"))) return workflowHandler(url, options, rows);
-    if (m3Handler && (url.startsWith("/api/demo") || url.startsWith("/api/onboarding") || url.startsWith("/api/import/") || url === "/api/templates" || /^\/api\/projects\/[^/]+$/.test(url))) {
+    if (m3Handler && (url.startsWith("/api/demo") || url.startsWith("/api/onboarding") || url.startsWith("/api/import/") || url === "/api/templates" || /^\/api\/projects\/[^/]+(\/preset)?$/.test(url))) {
       return m3Handler(url, options, rows);
     }
     if (url.startsWith("/api/projects/") || url.startsWith("/api/local-catalog")) {
@@ -2584,6 +2584,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       if (url === "/api/onboarding/done") { onboarding = {...onboarding, done: true}; return reply(200, {done: true}); }
       if (/^\/api\/projects\/[^/]+$/.test(url)) return reply(200, {project: {id: "default", name: body.name}});
       if (url === "/api/templates") { templates = {default: filmTemplate}; return reply(200, filmTemplate); }
+      if (url.endsWith("/preset")) { templates = {default: filmTemplate}; return reply(200, {template: filmTemplate, settings: {settings: body.settings, revision: 1, fields: []}}); }
       if (url === "/api/demo" && options.method === "POST") { demo = true; return reply(201, {project_id: "demo", records: 12, files: 4}); }
       if (url === "/api/demo" && options.method === "DELETE") { demo = false; return reply(200, {deleted_records: 12, deleted_files: 4}); }
       if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: ["Sheet1"], sheet: "Sheet1",
@@ -2619,11 +2620,14 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("onboarding-demo").checked = true;
       $("onboarding-next").click(); for (let i = 0; i < 8; i++) await flush();
       const order = calls.map(call => `${call.method} ${call.url}`);
-      assert.deepEqual(order.filter(item => !item.startsWith("GET")), ["PUT /api/projects/default", "PUT /api/templates", "PUT /api/projects/default/settings", "POST /api/demo", "POST /api/onboarding/done"],
-        "Finish renames, applies the preset, loads the demo and marks onboarding done, in that order");
-      const settingsBody = calls.find(call => call.url === "/api/projects/default/settings").body;
-      assert.equal(settingsBody.settings.builtin.precursor.enabled, false, "The film preset switches off precursors");
-      assert.deepEqual(settingsBody.settings.key_fields.map(field => field.label), ["基底", "沉积功率"]);
+      assert.deepEqual(order.filter(item => !item.startsWith("GET")), ["PUT /api/projects/default", "POST /api/projects/default/preset", "POST /api/demo", "POST /api/onboarding/done"],
+        "Finish renames, applies the preset in one call, loads the demo and marks onboarding done, in that order");
+      const presetBody = calls.find(call => call.url === "/api/projects/default/preset").body;
+      assert.equal(presetBody.settings.builtin.precursor.enabled, false, "The film preset switches off precursors");
+      assert.deepEqual(presetBody.settings.key_fields.map(field => field.label), ["Substrate", "Deposition power"], "Key fields match the template sent with them");
+      assert.deepEqual(presetBody.template.fields.slice(0, 2).map(field => field.label), ["Substrate", "Deposition power"]);
+      assert.deepEqual([presetBody.expected_template_revision, presetBody.expected_settings_revision], [0, 0], "The preset states the revisions it expects");
+      assert.equal(presetBody.template.fields.length, 4);
       assert.equal($("onboarding-dialog").open, false);
       assert.equal($("backup-dialog").open, true, "Backup settings open when requested");
       $("close-backup").click();
@@ -2694,7 +2698,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
         return reply(200, {upload_id: "u1", format: "csv", sheets: [], sheet: "", columns: ["编号", "样品编号"], rows: [["1", "S-1"]], total_rows: 1});
       }
       if (url === "/api/import/records/preview") return reply(200, {rows: [{row: 1, sample_id: "S-1", action: "create", errors: []}], counts: {create: 1, skip: 0, error: 0}, token: "t1"});
-      if (url.startsWith("/api/import/batches/")) return reply(200, {archived: 2, kept: 0});
+      if (url.startsWith("/api/import/batches/")) return reply(200, {archived: 2, kept: 0, already_archived: 1});
       if (url === "/api/onboarding/done") return reply(200, {done: true});
       if (url === "/api/templates" || /^\/api\/projects\/[^/]+$/.test(url)) return reply(200, {});
       throw new Error("Unhandled " + url);
@@ -2711,7 +2715,7 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       w.document.querySelector('[name="onboarding-preset"][value="film"]').checked = true;
       for (let i = 0; i < 4; i++) $("onboarding-next").click();
       for (let i = 0; i < 6; i++) await flush();
-      assert.equal(calls.some(call => call.url === "/api/templates" || call.url.endsWith("/settings") && call.method === "PUT"), false, "Configured projects are never overwritten");
+      assert.equal(calls.some(call => call.url === "/api/templates" || call.url.endsWith("/preset") || call.url.endsWith("/settings") && call.method === "PUT"), false, "Configured projects are never overwritten");
       assert.match($("toast").textContent, /kept as they are/);
       if ($("backup-dialog").open) $("close-backup").click();
       // Specific headers win: "样品编号" is the sample ID even after a generic "编号" column.
@@ -2738,8 +2742,31 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       $("history-view").click(); for (let i = 0; i < 3; i++) await flush();
       $("history-content").querySelector("[data-archive-import]").click(); for (let i = 0; i < 4; i++) await flush();
       assert.ok(calls.some(call => call.url === `/api/import/batches/${"c".repeat(32)}/archive`), "History archives the import batch");
+      assert.match($("toast").textContent, /1 were already archived/, "Already archived samples are reported separately");
       $("history-content").querySelector("[data-history-batch]").click(); for (let i = 0; i < 3; i++) await flush();
       assert.equal($("preview-undo").hidden, true, "Import batches are undone by archiving, not by field undo");
+    } finally { env.dom.window.close(); }
+  }
+  {
+    // §8.3: a preset that lost the race to another window changes nothing and onboarding still completes.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const calls = [];
+    const env = await boot({savedLanguage: "en",
+      m3Handler: (url, options) => { calls.push(`${options.method || "GET"} ${url}`);
+        if (url.endsWith("/preset")) return reply(409, {error: "项目已在其他窗口设置，引导未做修改。"});
+        return reply(200, url === "/api/onboarding/done" ? {done: true} : {project: {id: "default", name: "X"}}); },
+      readHandler: catalog => reply(200, {...catalog, onboarding: {empty: true, done: false}})});
+    try {
+      const {$, w} = env;
+      await flush(); await flush();
+      w.document.querySelector('[name="onboarding-preset"][value="powder"]').checked = true;
+      $("onboarding-backup").checked = false;
+      for (let i = 0; i < 4; i++) $("onboarding-next").click();
+      for (let i = 0; i < 6; i++) await flush();
+      assert.ok(calls.includes("POST /api/projects/default/preset"));
+      assert.ok(calls.includes("POST /api/onboarding/done"), "Onboarding still completes");
+      assert.equal($("onboarding-dialog").open, false);
+      assert.match($("toast").textContent, /kept as they are/);
     } finally { env.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");

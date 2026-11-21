@@ -2,6 +2,10 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "另有 {count} 条此前已归档。": "{count} were already archived.",
+    "同一文件中样品编号重复。": "The sample ID appears more than once in this file.",
+    "示例项目中有不是示例生成的样品或附件，无法整体删除。请先把它们移到其他项目。": "The demo project contains samples or attachments that were not generated for the demo, so it cannot be deleted as a whole. Move them to another project first.",
+    "项目已在其他窗口设置，引导未做修改。": "The project was set up in another window, so the wizard changed nothing.",
     "设置完成。项目已有模板或设置，已原样保留。": "All set. The project already had a template or settings, so they were kept as they are.",
     "已导入 {created} 条样品。之后也可以在“修改历史”中撤回这次导入。": "Imported {created} samples. You can also undo this import later from Change history.",
     "请填写项目名称。": "Enter a project name.",
