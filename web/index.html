@@ -60,6 +60,8 @@
       <button class="nav-item" id="manage-template"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="实验模板">实验模板</span></button>
       <button class="nav-item" id="project-settings-view"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="项目设置">项目设置</span></button>
       <button class="nav-item" id="conventions-view"><svg class="icon" aria-hidden="true"><use href="#i-language"/></svg><span data-i18n="本地约定">本地约定</span></button>
+      <button class="nav-item" id="records-import-view"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="导入台账">导入台账</span></button>
+      <button class="nav-item" id="demo-view"><svg class="icon" aria-hidden="true"><use href="#i-flask"/></svg><span data-i18n="示例实验库">示例实验库</span></button>
       <button class="nav-item" id="folder-import"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="导入文件夹">导入文件夹</span></button>
       <button class="nav-item" id="manage-categories"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span data-i18n="数据类别">数据类别</span></button>
       <button class="nav-item" id="trash-view"><svg class="icon" aria-hidden="true"><use href="#i-archive"/></svg><span data-i18n="回收站">回收站</span><b id="trash-count">0</b></button>
@@ -303,10 +305,56 @@
     </div>
     <div class="dialog-footer workflow-actions"><button id="preview-import" data-i18n="预览归属">预览归属</button><button id="confirm-import" class="primary" disabled data-i18n="确认导入">确认导入</button></div>
   </dialog>
+  <dialog id="onboarding-dialog" class="workflow-dialog onboarding-dialog" aria-labelledby="onboarding-title">
+    <div class="dialog-header"><div><h2 id="onboarding-title" data-i18n="欢迎使用实验数据目录">欢迎使用实验数据目录</h2><p id="onboarding-step-label" class="dialog-subtitle"></p></div><button id="close-onboarding" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p id="onboarding-error" class="inline-error" role="alert" hidden></p>
+      <section class="onboarding-step" data-onboarding-step="0">
+        <p data-i18n="几步设置后就可以开始记录实验。所有数据只保存在这台电脑上。">几步设置后就可以开始记录实验。所有数据只保存在这台电脑上。</p>
+        <label class="onboarding-field"><span data-i18n="第一个项目叫什么？">第一个项目叫什么？</span><input id="onboarding-project-name" maxlength="80" autocomplete="off"></label>
+      </section>
+      <section class="onboarding-step" data-onboarding-step="1" hidden>
+        <p data-i18n="选择最接近的实验类型，程序会准备好合适的字段。之后可以在“项目设置”和“实验模板”中随时修改。">选择最接近的实验类型，程序会准备好合适的字段。之后可以在“项目设置”和“实验模板”中随时修改。</p>
+        <div class="preset-choices" role="radiogroup" data-i18n-aria-label="实验类型" aria-label="实验类型">
+          <label class="preset-choice"><input type="radio" name="onboarding-preset" value="solution" checked><span><strong data-i18n="溶液合成">溶液合成</strong><small data-i18n="使用内置的前驱体、温度、时间、溶剂 / 配体字段。">使用内置的前驱体、温度、时间、溶剂 / 配体字段。</small></span></label>
+          <label class="preset-choice"><input type="radio" name="onboarding-preset" value="powder"><span><strong data-i18n="粉体合成">粉体合成</strong><small data-i18n="增加合成气氛、退火温度和粒径等模板字段。">增加合成气氛、退火温度和粒径等模板字段。</small></span></label>
+          <label class="preset-choice"><input type="radio" name="onboarding-preset" value="film"><span><strong data-i18n="薄膜沉积">薄膜沉积</strong><small data-i18n="增加基底、沉积功率、沉积时间和膜厚字段，关闭前驱体和溶剂 / 配体。">增加基底、沉积功率、沉积时间和膜厚字段，关闭前驱体和溶剂 / 配体。</small></span></label>
+          <label class="preset-choice"><input type="radio" name="onboarding-preset" value="later"><span><strong data-i18n="稍后自己设置">稍后自己设置</strong><small data-i18n="先不做任何改动。">先不做任何改动。</small></span></label>
+        </div>
+      </section>
+      <section class="onboarding-step" data-onboarding-step="2" hidden>
+        <p data-i18n="实验数据只保存在这台电脑上。建议把备份放到另一块磁盘或移动硬盘，之后每周点一次“完整备份”。">实验数据只保存在这台电脑上。建议把备份放到另一块磁盘或移动硬盘，之后每周点一次“完整备份”。</p>
+        <label class="lab-check"><input id="onboarding-backup" type="checkbox" checked><span data-i18n="完成后打开备份设置">完成后打开备份设置</span></label>
+      </section>
+      <section class="onboarding-step" data-onboarding-step="3" hidden>
+        <p data-i18n="想先看看效果？示例实验库包含虚构的样品、条件、结果和谱图，放在单独的“示例项目”里，随时可以一键删除。">想先看看效果？示例实验库包含虚构的样品、条件、结果和谱图，放在单独的“示例项目”里，随时可以一键删除。</p>
+        <label class="lab-check"><input id="onboarding-demo" type="checkbox"><span data-i18n="同时载入示例实验库">同时载入示例实验库</span></label>
+      </section>
+    </div>
+    <div class="dialog-footer onboarding-actions"><button id="skip-onboarding" class="quiet" data-i18n="跳过引导">跳过引导</button><div><button id="onboarding-back" data-i18n="上一步">上一步</button><button id="onboarding-next" class="primary" data-i18n="下一步">下一步</button></div></div>
+  </dialog>
+  <dialog id="records-import-dialog" class="workflow-dialog records-import-dialog" aria-labelledby="records-import-title">
+    <div class="dialog-header"><div><h2 id="records-import-title" data-i18n="导入台账">导入台账</h2><p class="dialog-subtitle" data-i18n="从 CSV 或 Excel（.xlsx）表格批量新建样品。已有的样品不会被修改。">从 CSV 或 Excel（.xlsx）表格批量新建样品。已有的样品不会被修改。</p></div><button id="close-records-import" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <p id="records-import-error" class="inline-error" role="alert" hidden></p>
+      <div class="records-import-source">
+        <label><span data-i18n="导入到项目">导入到项目</span><select id="ri-project"></select></label>
+        <div><span class="field-label" data-i18n="表格文件">表格文件</span><input id="ri-file" type="file" accept=".csv,.xlsx,text/csv" hidden><button type="button" id="ri-choose" data-i18n="选择 CSV 或 .xlsx 文件">选择 CSV 或 .xlsx 文件</button><span id="ri-file-name" class="field-help"></span></div>
+        <label id="ri-sheet-label" hidden><span data-i18n="工作表">工作表</span><select id="ri-sheet"></select></label>
+        <label><span data-i18n="已有的样品编号">已有的样品编号</span><select id="ri-existing"><option value="skip" data-i18n="跳过，不修改">跳过，不修改</option><option value="fail" data-i18n="视为错误">视为错误</option></select></label>
+      </div>
+      <p class="field-help" data-i18n="每列选择要导入到的字段；样品编号必填。列表可以用分号、顿号或 “ + ” 分隔；数字可以带上该字段的单位。每次最多 2000 行。">每列选择要导入到的字段；样品编号必填。列表可以用分号、顿号或 “ + ” 分隔；数字可以带上该字段的单位。每次最多 2000 行。</p>
+      <div id="ri-mapping" class="table-scroll"></div>
+      <p id="ri-summary" class="field-help" role="status"></p>
+      <div id="ri-preview" class="table-scroll"></div>
+    </div>
+    <div class="dialog-footer workflow-actions"><button id="ri-cancel" data-i18n="关闭">关闭</button><button id="ri-undo" hidden data-i18n="撤回这次导入（归档）">撤回这次导入（归档）</button><button id="ri-preview-button" disabled data-i18n="预览">预览</button><button id="ri-commit" class="primary" disabled data-i18n="确认导入">确认导入</button></div>
+  </dialog>
   <dialog id="project-settings-dialog" class="workflow-dialog settings-dialog" aria-labelledby="project-settings-title">
     <div class="dialog-header"><div><h2 id="project-settings-title" data-i18n="项目设置">项目设置</h2><p class="dialog-subtitle" data-i18n="决定这个项目使用哪些条件字段、如何称呼它们，以及哪些模板字段作为关键字段。">决定这个项目使用哪些条件字段、如何称呼它们，以及哪些模板字段作为关键字段。</p></div><button id="close-project-settings" class="icon-button" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
     <div class="dialog-body">
       <label class="settings-project"><span data-i18n="实验项目">实验项目</span><select id="settings-project"></select></label>
+      <div class="settings-rename"><label><span data-i18n="项目名称">项目名称</span><input id="settings-project-name" maxlength="80" autocomplete="off"></label><button type="button" id="rename-project" data-i18n="改名">改名</button></div>
       <p id="project-settings-error" class="inline-error" role="alert" hidden></p>
       <section class="settings-section"><h3 data-i18n="内置条件字段">内置条件字段</h3><p class="field-help" data-i18n="关闭后，这个项目的筛选、表格、编辑器、对比和缺条件提示都不再显示该字段；已保存的数据保持不变。名称留空时使用默认名称。">关闭后，这个项目的筛选、表格、编辑器、对比和缺条件提示都不再显示该字段；已保存的数据保持不变。名称留空时使用默认名称。</p><div id="settings-builtin" class="table-scroll"></div></section>
       <section class="settings-section"><h3 data-i18n="关键字段">关键字段</h3><p class="field-help" data-i18n="从当前实验模板中选择最多 8 个字段。关键字段会出现在筛选、条件分布、列表、对比、CSV 和批量编辑中。">从当前实验模板中选择最多 8 个字段。关键字段会出现在筛选、条件分布、列表、对比、CSV 和批量编辑中。</p><div id="settings-key-fields"></div></section>

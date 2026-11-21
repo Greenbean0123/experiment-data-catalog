@@ -12,7 +12,7 @@ const scripts = ["i18n.js", "app.js"].map(name => fs.readFileSync(path.join(__di
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const sample = (id, fields = {}) => ({id, sample_id: id, experiment_no: id, project_id: "default", project_name: "默认项目", series: "示例系列", experiment_date: "", precursor: "PA12", temperature: 250, duration: 60, solvent: "ODE", ligand: "OA", material_amounts: [], notes: "中文原始记录，不应被翻译", status: "待补全", archived: false, extra_conditions: [], files: [], revision: 1, updated_at: "2026-11-14T12:00:00Z", ...fields});
 
-async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, attachmentHandler, settingsHandler, deleteError, statusError, savedConditions = {}} = {}) {
+async function boot({savedLanguage, savedTheme, savedProject, savedOrder, systemDark = false, mobile = false, unavailableStorage = false, offline = false, desktop = false, extraRows = [], extraProjects = [], extraKinds = [], previewHandler, conditionHandler, readHandler, recordHandler, sharedHandler, bulkHandler, workflowHandler, backupHandler, attachmentHandler, settingsHandler, m3Handler, deleteError, statusError, savedConditions = {}} = {}) {
   const console = new VirtualConsole();
   const errors = [];
   console.on("jsdomError", error => errors.push(error));
@@ -43,6 +43,9 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
     if (typeof url === "string" && url.startsWith("api/")) url = "/" + url;  // The page uses relative URLs under /s/{instance}/.
     if (offline) throw new Error("Offline");
     if (workflowHandler && (url.startsWith("/api/history") || url.startsWith("/api/reviews"))) return workflowHandler(url, options, rows);
+    if (m3Handler && (url.startsWith("/api/demo") || url.startsWith("/api/onboarding") || url.startsWith("/api/import/") || url === "/api/templates" || /^\/api\/projects\/[^/]+$/.test(url))) {
+      return m3Handler(url, options, rows);
+    }
     if (url.startsWith("/api/projects/") || url.startsWith("/api/local-catalog")) {
       assert(settingsHandler, "Unexpected settings request: " + url);
       return settingsHandler(url, options);
@@ -2565,6 +2568,116 @@ async function boot({savedLanguage, savedTheme, savedProject, savedOrder, system
       assert.ok(decision, "The legacy item can be reopened");
       assert.deepEqual(decision.payload.missing, [], "Legacy items send an empty displayed list");
     } finally { env.dom.window.close(); }
+  }
+  {
+    // Milestone 3: onboarding wizard, demo catalog, record import.
+    const reply = (status, body) => ({ok: status < 300, status, json: async () => structuredClone(body)});
+    const calls = [];
+    let onboarding = {empty: true, done: false}, demo = false, previewCount = 0;
+    const filmTemplate = {revision: 1, name: "Film deposition", fields: [
+      {key: "0", label: "基底", section: "condition", type: "single", unit: "", options: ["玻璃", "硅片", "金属箔"], required: true},
+      {key: "1", label: "沉积功率", section: "condition", type: "number", unit: "W", options: [], required: true}]};
+    let templates = {};
+    const handler = (url, options, rows) => {
+      const body = options.body && typeof options.body === "string" ? JSON.parse(options.body) : null;
+      calls.push({url, method: options.method || "GET", body});
+      if (url === "/api/onboarding/done") { onboarding = {...onboarding, done: true}; return reply(200, {done: true}); }
+      if (/^\/api\/projects\/[^/]+$/.test(url)) return reply(200, {project: {id: "default", name: body.name}});
+      if (url === "/api/templates") { templates = {default: filmTemplate}; return reply(200, filmTemplate); }
+      if (url === "/api/demo" && options.method === "POST") { demo = true; return reply(201, {project_id: "demo", records: 12, files: 4}); }
+      if (url === "/api/demo" && options.method === "DELETE") { demo = false; return reply(200, {deleted_records: 12, deleted_files: 4}); }
+      if (url.startsWith("/api/import/records/parse")) return reply(200, {upload_id: "u1", format: "csv", sheets: ["Sheet1"], sheet: "Sheet1",
+        columns: ["样品编号", "温度 (°C)", "基底", "备注", "颜色"], rows: [["S-1", "250", "玻璃", "ok", "red"], ["S-2", "abc", "硅片", "", "blue"]], total_rows: 2});
+      if (url === "/api/import/records/preview") {
+        previewCount++;
+        const bad = body.mapping["1"] === "temperature";
+        return reply(200, {rows: [{row: 1, sample_id: "S-1", action: "create", errors: [], values: {}}, {row: 2, sample_id: "S-2", action: bad ? "error" : "create", errors: bad ? ["第 2 行 温度 不是有效的数值。"] : [], values: {}}],
+          counts: {create: bad ? 1 : 2, skip: 0, error: bad ? 1 : 0}, token: "t" + previewCount});
+      }
+      if (url === "/api/import/records/commit") return reply(201, {batch_id: "b".repeat(32), created: 2, skipped: 0});
+      if (url.startsWith("/api/import/batches/")) return reply(200, {archived: 2, kept: 0});
+      throw new Error("Unhandled " + url);
+    };
+    const env = await boot({savedLanguage: "en", m3Handler: handler,
+      readHandler: catalog => reply(200, {...catalog, onboarding, templates, projects: [...catalog.projects, ...(demo ? [{id: "demo", name: "示例项目"}] : [])],
+        project_settings: {default: {revision: Object.keys(templates).length ? 1 : 0, settings: {builtin: {}, key_fields: [], phase_presets: []}, fields: []}}}),
+      settingsHandler: (url, options) => { const body = options.body ? JSON.parse(options.body) : null; calls.push({url, method: options.method || "GET", body}); return reply(200, {settings: body?.settings || {}, revision: 1, fields: []}); },
+      backupHandler: () => reply(200, {state: "idle", last: null, folder: "", stale_after_days: 7})});
+    try {
+      const {$, w} = env;
+      await flush(); await flush();
+      // The wizard opens for a new, empty catalog.
+      assert.equal($("onboarding-dialog").open, true, "A new catalog opens the onboarding wizard");
+      assert.match($("onboarding-step-label").textContent, /Step 1 of 4/);
+      $("onboarding-project-name").value = "";
+      $("onboarding-next").click();
+      assert.match($("onboarding-error").textContent, /Enter a project name/);
+      $("onboarding-project-name").value = "Thin films";
+      $("onboarding-next").click();
+      w.document.querySelector('[name="onboarding-preset"][value="film"]').checked = true;
+      $("onboarding-next").click(); $("onboarding-next").click();
+      $("onboarding-demo").checked = true;
+      $("onboarding-next").click(); for (let i = 0; i < 8; i++) await flush();
+      const order = calls.map(call => `${call.method} ${call.url}`);
+      assert.deepEqual(order.filter(item => !item.startsWith("GET")), ["PUT /api/projects/default", "PUT /api/templates", "PUT /api/projects/default/settings", "POST /api/demo", "POST /api/onboarding/done"],
+        "Finish renames, applies the preset, loads the demo and marks onboarding done, in that order");
+      const settingsBody = calls.find(call => call.url === "/api/projects/default/settings").body;
+      assert.equal(settingsBody.settings.builtin.precursor.enabled, false, "The film preset switches off precursors");
+      assert.deepEqual(settingsBody.settings.key_fields.map(field => field.label), ["基底", "沉积功率"]);
+      assert.equal($("onboarding-dialog").open, false);
+      assert.equal($("backup-dialog").open, true, "Backup settings open when requested");
+      $("close-backup").click();
+      // Demo catalog: delete asks first, then removes it.
+      w.confirm = () => false;
+      $("demo-view").click(); await flush();
+      assert.equal(calls.some(call => call.method === "DELETE" && call.url === "/api/demo"), false, "Declining keeps the demo");
+      w.confirm = () => true;
+      $("demo-view").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.ok(calls.some(call => call.method === "DELETE" && call.url === "/api/demo" && call.body.confirm === "delete-demo"));
+      assert.match($("toast").textContent, /Demo catalog deleted \(12 samples\)/);
+      // Record import: auto-guessed mapping, row errors block the commit, fixing the mapping allows it, undo archives.
+      $("records-import-view").click();
+      const file = new w.File(["样品编号,温度\nS-1,250"], "records.csv");
+      Object.defineProperty($("ri-file"), "files", {value: [file], configurable: true});
+      $("ri-file").dispatchEvent(new w.Event("change", {bubbles: true})); for (let i = 0; i < 4; i++) await flush();
+      const target = index => $("ri-mapping").querySelector(`[data-import-column="${index}"]`).value;
+      assert.equal(target(0), "sample_id");
+      assert.equal(target(1), "temperature", "Headers with units are recognised");
+      assert.equal(target(2), "template:0", "Template fields are matched by label");
+      assert.equal(target(3), "notes");
+      assert.equal(target(4), "", "Unknown columns are not imported by default");
+      $("ri-preview-button").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.match($("ri-summary").textContent, /1 new, 0 skipped, 1 with errors/);
+      assert.match($("ri-preview").textContent, /Row 2: 温度 is not a valid number/);
+      assert.equal($("ri-commit").disabled, true, "Rows with errors block the import");
+      const temp = $("ri-mapping").querySelector('[data-import-column="1"]');
+      temp.value = ""; temp.dispatchEvent(new w.Event("change", {bubbles: true}));
+      assert.equal($("ri-commit").disabled, true, "Changing the mapping requires a new preview");
+      $("ri-preview-button").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.equal($("ri-commit").disabled, false);
+      $("ri-commit").click(); for (let i = 0; i < 5; i++) await flush();
+      const commit = calls.find(call => call.url === "/api/import/records/commit").body;
+      assert.equal(commit.token, "t2", "The commit carries the token of the latest preview");
+      assert.deepEqual(commit.mapping, {0: "sample_id", 2: "template:0", 3: "notes"});
+      assert.match($("ri-summary").textContent, /Imported 2 samples/);
+      assert.equal($("ri-undo").hidden, false);
+      $("ri-undo").click(); for (let i = 0; i < 4; i++) await flush();
+      assert.ok(calls.some(call => call.url === `/api/import/batches/${"b".repeat(32)}/archive`));
+      assert.match($("ri-summary").textContent, /Archived 2 imported samples/);
+      $("ri-cancel").click();
+      assert.equal($("records-import-dialog").open, false);
+    } finally { env.dom.window.close(); }
+    // Skipping marks onboarding done and does not change anything else.
+    const skipCalls = [];
+    const skip = await boot({savedLanguage: "en", m3Handler: (url, options) => { skipCalls.push(url); return reply(200, {done: true}); },
+      readHandler: catalog => reply(200, {...catalog, onboarding: {empty: true, done: false}})});
+    try {
+      await flush(); await flush();
+      assert.equal(skip.$("onboarding-dialog").open, true);
+      skip.$("skip-onboarding").click(); await flush();
+      assert.deepEqual(skipCalls, ["/api/onboarding/done"]);
+      assert.equal(skip.$("onboarding-dialog").open, false);
+    } finally { skip.dom.window.close(); }
   }
   console.log("UI DOM checks passed: selection, previews, XRD overlays, bilingual drafts, conflicts and lost-response recovery.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -2,6 +2,79 @@
 
 const CatalogI18n = (() => {
   const en = {
+    "请填写项目名称。": "Enter a project name.",
+    "项目已改名为 {name}。": "Project renamed to {name}.",
+    "永久删除示例实验库？“示例项目”中的全部样品和附件都会删除，其他项目不受影响。": "Permanently delete the demo catalog? All samples and attachments in the demo project are removed; other projects are not affected.",
+    "已删除示例实验库（{count} 条样品）。": "Demo catalog deleted ({count} samples).",
+    "已载入示例实验库：{count} 条虚构样品，可随时删除。": "Demo catalog loaded: {count} fictitious samples. You can delete it at any time.",
+    "第 {step} / {total} 步 · {name}": "Step {step} of {total} · {name}",
+    "设置完成，可以开始记录实验了。": "All set. You can start recording experiments.",
+    "样品编号（必填）": "Sample ID (required)",
+    "模板：{field}": "Template: {field}",
+    "表格列": "Column",
+    "示例值": "Example values",
+    "导入到": "Import into",
+    "{column} 导入到": "Import {column} into",
+    "不导入": "Do not import",
+    "自定义条件：{name}": "Custom condition: {name}",
+    "共 {count} 行。选择对应字段后点“预览”。": "{count} rows. Choose the fields, then select Preview.",
+    "预览：新建 {create} 条，跳过 {skip} 条，错误 {error} 条。": "Preview: {create} new, {skip} skipped, {error} with errors.",
+    "行": "Row",
+    "结果": "Result",
+    "说明": "Details",
+    "只显示前 {count} 行，错误行排在最前。": "Showing the first {count} rows, rows with errors first.",
+    "已导入 {created} 条样品，跳过 {skipped} 条。": "Imported {created} samples, skipped {skipped}.",
+    "已导入 {created} 条样品。": "Imported {created} samples.",
+    "把这次导入的样品全部归档？导入后被修改过的样品会保留。归档的样品可以恢复。": "Archive all samples from this import? Samples changed since the import are kept. Archived samples can be restored.",
+    "已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。": "Archived {archived} imported samples and kept {kept} that were changed.",
+    "导入尚未完成，确定关闭吗？": "The import is not finished. Close anyway?",
+    "导入台账": "Import records",
+    "示例实验库": "Demo catalog",
+    "示例项目": "Demo project",
+    "欢迎使用实验数据目录": "Welcome to Experiment Data Catalog",
+    "几步设置后就可以开始记录实验。所有数据只保存在这台电脑上。": "A few steps and you can start recording experiments. All data stays on this computer.",
+    "第一个项目叫什么？": "What is your first project called?",
+    "选择最接近的实验类型，程序会准备好合适的字段。之后可以在“项目设置”和“实验模板”中随时修改。": "Pick the closest kind of experiment and the app prepares suitable fields. You can change them later under Project settings and Experiment template.",
+    "实验类型": "Kind of experiment",
+    "溶液合成": "Solution synthesis",
+    "使用内置的前驱体、温度、时间、溶剂 / 配体字段。": "Uses the built-in precursor, temperature, time and solvent / ligand fields.",
+    "增加合成气氛、退火温度和粒径等模板字段。": "Adds template fields such as atmosphere, annealing temperature and particle size.",
+    "增加基底、沉积功率、沉积时间和膜厚字段，关闭前驱体和溶剂 / 配体。": "Adds substrate, deposition power, deposition time and film thickness, and switches off precursor and solvent / ligand.",
+    "稍后自己设置": "Set it up later",
+    "先不做任何改动。": "Leaves everything as it is for now.",
+    "实验数据只保存在这台电脑上。建议把备份放到另一块磁盘或移动硬盘，之后每周点一次“完整备份”。": "Your data is stored only on this computer. Keep backups on another disk or an external drive, and run Full backup once a week.",
+    "完成后打开备份设置": "Open backup settings when done",
+    "想先看看效果？示例实验库包含虚构的样品、条件、结果和谱图，放在单独的“示例项目”里，随时可以一键删除。": "Want to look around first? The demo catalog holds fictitious samples, conditions, results and patterns in a separate demo project that you can delete at any time.",
+    "同时载入示例实验库": "Also load the demo catalog",
+    "跳过引导": "Skip",
+    "上一步": "Back",
+    "下一步": "Next",
+    "完成": "Finish",
+    "备份": "Backup",
+    "新建": "New",
+    "跳过": "Skipped",
+    "错误": "Error",
+    "从 CSV 或 Excel（.xlsx）表格批量新建样品。已有的样品不会被修改。": "Create samples in bulk from a CSV or Excel (.xlsx) file. Existing samples are never changed.",
+    "导入到项目": "Import into project",
+    "表格文件": "Spreadsheet",
+    "选择 CSV 或 .xlsx 文件": "Choose a CSV or .xlsx file",
+    "工作表": "Sheet",
+    "已有的样品编号": "Existing sample IDs",
+    "跳过，不修改": "Skip, leave unchanged",
+    "视为错误": "Treat as an error",
+    "每列选择要导入到的字段；样品编号必填。列表可以用分号、顿号或 “ + ” 分隔；数字可以带上该字段的单位。每次最多 2000 行。": "Choose a field for each column; the sample ID is required. Separate list values with semicolons, 、 or \" + \"; numbers may include the field's unit. Up to 2000 rows per import.",
+    "撤回这次导入（归档）": "Undo this import (archive)",
+    "预览": "Preview",
+    "改名": "Rename",
+    "请把一列导入到“样品编号”。": "Map exactly one column to Sample ID.",
+    "每个字段只能对应一列，请检查重复的选择。": "Each field can take only one column. Check the duplicate choices.",
+    "示例实验库已存在。": "The demo catalog already exists.",
+    "请确认删除示例实验库。": "Confirm deleting the demo catalog.",
+    "没有示例实验库。": "There is no demo catalog.",
+    "表格最多 2000 行、100 列，请拆分后再导入。": "Spreadsheets can have up to 2000 rows and 100 columns. Split the file and import again.",
+    "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。": "This file cannot be read. Save it as a UTF-8 CSV or .xlsx and try again.",
+    "导入文件已过期，请重新选择文件。": "The uploaded file has expired. Choose the file again.",
+    "数据已变化，请重新预览。": "The data changed. Preview again.",
     "本地约定已保存，local-catalog.json 将在文件可写时自动更新。": "Catalog conventions saved. local-catalog.json will be updated automatically once the file can be written.",
     "有名称或别名包含换行等控制字符，无法在这里编辑。请先停止程序，手工修改 local-catalog.json。": "Some names or aliases contain line breaks or other control characters and cannot be edited here. Stop the app and edit local-catalog.json by hand.",
     "无单位": "no unit",
@@ -632,6 +705,7 @@ const CatalogI18n = (() => {
     if (language !== "en") return value;
     if (field === "notes") return notesText(value, language);
     if (field === "project_name" && record.project_id === "default" && value === "默认项目") return "Default project";
+    if (field === "project_name" && record.project_id === "demo" && value === "示例项目") return "Demo project";
     if (field === "series") return categories[value] ?? value;
     const generated = record.notes?.startsWith("批量导入：local-") || record.series === "导入报告 / Import report";
     if (field === "sample_id" && generated && value.startsWith("资料集-")) {
@@ -666,6 +740,12 @@ const CatalogI18n = (() => {
     if (keyMatch) return `These samples use a different unit from the one entered: ${keyMatch[1].replace(/、/g, ", ")}`;
     keyMatch = message.match(/^以下实验在新的编号前缀下会合并，但共用条件不一致：(.+)。请先统一这些实验的共用条件，再修改前缀。$/);
     if (keyMatch) return `These experiments would merge under the new prefixes but their shared conditions differ: ${keyMatch[1].replace(/、/g, ", ")}. Make their shared conditions agree before changing the prefixes.`;
+    keyMatch = message.match(/^项目已关闭字段 (.+)，不能导入到该字段。$/);
+    if (keyMatch) return `The project has switched off ${keyMatch[1]}; nothing can be imported into it.`;
+    keyMatch = message.match(/^第 (\d+) 行 (.+) 不是有效的数值。$/);
+    if (keyMatch) return `Row ${keyMatch[1]}: ${keyMatch[2]} is not a valid number.`;
+    keyMatch = message.match(/^还有 (\d+) 行有错误，请修正后再导入。$/);
+    if (keyMatch) return `${keyMatch[1]} rows still have errors. Fix them before importing.`;
     keyMatch = message.match(/^本地约定格式不正确：(.+)$/);
     if (keyMatch) return `Invalid catalog conventions: ${keyMatch[1]}`;
     let match = message.match(/^备份磁盘空间不足：还需要约 (.+) GB，可用 (.+) GB。$/);

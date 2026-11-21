@@ -125,6 +125,15 @@ Use **×** beside a solvent / ligand to remove it from saved choices. For temper
 - **Comparison plots**. Select 2–6 samples. Use the table or plot signals recorded with the same project and template version. For an XRD overlay, select UTF-8 CSVs from at least two samples with 2θ in degrees and measured intensity as the first two columns. Each file is limited to 5 MiB and 20,000 nonblank rows. The plot starts with measured intensities and supports optional min–max normalization.
 - **Export experiment ZIP**. Use the workspace or select samples in the list. The list expands each selected group to all samples in that archive state, including filtered-out samples, up to 500. The package includes conditions, results, original attachments present at export, checksums, and references to outside parents. Stored source paths and sample notes are omitted. Use **Full backup** for recovery.
 
+## 首次使用、示例实验库与导入台账 / Getting started
+
+- **首次使用引导**：新建的空实验库第一次打开时，依次设置第一个项目的名称、实验类型（溶液合成 / 粉体合成 / 薄膜沉积 / 稍后设置，选择后自动建立对应的实验模板、关键字段和内置字段开关）、提醒设置备份，并可同时载入示例实验库。可以随时跳过，跳过后不再出现；已有数据的实验库不会显示。
+- **项目改名**：在“项目设置”中修改项目名称，项目编号和数据不变。
+- **示例实验库**：左侧“示例实验库”在单独的“示例项目”中生成虚构的样品、条件、结果和合成的 XRD 曲线，方便试用；再次点击可永久删除整个示例项目，其他项目不受影响。这是程序中唯一会真正删除记录的操作，只作用于示例项目。
+- **导入台账**：左侧“导入台账”从 CSV（UTF-8 或中文 Excel 常用的 GBK 编码）或 .xlsx 批量新建样品。为每一列选择字段（按中英文表头自动识别，样品编号必填），预览逐行结果后确认；有错误的行需要先修正。已有的样品编号可以选择跳过或视为错误，不会被修改。每次最多 2000 行、100 列。导入完成后可以“撤回这次导入”，把导入后未修改过的样品全部归档（可恢复）。
+
+**Getting started.** A new, empty catalog opens a short wizard (project name, kind of experiment with matching template fields and built-in switches, backup reminder, optional demo catalog). **Demo catalog** creates fictitious samples in a separate demo project and can delete that project completely. **Import records** creates samples from a CSV (UTF-8 or GBK) or .xlsx file with column mapping, a row-by-row preview and an undo that archives the imported samples. Existing samples are never changed by an import.
+
 ## 项目设置与关键字段 / Project settings and key fields
 
 左侧 **项目设置** 为每个项目单独决定：

@@ -1095,6 +1095,7 @@ function initialize() {
     if (result.backup && !backupTimer) { backupStatus = result.backup; renderBackupBadge(); }
     if (Number.isInteger(result.trash_count)) { trashCount = result.trash_count; renderTrashCount(); }
     categoryCounts = result.category_counts && typeof result.category_counts === "object" ? result.category_counts : null;
+    const onboarding = result.onboarding;
     if (projectId && !projects.some(project => project.id === projectId)) projectId = "default";
     loaded = true;
     loadError = null;
@@ -1102,6 +1103,7 @@ function initialize() {
     renderConditionOptions();
     if (!routeApplied) { applyRoute(); routeApplied = true; routeReplace = true; }
     render();
+    if (onboarding && onboarding.empty && !onboarding.done && !onboardingShown && !document.querySelector("dialog[open]")) openOnboarding();
   }
 
   function renderConditionOptions() {
@@ -2282,13 +2284,13 @@ function initialize() {
     $("undo-scope-label").hidden = !historyDetail || !historyRecord || Boolean(undoPreview) || $("preview-undo").hidden;
     $("history-back").textContent = t(historyDetail ? undoPreview ? "返回修改" : "返回历史" : "关闭");
     if (historyDetail) {
-      $("history-subtitle").textContent = `${t(historyActions[historyDetail.action] || historyDetail.action)} · ${new Date(historyDetail.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN")}`;
+      $("history-subtitle").textContent = `${t(historyDetail.action === "import" && historyDetail.source === "import" ? "导入台账" : historyActions[historyDetail.action] || historyDetail.action)} · ${new Date(historyDetail.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN")}`;
       const rows = undoPreview ? undoPreview.rows : historyDetail.rows.filter(row => !historyRecord || $("undo-scope").value === "batch" || row.id === historyRecord);
       const note = historyDetail.action === "shared" ? `<p class="field-help">${t("撤销只恢复样品字段。要调整共用值，请在样品编辑器中重新设置。")}</p>` : "";
       $("history-content").innerHTML = note + (undoPreview ? `<p class="form-hint">${t("确认后恢复下列字段。后续修改有冲突时整批撤销取消。")}</p>` : "") + workflowRows(rows);
     } else {
       $("history-subtitle").textContent = historyRecord ? records.find(record => record.id === historyRecord)?.sample_id || "" : projectId ? projectLabel(projectId) : t("全部项目");
-      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${escape(t(historyActions[batch.action] || batch.action))}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
+      $("history-content").innerHTML = historyBatches.length ? `<table class="workflow-table"><thead><tr><th>${t("时间")}</th><th>${t("操作")}</th><th>${t("样品数")}</th><th>${t("操作")}</th></tr></thead><tbody>${historyBatches.map(batch => `<tr><td>${escape(new Date(batch.created_at).toLocaleString(language === "en" ? "en-US" : "zh-CN"))}</td><td>${escape(t(batch.action === "import" && batch.source === "import" ? "导入台账" : historyActions[batch.action] || batch.action))}${!batch.remaining ? " · " + t("已撤销") : ""}</td><td>${batch.count}</td><td><button data-history-batch="${batch.id}">${t("查看变更")}</button></td></tr>`).join("")}</tbody></table>` : `<p class="empty">${t("尚无修改历史。")}</p>`;
       $("history-content").insertAdjacentHTML("beforeend", fileEventsHtml(historyFileEvents));
     }
   }
@@ -2901,6 +2903,7 @@ function initialize() {
   }
   async function loadProjectSettings(project) {
     settingsProject = project; settingsLoadedFor = ""; settingsDirty = false;
+    $("settings-project-name").value = projects.find(item => item.id === project)?.name || "";
     $("settings-builtin").textContent = t("正在读取…"); $("settings-key-fields").textContent = ""; $("settings-phases").value = "";
     $("project-settings-error").hidden = true;
     settingsBusy = true; syncProjectSettingsControls();
@@ -2934,7 +2937,7 @@ function initialize() {
     try { await loadProjectSettings(next); } catch (error) { showError("project-settings-error", error.message); }
   });
   for (const type of ["input", "change"]) $("project-settings-dialog").addEventListener(type, event => {
-    if (event.target.id === "settings-project") return;
+    if (event.target.id === "settings-project" || event.target.id === "settings-project-name") return;
     settingsDirty = true;
     syncProjectSettingsControls();
   });
@@ -3077,6 +3080,284 @@ function initialize() {
   });
   for (const id of ["close-conventions", "cancel-conventions"]) $(id).addEventListener("click", closeConventions);
   $("conventions-dialog").addEventListener("cancel", event => { event.preventDefault(); closeConventions(); });
+
+  // ---- Project rename (PUT api/projects/{id}) ----
+  $("rename-project").addEventListener("click", async () => {
+    const project = settingsProject, name = $("settings-project-name").value.trim();
+    if (!project || settingsBusy) return;
+    if (!name) return showError("project-settings-error", "请填写项目名称。");
+    settingsBusy = true; syncProjectSettingsControls();
+    try {
+      await api(`api/projects/${encodeURIComponent(project)}`, {method: "PUT", body: JSON.stringify({name})});
+      await load();
+      $("settings-project").innerHTML = projects.map(item => `<option value="${escape(item.id)}">${escape(projectLabel(item.id))}</option>`).join("");
+      $("settings-project").value = project;
+      $("project-settings-error").hidden = true;
+      toast(t("项目已改名为 {name}。", {name}));
+    } catch (error) { showError("project-settings-error", error.message); }
+    finally { settingsBusy = false; syncProjectSettingsControls(); }
+  });
+
+  // ---- Demo catalog (POST / DELETE api/demo) ----
+  const demoExists = () => projects.some(project => project.id === "demo");
+  async function createDemo() {
+    const result = await api("api/demo", {method: "POST", body: "{}"});
+    await load();
+    return result;
+  }
+  $("demo-view").addEventListener("click", async () => {
+    try {
+      if (demoExists()) {
+        if (!confirm(t("永久删除示例实验库？“示例项目”中的全部样品和附件都会删除，其他项目不受影响。"))) return;
+        const result = await api("api/demo", {method: "DELETE", body: JSON.stringify({confirm: "delete-demo"})});
+        if (projectId === "demo") projectId = "default";
+        await load();
+        toast(t("已删除示例实验库（{count} 条样品）。", {count: result.deleted_records}));
+      } else {
+        const result = await createDemo();
+        projectId = result.project_id || "demo";
+        try { localStorage.setItem("catalog-project", projectId); } catch {}
+        render();
+        toast(t("已载入示例实验库：{count} 条虚构样品，可随时删除。", {count: result.records}));
+      }
+    } catch (error) { toast(I18n.translateError(error.message, language)); }
+  });
+
+  // ---- Onboarding wizard ----
+  let onboardingStep = 0, onboardingBusy = false, onboardingShown = false;
+  const ONBOARDING_STEPS = ["项目名称", "实验类型", "备份", "示例实验库"];
+  function renderOnboarding() {
+    for (const section of $("onboarding-dialog").querySelectorAll("[data-onboarding-step]")) section.hidden = Number(section.dataset.onboardingStep) !== onboardingStep;
+    $("onboarding-step-label").textContent = t("第 {step} / {total} 步 · {name}", {step: onboardingStep + 1, total: ONBOARDING_STEPS.length, name: t(ONBOARDING_STEPS[onboardingStep])});
+    $("onboarding-back").hidden = onboardingStep === 0;
+    $("onboarding-next").textContent = t(onboardingStep === ONBOARDING_STEPS.length - 1 ? "完成" : "下一步");
+    for (const control of $("onboarding-dialog").querySelectorAll("button,input")) control.disabled = onboardingBusy;
+  }
+  function openOnboarding() {
+    onboardingShown = true; onboardingStep = 0;
+    $("onboarding-error").hidden = true;
+    $("onboarding-project-name").value = projectLabel(projects[0]?.id || "default");
+    $("onboarding-demo").checked = false;
+    renderOnboarding();
+    $("onboarding-dialog").showModal();
+    $("onboarding-project-name").focus();
+  }
+  async function markOnboardingDone() {
+    try { await api("api/onboarding/done", {method: "POST", body: "{}"}); } catch {}
+  }
+  // Applies a preset to a project that has no template yet: the example template plus matching project settings.
+  async function applyPreset(project, preset) {
+    if (preset === "solution" || preset === "later") return;
+    if (!templates[project]) {
+      const example = exampleTemplate(preset);
+      templates[project] = await api("api/templates", {method: "PUT", body: JSON.stringify({...example, project_id: project, revision: 0})});
+    }
+    const fields = (templates[project].fields || []).filter(field => field.section === "condition").slice(0, 2);
+    const current = PROJECT_SETTINGS.get(project);
+    const off = preset === "film" ? ["precursor", "materials"] : [];
+    const builtin = Object.fromEntries(["precursor", "temperature", "duration", "materials"].map(field => [field, {enabled: !off.includes(field), label: {zh: "", en: ""}}]));
+    await api(`api/projects/${encodeURIComponent(project)}/settings`, {method: "PUT", body: JSON.stringify({
+      settings: {builtin, key_fields: fields.map(field => ({section: field.section, label: field.label, check_missing: false})), phase_presets: []},
+      revision: Number.isInteger(current?.revision) ? current.revision : 0})});
+  }
+  async function finishOnboarding() {
+    const project = projects[0]?.id || "default";
+    const name = $("onboarding-project-name").value.trim();
+    const preset = $("onboarding-dialog").querySelector('[name="onboarding-preset"]:checked')?.value || "solution";
+    onboardingBusy = true; renderOnboarding(); $("onboarding-error").hidden = true;
+    try {
+      if (name && name !== projectLabel(project)) await api(`api/projects/${encodeURIComponent(project)}`, {method: "PUT", body: JSON.stringify({name})});
+      await applyPreset(project, preset);
+      if ($("onboarding-demo").checked && !demoExists()) await api("api/demo", {method: "POST", body: "{}"});
+      await markOnboardingDone();
+      onboardingBusy = false;
+      $("onboarding-dialog").close();
+      projectId = project;
+      await load();
+      toast(t("设置完成，可以开始记录实验了。"));
+      if ($("onboarding-backup").checked) openBackup();
+    } catch (error) {
+      onboardingBusy = false; renderOnboarding();
+      showError("onboarding-error", error.message);
+    }
+  }
+  $("onboarding-next").addEventListener("click", () => {
+    if (onboardingBusy) return;
+    if (onboardingStep === 0 && !$("onboarding-project-name").value.trim()) return showError("onboarding-error", "请填写项目名称。");
+    $("onboarding-error").hidden = true;
+    if (onboardingStep < ONBOARDING_STEPS.length - 1) { onboardingStep++; renderOnboarding(); return; }
+    finishOnboarding();
+  });
+  $("onboarding-back").addEventListener("click", () => { if (!onboardingBusy && onboardingStep > 0) { onboardingStep--; renderOnboarding(); } });
+  const skipOnboarding = async () => {
+    if (onboardingBusy) return;
+    $("onboarding-dialog").close();
+    await markOnboardingDone();
+  };
+  for (const id of ["skip-onboarding", "close-onboarding"]) $(id).addEventListener("click", skipOnboarding);
+  $("onboarding-dialog").addEventListener("cancel", event => { event.preventDefault(); skipOnboarding(); });
+
+  // ---- Record import (api/import/records/*) ----
+  let riUpload = null, riFile = null, riPreview = null, riBusy = false, riDirty = false, riBatch = null;
+  const IMPORT_GUESSES = {
+    sample_id: ["样品编号", "样品", "编号", "sample", "sample id", "sampleid", "sample_id"],
+    experiment_no: ["实验编号", "批次", "experiment", "experiment no", "experiment number", "experiment_no", "batch"],
+    series: ["系列", "实验系列", "series"],
+    experiment_date: ["日期", "实验日期", "date", "experiment date"],
+    precursors: ["前驱体", "precursor", "precursors"],
+    temperature: ["温度", "反应温度", "temperature", "temp"],
+    duration: ["时间", "反应时间", "取样时间", "时长", "duration", "time"],
+    solvents: ["溶剂", "配体", "溶剂 / 配体", "溶剂/配体", "solvent", "solvents", "ligand", "ligands"],
+    notes: ["备注", "说明", "notes", "note", "remarks", "comment"],
+  };
+  const headerKey = value => String(value).toLowerCase().replace(/[（(][^）)]*[）)]/g, "").replace(/[\/·]\s*(°c|min|℃)\s*$/i, "").replace(/\s+/g, " ").trim();
+  function importTargets(project) {
+    const builtins = [["sample_id", t("样品编号（必填）")], ["experiment_no", t("实验编号")], ["series", t("实验系列")], ["experiment_date", t("实验日期")],
+      ["precursors", builtinCaption(project, "precursor", language), "precursor"], ["temperature", builtinCaption(project, "temperature", language), "temperature"],
+      ["duration", builtinCaption(project, "duration", language), "duration"], ["solvents", builtinCaption(project, "materials", language), "materials"], ["notes", t("备注")]]
+      .filter(([, , field]) => !field || builtinEnabled(project, field)).map(([value, label]) => ({value, label}));
+    const template = (templates[project]?.fields || []).map(field => ({value: `template:${field.key}`, label: t("模板：{field}", {field: field.label + (field.unit ? ` (${field.unit})` : "")}), field}));
+    return [...builtins, ...template];
+  }
+  function guessTarget(header, targets, used) {
+    const key = headerKey(header);
+    for (const [target, names] of Object.entries(IMPORT_GUESSES)) {
+      if (!used.has(target) && targets.some(item => item.value === target) && names.some(name => headerKey(name) === key)) return target;
+    }
+    const template = targets.find(item => item.field && !used.has(item.value) && headerKey(item.field.label) === key);
+    return template ? template.value : "";
+  }
+  function renderImportMapping() {
+    const box = $("ri-mapping");
+    if (!riUpload) { box.innerHTML = ""; return; }
+    const targets = importTargets($("ri-project").value);
+    const previous = new Map([...box.querySelectorAll("[data-import-column]")].map(select => [select.dataset.importColumn, select.value]));
+    const used = new Set();
+    box.innerHTML = `<table class="workflow-table import-mapping"><thead><tr><th>${t("表格列")}</th><th>${t("示例值")}</th><th>${t("导入到")}</th></tr></thead><tbody>${riUpload.columns.map((header, index) => {
+      let value = previous.has(String(index)) ? previous.get(String(index)) : guessTarget(header, targets, used);
+      if (value && !value.startsWith("extra:") && !targets.some(item => item.value === value)) value = "";
+      if (value && !value.startsWith("extra:")) used.add(value);
+      const samples = riUpload.rows.slice(0, 3).map(row => row[index] ?? "").filter(Boolean).join(" · ");
+      const extra = `extra:${header}`;
+      return `<tr><th scope="row">${escape(header)}</th><td class="muted">${escape(samples)}</td><td><select data-import-column="${index}" aria-label="${escape(t("{column} 导入到", {column: header}))}">
+        <option value="">${escape(t("不导入"))}</option>${targets.map(item => `<option value="${escape(item.value)}" ${item.value === value ? "selected" : ""}>${escape(item.label)}</option>`).join("")}
+        <option value="${escape(extra)}" ${value === extra ? "selected" : ""}>${escape(t("自定义条件：{name}", {name: header}))}</option></select></td></tr>`;
+    }).join("")}</tbody></table>`;
+  }
+  function importMapping() {
+    const mapping = {};
+    for (const select of $("ri-mapping").querySelectorAll("[data-import-column]")) if (select.value) mapping[select.dataset.importColumn] = select.value;
+    return mapping;
+  }
+  function checkImportMapping(mapping) {
+    const values = Object.values(mapping);
+    if (values.filter(value => value === "sample_id").length !== 1) return "请把一列导入到“样品编号”。";
+    const single = values.filter(value => !value.startsWith("extra:"));
+    if (new Set(single).size !== single.length) return "每个字段只能对应一列，请检查重复的选择。";
+    return "";
+  }
+  function renderImportPreview() {
+    const box = $("ri-preview");
+    if (!riPreview) { box.innerHTML = ""; $("ri-summary").textContent = riUpload ? t("共 {count} 行。选择对应字段后点“预览”。", {count: riUpload.total_rows}) : ""; return; }
+    const counts = riPreview.counts || {};
+    $("ri-summary").textContent = t("预览：新建 {create} 条，跳过 {skip} 条，错误 {error} 条。", {create: counts.create || 0, skip: counts.skip || 0, error: counts.error || 0});
+    const actions = {create: "新建", skip: "跳过", error: "错误"};
+    const rows = [...riPreview.rows].sort((a, b) => Number(b.action === "error") - Number(a.action === "error") || a.row - b.row).slice(0, 300);
+    box.innerHTML = `<table class="workflow-table import-preview"><thead><tr><th>${t("行")}</th><th>${t("样品编号")}</th><th>${t("结果")}</th><th>${t("说明")}</th></tr></thead><tbody>${rows.map(row => `<tr class="import-${escape(row.action)}"><td>${escape(row.row)}</td><td>${escape(row.sample_id || "")}</td><td>${escape(t(actions[row.action] || row.action))}</td><td>${escape((row.errors || []).map(error => I18n.translateError(error, language)).join("；"))}</td></tr>`).join("")}</tbody></table>`
+      + (riPreview.rows.length > rows.length ? `<p class="field-help">${escape(t("只显示前 {count} 行，错误行排在最前。", {count: rows.length}))}</p>` : "");
+  }
+  function syncImportControls() {
+    for (const control of $("records-import-dialog").querySelectorAll("button,input,select")) control.disabled = riBusy;
+    if (riBusy) return;
+    $("ri-preview-button").disabled = !riUpload || Boolean(riBatch);
+    const counts = riPreview?.counts || {};
+    $("ri-commit").disabled = !riPreview || Boolean(riBatch) || Boolean(counts.error) || !counts.create;
+    $("ri-undo").hidden = !riBatch;
+    $("ri-sheet-label").hidden = !riUpload || (riUpload.sheets || []).length < 2;
+  }
+  function resetImport() {
+    riUpload = null; riFile = null; riPreview = null; riDirty = false; riBatch = null;
+    $("ri-file").value = ""; $("ri-file-name").textContent = "";
+    renderImportMapping(); renderImportPreview(); syncImportControls();
+  }
+  function openRecordsImport() {
+    $("ri-project").innerHTML = projects.map(item => `<option value="${escape(item.id)}">${escape(projectLabel(item.id))}</option>`).join("");
+    $("ri-project").value = projectId && projects.some(item => item.id === projectId) ? projectId : projects[0]?.id || "default";
+    $("records-import-error").hidden = true;
+    resetImport();
+    $("records-import-dialog").showModal();
+  }
+  async function parseImportFile(sheet = "") {
+    if (!riFile) return;
+    riBusy = true; syncImportControls(); $("records-import-error").hidden = true;
+    try {
+      const query = new URLSearchParams({name: riFile.name, ...(sheet ? {sheet} : {})});
+      riUpload = await api(`api/import/records/parse?${query}`, {method: "POST", body: riFile, headers: {"Content-Type": "application/octet-stream"}});
+      riPreview = null; riDirty = true;
+      $("ri-sheet").innerHTML = (riUpload.sheets || []).map(name => `<option value="${escape(name)}" ${name === riUpload.sheet ? "selected" : ""}>${escape(name)}</option>`).join("");
+      $("ri-mapping").innerHTML = "";
+      renderImportMapping(); renderImportPreview();
+    } catch (error) { showError("records-import-error", error.message); }
+    finally { riBusy = false; syncImportControls(); }
+  }
+  async function runImport(commit) {
+    const mapping = importMapping(), problem = checkImportMapping(mapping);
+    if (problem) return showError("records-import-error", problem);
+    const body = {upload_id: riUpload.upload_id, project_id: $("ri-project").value, mapping, existing: $("ri-existing").value};
+    riBusy = true; syncImportControls(); $("records-import-error").hidden = true;
+    try {
+      if (!commit) {
+        riPreview = await api("api/import/records/preview", {method: "POST", body: JSON.stringify(body)});
+      } else {
+        const result = await api("api/import/records/commit", {method: "POST", body: JSON.stringify({...body, token: riPreview.token})});
+        riBatch = result.batch_id; riDirty = false;
+        $("ri-summary").textContent = t("已导入 {created} 条样品，跳过 {skipped} 条。", {created: result.created, skipped: result.skipped});
+        projectId = body.project_id;
+        await load();
+        toast(t("已导入 {created} 条样品。", {created: result.created}));
+      }
+      if (!commit) renderImportPreview();
+    } catch (error) {
+      showError("records-import-error", error.message);
+      if (commit && error.status === 409) riPreview = null;
+      if (commit) renderImportPreview();
+    } finally { riBusy = false; syncImportControls(); }
+  }
+  $("records-import-view").addEventListener("click", openRecordsImport);
+  $("ri-choose").addEventListener("click", () => $("ri-file").click());
+  $("ri-file").addEventListener("change", () => {
+    riFile = $("ri-file").files[0] || null;
+    $("ri-file-name").textContent = riFile ? `${riFile.name} · ${sizeText(riFile.size)}` : "";
+    riBatch = null;
+    if (riFile) parseImportFile();
+  });
+  $("ri-sheet").addEventListener("change", () => parseImportFile($("ri-sheet").value));
+  for (const id of ["ri-project", "ri-existing"]) $(id).addEventListener("change", () => {
+    riPreview = null; if (id === "ri-project") { $("ri-mapping").innerHTML = ""; renderImportMapping(); }
+    renderImportPreview(); syncImportControls();
+  });
+  $("ri-mapping").addEventListener("change", () => { riPreview = null; riDirty = true; renderImportPreview(); syncImportControls(); });
+  $("ri-preview-button").addEventListener("click", () => { if (!riBusy && riUpload) runImport(false); });
+  $("ri-commit").addEventListener("click", () => { if (!riBusy && riPreview && !riBatch) runImport(true); });
+  $("ri-undo").addEventListener("click", async () => {
+    if (riBusy || !riBatch) return;
+    if (!confirm(t("把这次导入的样品全部归档？导入后被修改过的样品会保留。归档的样品可以恢复。"))) return;
+    riBusy = true; syncImportControls();
+    try {
+      const result = await api(`api/import/batches/${encodeURIComponent(riBatch)}/archive`, {method: "POST", body: "{}"});
+      riBatch = null;
+      await load();
+      $("ri-summary").textContent = t("已归档 {archived} 条导入的样品，保留 {kept} 条已修改的样品。", {archived: result.archived, kept: result.kept});
+    } catch (error) { showError("records-import-error", error.message); }
+    finally { riBusy = false; syncImportControls(); }
+  });
+  const closeRecordsImport = () => {
+    if (riBusy || (riDirty && !confirm(t("导入尚未完成，确定关闭吗？")))) return;
+    riDirty = false;
+    $("records-import-dialog").close();
+  };
+  for (const id of ["close-records-import", "ri-cancel"]) $(id).addEventListener("click", closeRecordsImport);
+  $("records-import-dialog").addEventListener("cancel", event => { event.preventDefault(); closeRecordsImport(); });
 
   const backupStale = status => {
     const time = Date.parse(status?.last?.time || "");
@@ -4072,7 +4353,7 @@ function initialize() {
   $("comparison").addEventListener("close", clearComparisonXrd);
   const hasUnfinishedWork = () => dirty || saving || uploading || catalogSaving || materialSaving || presetSaving ||
     statusSaving || previewPhaseSaving || bulkBusy || bulkDirty || workflowBusy || workflowDirty || templateDirty || templateSaving || importing ||
-    backupStarting || backupStatus?.state === "running" || fileSaving || trashBusy || fileDirty() || trashDirty() || settingsBusy || settingsDirty || conventionsBusy || conventionsDirty;
+    backupStarting || backupStatus?.state === "running" || fileSaving || trashBusy || fileDirty() || trashDirty() || settingsBusy || settingsDirty || conventionsBusy || conventionsDirty || onboardingBusy || riBusy || riDirty;
   window.addEventListener("beforeunload", event => {
     if (hasUnfinishedWork()) { event.preventDefault(); event.returnValue = ""; }
   });
