@@ -2851,6 +2851,7 @@ class Milestone3Tests(unittest.TestCase):
         self.assertEqual(self.request_json(route, {}, "POST", 201), created)
         self.assertEqual(self.request_json(route, {}, "POST", 409), {"error": "示例实验库已存在。"})
         self.assertEqual(self.request_json(route, {}, "DELETE", 400), {"error": "请确认删除示例实验库。"})
+        self.assertEqual(self.request_json(route, method="DELETE", status=400), {"error": "请确认删除示例实验库。"})
         catalog = self.request_json("/api/experiments")
         self.assertEqual(catalog["onboarding"], {"done": False, "empty": True})
         self.assertIn({"id": "demo", "name": "示例项目"}, catalog["projects"])
@@ -2907,6 +2908,7 @@ class Milestone3Tests(unittest.TestCase):
                 self.assertIsNone(db.execute(f"SELECT 1 FROM {table} WHERE project_id='demo'").fetchone())
             self.assertIsNone(db.execute("SELECT 1 FROM history_batches WHERE source='demo'").fetchone())
             self.assertIsNone(db.execute("SELECT 1 FROM folder_import_receipts WHERE id=?", (receipt,)).fetchone())
+            self.assertFalse({row["file_id"] for row in db.execute("SELECT file_id FROM file_events")} & demo_files)
             self.assertIsNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (demo_review,)).fetchone())
             self.assertIsNotNone(db.execute("SELECT 1 FROM review_items WHERE id=?", (real_review,)).fetchone())
             self.assertIsNone(self.store.setting(db, "demo_project_id"))
@@ -3010,6 +3012,228 @@ class Milestone3Tests(unittest.TestCase):
         self.assertNotEqual(parsed["upload_id"], selected["upload_id"])
         self.assertEqual(self.parse_upload("Book.xlsx", data, "Missing", status=400),
                          {"error": "无法读取这个文件，请另存为 UTF-8 CSV 或 .xlsx 后重试。"})
+
+        def replace_xlsx_parts(parts):
+            changed = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(changed, "w", zipfile.ZIP_DEFLATED) as target:
+                for name in source.namelist():
+                    target.writestr(name, parts[name] if name in parts else source.read(name))
+            return changed.getvalue()
+
+        blank = replace_xlsx_parts({"xl/worksheets/sheet1.xml": f'<worksheet xmlns="{ns}"><sheetData/></worksheet>'})
+        empty = self.parse_upload("Blank first sheet.xlsx", blank)
+        self.assertEqual((empty["sheets"], empty["columns"], empty["rows"], empty["total_rows"]),
+                         (["主表", "Second sheet"], [], [], 0))
+        self.assertEqual(self.parse_upload("Blank first sheet.xlsx", blank, "Second sheet")["rows"], selected["rows"])
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            path = "xl/workbook.xml"
+            workbook = archive.read(path).replace(b"<sheets>", b'<workbookPr date1904="1"/><sheets>')
+        shifted = self.parse_upload("1904.xlsx", replace_xlsx_parts({path: workbook}))
+        self.assertEqual(shifted["rows"][0][2], "2028-01-02")
+        for body in ('<row r="1"><c r="CW1"><v>1</v></c></row>',
+                     "".join(f'<row r="{i}"><c><v>{i}</v></c></row>' for i in range(1, 2003))):
+            oversized = replace_xlsx_parts({"xl/worksheets/sheet1.xml": f'<worksheet xmlns="{ns}"><sheetData>{body}</sheetData></worksheet>'})
+            self.assertEqual(self.parse_upload("Oversized.xlsx", oversized, status=400),
+                             {"error": "表格最多 2000 行、100 列，请拆分后再导入。"})
+
+    def import_payload(self, targets, rows, project="default", existing="skip"):
+        source = io.StringIO(newline="")
+        writer = csv.writer(source)
+        writer.writerow([target or "unmapped" for target in targets])
+        writer.writerows(rows)
+        upload = self.parse_upload("records.csv", source.getvalue().encode("utf-8"))
+        return {"upload_id": upload["upload_id"], "project_id": project, "existing": existing,
+                "mapping": {str(index): target for index, target in enumerate(targets) if target}}
+
+    def test_record_import_preview_normalizes_and_reports_every_invalid_value(self):
+        self.store.save_template({"project_id": "default", "revision": 0, "name": "Film", "fields": [
+            {"label": "Substrate", "section": "condition", "type": "single", "options": ["Glass", "Si"]},
+            {"label": "Thickness", "section": "result", "type": "number", "unit": "nm"},
+            {"label": "Ramps", "section": "condition", "type": "multi", "options": ["Fast", "Slow"]},
+        ]})
+        existing = self.store.save({"sample_id": "ARCH-1"})
+        self.store.archive(existing, {"archived": True, "revision": 1})
+        body = self.import_payload(
+            ["sample_id", "experiment_no", "series", "experiment_date", "precursors", "temperature", "duration", "solvents",
+             "notes", "template:0", "template:1", "template:2", "extra:压力", ""],
+            [
+                ["NEW-1", "Batch A", "Series", "2024/02/29", "A; B；C、D\nE + Na+", "250 °C", "60 min", "水 + EtOH",
+                 "Notes", "Glass", "120 nm", "Fast; Slow", "低", "ignore"],
+                ["wrong", "", "", "2023.02.29", ";".join(["p" + str(i) for i in range(21)]), "26 K", "100001 min", "",
+                 "a" * 20001, "Wood", "1 µm", "Fast + Other", "b" * 251, ""],
+                ["new-1", "Case-insensitive repeat", "", "2024.02.29"],
+                ["arch-1", "", "", "", "", "26 K"],
+                ["ARCH-1", "Repeat an archived sample"],
+                ["", "No sample ID"],
+            ],
+        )
+        path = "/api/import/records/preview"
+        preview = self.request_json(path, body, "POST")
+        self.assertEqual(preview["counts"], {"create": 1, "skip": 1, "error": 4})
+        self.assertRegex(preview["token"], r"^[0-9a-f]{64}$")
+        rows = preview["rows"]
+        self.assertEqual([row["row"] for row in rows], list(range(1, 7)))
+        self.assertEqual(rows[0], {
+            "row": 1, "sample_id": "NEW-1", "action": "create", "errors": [],
+            "values": {"sample_id": "NEW-1", "experiment_no": "Batch A", "series": "Series", "experiment_date": "2024-02-29",
+                       "precursors": ["A", "B", "C", "D", "E", "Na+"], "temperature": 250, "duration": 60,
+                       "solvents": ["水", "EtOH"], "notes": "Notes", "extra_conditions": [{"name": "压力", "value": "低", "unit": ""}],
+                       "lab_data": {"template_revision": 1, "values": {"0": "Glass", "1": 120, "2": ["Fast", "Slow"]}}},
+        })
+        self.assertEqual(rows[1]["errors"], [
+            "实验日期格式应为 YYYY-MM-DD。", "请选择最多 20 项前驱体，每个名称最多 250 个字符。", "第 2 行 温度 不是有效的数值。",
+            "duration 必须是 0 到 100000 范围内的有限数值，未知时留空。", "notes 格式不正确或内容过长。",
+            "Substrate：请选择模板中已有的选项。", "第 2 行 Thickness 不是有效的数值。", "Ramps：请选择模板中已有的选项。",
+            "自定义条件的名称、数值和单位应为简短文本。",
+        ])
+        self.assertEqual((rows[2]["errors"], rows[2]["values"]["experiment_date"]), (["同一文件中样品编号重复。"], "2024-02-29"))
+        self.assertEqual((rows[3]["action"], rows[3]["errors"]), ("skip", []))
+        self.assertEqual(rows[4]["errors"], ["同一文件中样品编号重复。"])
+        self.assertEqual(rows[5]["errors"], ["请填写样品编号。"])
+        fail = self.request_json(path, {**body, "existing": "fail"}, "POST")
+        duplicate = "该项目内样品编号已存在（含已归档记录）。请使用不同编号。"
+        self.assertEqual(fail["rows"][3]["errors"], ["第 4 行 温度 不是有效的数值。", duplicate])
+        self.assertEqual(fail["rows"][4]["errors"], ["同一文件中样品编号重复。", duplicate])
+        self.assertNotEqual(fail["token"], preview["token"])
+        self.assertEqual(self.request_json("/api/import/records/commit", {**body, "token": preview["token"]}, "POST", 400),
+                         {"error": "还有 4 行有错误，请修正后再导入。"})
+        self.assertEqual([row["id"] for row in self.store.list()], [existing])
+
+        settings = self.store.get_project_settings("default")
+        settings["settings"]["builtin"]["temperature"] = {"enabled": False, "label": {"zh": "沉积温度"}}
+        self.store.save_project_settings("default", settings)
+        self.assertEqual(self.request_json(path, body, "POST", 400), {"error": "项目已关闭字段 沉积温度，不能导入到该字段。"})
+        self.assertEqual(self.request_json(path, {**body, "mapping": {"0": "sample_id", "1": "sample_id"}}, "POST", 400),
+                         {"error": "请把一列导入到“样品编号”。"})
+        self.assertEqual(self.request_json(path, {**body, "mapping": {"0": "sample_id", "1": "template:99"}}, "POST", 400),
+                         {"error": "字段与所选模板版本不匹配。"})
+
+    def test_record_import_cache_expiration(self):
+        path = "/api/import/records/preview"
+        with patch("server.monotonic", return_value=1000):
+            body = self.import_payload(["sample_id"], [["cached"]])
+            preview = self.request_json(path, body, "POST")
+        with patch("server.monotonic", return_value=2799):
+            self.assertEqual(self.request_json(path, body, "POST"), preview)
+        expired = {"error": "导入文件已过期，请重新选择文件。"}
+        with patch("server.monotonic", return_value=2800):
+            self.assertEqual(self.request_json(path, body, "POST", 404), expired)
+            self.assertEqual(self.request_json("/api/import/records/commit", {**body, "token": preview["token"]}, "POST", 404), expired)
+            self.assertNotIn(body["upload_id"], self.store.record_uploads)
+        self.assertEqual(self.request_json(path, {**body, "upload_id": "0" * 32}, "POST", 404), expired)
+
+    def test_record_import_commit_with_defaults_and_archive_unchanged_only(self):
+        template = self.store.save_template({"project_id": "default", "revision": 0, "name": "Film", "fields": [
+            {"label": "Thickness", "section": "condition", "type": "number", "unit": "nm", "required": True},
+        ]})
+        self.store.save_project_settings("default", {"revision": 0, "settings": {"key_fields": [
+            {"section": "condition", "label": "Thickness", "check_missing": True},
+        ]}})
+        base = self.store.save({"sample_id": "existing", "experiment_no": "Group A", "precursors": ["A", "B"], "temperature": 245,
+                                "solvents": ["Water"], "material_amounts": [{"name": "Water", "amount": 1, "unit": "mL"}],
+                                "shared_token": self.store.shared_defaults("default", "Group A")["token"]})
+        body = self.import_payload(
+            ["sample_id", "experiment_no", "temperature", "template:0"],
+            [["EXISTING", "", "", ""], ["new1", "Group A", "", "120 nm"], ["new2", "Group A", "260 °C", ""],
+             ["new3", "Group B", "180 °C", ""], ["new4", "Group B", "", "130 nm"]],
+        )
+        preview = self.request_json("/api/import/records/preview", body, "POST")
+        self.assertEqual(preview["counts"], {"create": 4, "skip": 1, "error": 0})
+        confirmed = {row["sample_id"]: row["values"] for row in preview["rows"] if row["action"] == "create"}
+        self.assertEqual(confirmed["new1"]["temperature"], 245)
+        self.assertEqual(confirmed["new1"]["precursors"], ["A", "B"])
+        self.assertEqual(confirmed["new1"]["material_amounts"], [{"name": "Water", "amount": 1, "unit": "mL"}])
+        self.assertEqual(confirmed["new4"]["temperature"], 180)
+        project = self.store.add_catalog_item("projects", {"name": "Other project"})["project"]["id"]
+        other = self.store.save({"sample_id": "new4", "project_id": project})
+        commit = "/api/import/records/commit"
+        result = self.request_json(commit, {**body, "token": preview["token"]}, "POST", 201)
+        batch_id = result["batch_id"]
+        self.assertRegex(batch_id, r"^[0-9a-f]{32}$")
+        self.assertEqual(result, {"batch_id": batch_id, "created": 4, "skipped": 1})
+        self.assertEqual(self.request_json(commit, {**body, "token": preview["token"]}, "POST", 409),
+                         {"error": "数据已变化，请重新预览。"})
+        catalog = self.request_json("/api/experiments")
+        by_id = {row["sample_id"]: row for row in catalog["experiments"] if row["project_id"] == "default"}
+        for sample, values in confirmed.items():
+            for field, value in values.items():
+                self.assertEqual(by_id[sample][field], value)
+            self.assertEqual(by_id[sample]["template"], template)
+        self.assertEqual(by_id["new2"]["lab_data"], {"template_revision": 1})
+        self.assertEqual(self.store.shared_defaults("default", "Group A")["conditions"]["temperature"], 245)
+        history = self.request_json("/api/history?project_id=default")
+        imports = [batch for batch in history["batches"] if batch["action"] == "import"]
+        self.assertEqual([(batch["id"], batch["source"], batch["count"]) for batch in imports], [(batch_id, "import", 4)])
+        detail = self.request_json("/api/history/" + batch_id)
+        self.assertEqual({row["sample_id"] for row in detail["rows"]}, set(confirmed))
+        self.assertEqual(self.request_json("/api/history/" + batch_id + "/undo", {"preview": True}, "POST", 409),
+                         {"error": "这次操作不支持撤销。"})
+        changed = by_id["new2"]
+        self.store.save({**changed, "notes": "User edited notes"}, changed["id"])
+        route = f"/api/import/batches/{batch_id}/archive"
+        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 3, "kept": 1})
+        self.assertEqual(self.request_json(route, {}, "POST"), {"archived": 0, "kept": 4})
+        records = {row["id"]: row for row in self.store.list()}
+        self.assertEqual({row["sample_id"] for row in records.values() if row["archived"]}, {"new1", "new3", "new4"})
+        self.assertFalse(records[base]["archived"])
+        self.assertFalse(records[other]["archived"])
+        self.assertEqual(records[changed["id"]]["notes"], "User edited notes")
+        archive_batch = self.request_json("/api/history")["batches"][0]
+        self.assertEqual((archive_batch["action"], archive_batch["count"]), ("archive", 3))
+        self.assertEqual(self.request_json(f"/api/import/batches/{archive_batch['id']}/archive", {}, "POST", 404),
+                         {"error": "找不到这次导入。"})
+        self.assertEqual(self.request_json("/api/import/batches/" + "0" * 32 + "/archive", {}, "POST", 404),
+                         {"error": "找不到这次导入。"})
+        undo = "/api/history/" + archive_batch["id"] + "/undo"
+        reversions = self.request_json(undo, {"preview": True}, "POST")
+        result = self.request_json(undo, {"preview": False, "revisions": reversions["revisions"]}, "POST")
+        self.assertEqual(result["updated"], 3)
+        self.assertFalse(any(row["archived"] for row in self.store.list()))
+
+    def test_record_import_tokens_and_transaction_rollback(self):
+        group = self.store.save({"sample_id": "known", "experiment_no": "Group", "temperature": 160})
+        body = self.import_payload(["sample_id", "experiment_no", "temperature", "precursors"],
+                                   [["created1", "Group", "", "A"], ["created2", "Group", "", "B"]])
+        preview_path, commit_path = ("/api/import/records/" + name for name in ("preview", "commit"))
+        preview = self.request_json(preview_path, body, "POST")
+        stale = {"error": "数据已变化，请重新预览。"}
+        self.assertEqual(self.request_json(commit_path, {**body, "existing": "fail", "token": preview["token"]}, "POST", 409), stale)
+        self.store.save({"sample_id": "known", "experiment_no": "Group", "temperature": 165, "revision": 1}, group)
+        self.assertEqual(self.request_json(commit_path, {**body, "token": preview["token"]}, "POST", 409), stale)
+        fresh = self.request_json(preview_path, body, "POST")
+        self.assertEqual(fresh["rows"][0]["values"]["temperature"], 165)
+        payload = {**body, "token": fresh["token"]}
+        original = self.store.insert_record
+
+        def fail_second(db, clean, now):
+            if clean["sample_id"] == "created2":
+                raise RuntimeError("test rollback")
+            return original(db, clean, now)
+
+        before = self.store.list(), self.store.catalog(), self.store.history(), self.store.shared_defaults("default", "Group")
+        with patch.object(self.store, "insert_record", side_effect=fail_second):
+            with self.assertRaisesRegex(RuntimeError, "test rollback"):
+                self.store.import_records(payload, commit=True)
+        self.assertEqual((self.store.list(), self.store.catalog(), self.store.history(),
+                          self.store.shared_defaults("default", "Group")), before)
+        settings = self.store.get_project_settings("default")
+        settings["settings"]["builtin"]["temperature"]["enabled"] = False
+        self.store.save_project_settings("default", settings)
+        self.assertEqual(self.request_json(commit_path, payload, "POST", 409), stale)
+        self.assertEqual([row["id"] for row in self.store.list()], [group])
+        body["mapping"].pop("2")
+        preview = self.request_json(preview_path, body, "POST")
+        self.assertNotIn("temperature", preview["rows"][0]["values"])
+        self.store.save_template({"project_id": "default", "revision": 0, "name": "New schema", "fields": []})
+        self.assertEqual(self.request_json(commit_path, {**body, "token": preview["token"]}, "POST", 409), stale)
+        preview = self.request_json(preview_path, body, "POST")
+        self.assertEqual(self.request_json(commit_path, {**body, "token": preview["token"]}, "POST", 201)["created"], 2)
+        self.assertTrue(all(row["temperature"] is None for row in self.store.list() if row["id"] != group))
+        only_skips = self.request_json(preview_path, body, "POST")
+        history = self.store.history()
+        self.assertEqual(self.request_json(commit_path, {**body, "token": only_skips["token"]}, "POST", 201),
+                         {"batch_id": None, "created": 0, "skipped": 2})
+        self.assertEqual(self.store.history(), history)
 
 
 class DataSafetyTests(unittest.TestCase):

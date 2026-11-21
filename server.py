@@ -237,6 +237,27 @@ def shared_columns(values):
     return columns
 
 
+def effective_shared_conditions(members, state):
+    conditions = dict((state or EMPTY_SHARED_STATE)["conditions"])
+    unobserved = set()
+    if conditions.keys() != EMPTY_SHARED_CONDITIONS.keys():
+        recorded = [shared_values(row) for row in members]
+        for field, empty in EMPTY_SHARED_CONDITIONS.items():
+            if field in conditions:
+                continue
+            known = [values[field] for values in recorded if values[field] != empty]
+            if not known:
+                unobserved.add(field)
+            conditions[field] = known[0] if known and all(value == known[0] for value in known) else empty
+    return conditions, unobserved
+
+
+def inherit_shared_conditions(clean, payload, defaults, ignored=()):
+    clean.update(shared_columns({field: defaults[field] for field, keys in SHARED_INPUTS.items()
+                                 if field not in ignored and not any(key in payload for key in keys)
+                                 and defaults[field] != EMPTY_SHARED_CONDITIONS[field]}))
+
+
 def material_summary(record):
     amounts = {item["name"]: item for item in record.get("material_amounts", [])}
     return " + ".join(name + (f" ({amounts[name]['amount']:.15g} {amounts[name]['unit']})" if name in amounts else "") for name in record_materials(record))
@@ -567,7 +588,10 @@ def validate_template_value(field, value):
 
 
 def read_record_table(rows):
-    header_index, header = next(rows)
+    first = next(rows, None)
+    if first is None:
+        return [], []
+    header_index, header = first
     width, total_text, data = len(header), sum(map(len, header)), []
     for index, row in rows:
         width = max(width, len(row))
@@ -582,8 +606,6 @@ def read_record_table(rows):
                 raise ValueError("Expanded spreadsheet is too large")
     if width > MAX_IMPORT_COLUMNS:
         raise Problem(IMPORT_TABLE_LIMIT)
-    if not width:
-        raise ValueError("Missing spreadsheet columns")
     columns = [(header[index].strip() if index < len(header) else "") or f"列 {index + 1}" for index in range(width)]
     return columns, [(index, row + [""] * (width - len(row))) for index, row in data]
 
@@ -700,7 +722,8 @@ def xlsx_record_rows(worksheet, shared, date_styles, date1904):
                 continue
             row.extend([""] * (column - len(row) - 1))
             row.append(value)
-        yield row_index, row
+        if row:
+            yield row_index, row
 
 
 def read_xlsx_record_table(data, requested_sheet):
@@ -745,6 +768,96 @@ def read_xlsx_record_table(data, requested_sheet):
         date1904 = properties is not None and properties.get("date1904") in ("1", "true")
         columns, rows = read_record_table(xlsx_record_rows(part(sheets[selected]), shared, styles, date1904))
     return list(sheets), selected, columns, rows
+
+
+def record_import_mapping(payload, width):
+    invalid = Problem("导入字段映射格式不正确。")
+    if not isinstance(payload, dict):
+        raise invalid
+    mapping, seen = {}, set()
+    for column, target in payload.items():
+        if (not isinstance(column, str) or not re.fullmatch(r"0|[1-9][0-9]?", column)
+                or int(column) >= width or not isinstance(target, str)):
+            raise invalid
+        if not target:
+            continue
+        if target.startswith("extra:"):
+            if any(0xd800 <= ord(char) <= 0xdfff for char in target):
+                raise invalid
+            target = "extra:" + validate_extra_condition({"name": target[6:]})["name"]
+        elif target not in IMPORT_TARGETS and not re.fullmatch(r"template:[0-9]{1,2}", target):
+            raise invalid
+        if target.casefold() in seen:
+            if target == "sample_id":
+                raise Problem("请把一列导入到“样品编号”。")
+            raise Problem("每个字段只能对应一列，请检查重复的选择。")
+        seen.add(target.casefold())
+        mapping[int(column)] = target
+    if "sample_id" not in seen:
+        raise Problem("请把一列导入到“样品编号”。")
+    return sorted(mapping.items())
+
+
+def import_list(text):
+    return [piece.strip() for piece in re.split(r"[;；、\r\n]| +\+ +", text) if piece.strip()]
+
+
+def import_number(text, unit, label, row):
+    suffix = r"\s*(?:" + re.escape(unit) + ")?" if unit else ""
+    match = re.fullmatch(r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)" + suffix, text)
+    value = float(match[1]) if match else None
+    if value is None or not math.isfinite(value):
+        raise Problem(f"第 {row} 行 {label} 不是有效的数值。")
+    return value
+
+
+def record_import_values(row, cells, mapping, template, labels):
+    values, extra, template_values, errors = {}, [], {}, []
+    sample, extra_count = "", 0
+    for column, target in mapping:
+        raw = cells[column]
+        text = raw.strip()
+        if target == "sample_id":
+            sample = text
+        elif not text:
+            continue
+        field = template.get(target)
+        try:
+            if field:
+                value = raw if field["type"] == "text" else text
+                if field["type"] == "number":
+                    value = import_number(text, field["unit"], field["label"], row)
+                elif field["type"] == "multi":
+                    value = import_list(text)
+                try:
+                    template_values[field["key"]] = validate_template_value(field, value)
+                except Problem as exc:
+                    raise Problem(f"{field['label']}：{exc}") from exc
+            elif target.startswith("extra:"):
+                extra_count += 1
+                extra.append(validate_extra_condition({"name": target[6:], "value": raw}))
+            elif target in IMPORT_UNITS:
+                values[target] = validate_numeric_condition(target, import_number(text, IMPORT_UNITS[target], labels[target], row))
+            elif target in ("precursors", "solvents"):
+                values[target] = validate_condition_list(target[:-1], import_list(text))
+            elif target == "experiment_date":
+                if not re.fullmatch(r"[0-9]{4}([./-])[0-9]{2}\1[0-9]{2}", text):
+                    raise Problem("实验日期格式应为 YYYY-MM-DD。")
+                values[target] = validate_record_date(text.replace("/", "-").replace(".", "-"))
+            else:
+                value = validate_record_text(target, raw)
+                if target == "sample_id" and not value:
+                    raise Problem("请填写样品编号。")
+                values[target] = value
+        except Problem as exc:
+            errors.append(str(exc))
+    if extra_count > 30:
+        errors.append("自定义条件最多 30 项。")
+    if extra:
+        values["extra_conditions"] = extra
+    if template_values:
+        values["lab_data"] = {"values": template_values}
+    return sample, values, errors
 
 
 def missing_template_fields(template, details, section):
@@ -1439,14 +1552,7 @@ class Store:
         members = [row for row in db.execute("SELECT * FROM experiments WHERE project_id=? AND archived=0 ORDER BY id", (project_id,))
                    if record_experiment_key(row, prefixes) == key and not is_dataset(row)]
         state = self.read_shared_defaults(db, project_id, key)
-        conditions = dict((state or EMPTY_SHARED_STATE)["conditions"])
-        if conditions.keys() != EMPTY_SHARED_CONDITIONS.keys():
-            recorded = [shared_values(row) for row in members]
-            for field, empty in EMPTY_SHARED_CONDITIONS.items():
-                if field in conditions:
-                    continue
-                known = [values[field] for values in recorded if values[field] != empty]
-                conditions[field] = known[0] if known and all(value == known[0] for value in known) else empty
+        conditions, _ = effective_shared_conditions(members, state)
         snapshot = [project_id, key, state, [(row["id"], row["revision"]) for row in members]]
         token = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode("utf-8")).hexdigest()
         return members, state, conditions, token
@@ -1534,7 +1640,7 @@ class Store:
                 self.write_shared_defaults(db, *target, other)
         return other
 
-    def remember_shared_baseline(self, db, group, record_id, current, clean):
+    def remember_shared_baseline(self, db, group, record_id, current, clean, ignored=()):
         members, state, previous, _ = group
         if not members or (current and len(members) == 1 and members[0]["id"] == record_id and not state):
             return
@@ -1546,7 +1652,7 @@ class Store:
         previous_fixed = set(overrides.get(record_id, []))
         fixed = previous_fixed.copy()
         for field, value in values.items():
-            if current and value == old[field]:
+            if field in ignored or (current and value == old[field]):
                 continue
             if value == previous[field]:
                 fixed.discard(field)
@@ -1754,7 +1860,7 @@ class Store:
                     self.local_catalog()
                 db.execute("BEGIN" if preview else "BEGIN IMMEDIATE")
                 batch = db.execute("SELECT * FROM history_batches WHERE id=?", (batch_id,)).fetchone()
-                if not batch or batch["action"] in {"create", "undo"}:
+                if not batch or batch["action"] in {"create", "import", "undo"}:
                     raise Problem("这次操作不支持撤销。", 409)
                 entries = db.execute("SELECT * FROM history_entries WHERE batch_id=? AND reverted_by IS NULL ORDER BY rowid", (batch_id,)).fetchall()
                 if selected is not None:
@@ -2254,6 +2360,8 @@ class Store:
             if extension == ".csv":
                 sheets, selected = [], ""
                 columns, rows = read_record_table(csv_record_rows(data))
+                if not columns:
+                    raise ValueError("Missing CSV header")
             elif extension == ".xlsx":
                 sheets, selected, columns, rows = read_xlsx_record_table(data, sheet)
             else:
@@ -2267,6 +2375,134 @@ class Store:
             self.record_uploads[upload_id] = (expires, columns, rows)
         return {"upload_id": upload_id, "format": extension[1:], "sheets": sheets, "sheet": selected,
                 "columns": columns, "rows": [row for _, row in rows[:20]], "total_rows": len(rows)}
+
+    def import_records(self, payload, *, commit=False):
+        if not isinstance(payload, dict):
+            raise Problem("台账导入请求不正确。")
+        upload_id, project_id, existing = (payload.get(key) for key in ("upload_id", "project_id", "existing"))
+        with self.lock, self.connect() as db:
+            self.expire_record_uploads()
+            if not isinstance(upload_id, str) or upload_id not in self.record_uploads:
+                raise Problem(EXPIRED_IMPORT, 404)
+            _, columns, table = self.record_uploads[upload_id]
+            mapping = record_import_mapping(payload.get("mapping"), len(columns))
+            if existing not in ("skip", "fail"):
+                raise Problem("请选择如何处理已存在的样品编号。")
+            if not valid_settings_text(project_id, 120) or not project_id:
+                raise Problem("请选择有效的实验项目。")
+            self.local_catalog()
+            db.execute("BEGIN IMMEDIATE" if commit else "BEGIN")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                if commit:
+                    raise Problem(STALE_IMPORT, 409)
+                raise Problem("请选择有效的实验项目。")
+            settings = self.project_settings(db, project_id)
+            template = self.project_template(db, project_id)
+            fields = {"template:" + field["key"]: field for field in template["fields"]} if template else {}
+            targets = {target for _, target in mapping}
+            if any(target.startswith("template:") and target not in fields for target in targets):
+                if commit:
+                    raise Problem(STALE_IMPORT, 409)
+                raise Problem("字段与所选模板版本不匹配。")
+            labels, disabled = {}, set()
+            for field, (label, builtin_columns) in PROJECT_BUILTINS.items():
+                entry = settings["settings"]["builtin"][field]
+                label = entry["label"]["zh"] or label
+                labels.update(dict.fromkeys(builtin_columns, label))
+                if not entry["enabled"]:
+                    if targets.intersection(builtin_columns):
+                        if commit:
+                            raise Problem(STALE_IMPORT, 409)
+                        raise Problem(f"项目已关闭字段 {label}，不能导入到该字段。")
+                    disabled.update(builtin_columns)
+            ignored = {field for field, keys in SHARED_INPUTS.items() if disabled.intersection(keys)}
+            rows, counts, prepared, members = [], dict.fromkeys(("create", "skip", "error"), 0), [], {}
+            records = db.execute("SELECT * FROM experiments WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
+            existing_samples = {record["sample_id"].translate(SQLITE_NOCASE): record["id"] for record in records}
+            seen, duplicates = set(), []
+            for number, cells in table:
+                sample, values, errors = record_import_values(number, cells, mapping, fields, labels)
+                key = values.get("sample_id", "").translate(SQLITE_NOCASE)
+                duplicate = existing_samples.get(key)
+                repeated = key in seen
+                if duplicate:
+                    duplicates.append((number, duplicate))
+                if repeated:
+                    errors.append("同一文件中样品编号重复。")
+                if duplicate and existing == "fail":
+                    errors.append(DUPLICATE_SAMPLE)
+                elif duplicate and not repeated:
+                    errors = []
+                action = "error" if errors else ("skip" if duplicate else "create")
+                if key:
+                    seen.add(key)
+                counts[action] += 1
+                row = {"row": number, "sample_id": sample, "action": action, "errors": errors, "values": values}
+                rows.append(row)
+                if action == "create":
+                    clean = validate(values)
+                    clean.update(project_id=project_id)
+                    clean.setdefault("precursors", None)
+                    clean.setdefault("solvents", None)
+                    clean.setdefault("material_amounts", "[]")
+                    dataset = is_dataset(clean)
+                    if template and (not dataset or "lab_data" in values):
+                        details = {"template_revision": template["revision"], **values.get("lab_data", {})}
+                        values["lab_data"] = details
+                        clean["lab_data"] = json.dumps(details, ensure_ascii=False)
+                    group = None if dataset else record_experiment_key(clean, self.grouping_prefixes)
+                    if group is not None:
+                        members.setdefault(group, [])
+                    prepared.append((values, clean, group))
+            for record in records:
+                if not record["archived"] and not is_dataset(record):
+                    group = record_experiment_key(record, self.grouping_prefixes)
+                    if group in members:
+                        members[group].append(record)
+            groups, shared_snapshot = {}, []
+            for key, group in sorted(members.items()):
+                state = self.read_shared_defaults(db, project_id, key)
+                conditions, unobserved = effective_shared_conditions(group, state)
+                groups[key] = (conditions, unobserved)
+                shared_snapshot.append((key, bool(group), state, conditions, sorted(unobserved)))
+            snapshot = [upload_id, project_id, mapping, existing, settings, template, sorted(self.grouping_prefixes),
+                        duplicates, shared_snapshot]
+            token = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode("utf-8")).hexdigest()
+            if commit and payload.get("token") != token:
+                raise Problem(STALE_IMPORT, 409)
+            if commit and counts["error"]:
+                raise Problem(f"还有 {counts['error']} 行有错误，请修正后再导入。")
+            created, now = {}, timestamp()
+            for values, clean, group in prepared:
+                if group is not None:
+                    defaults, unobserved = groups[group]
+                    inherit_shared_conditions(clean, values, defaults, ignored)
+                if commit:
+                    record_id = self.insert_record(db, clean, now)
+                    self.remember_condition_options(db, clean, disabled)
+                    if group is not None:
+                        state = self.read_shared_defaults(db, project_id, group)
+                        self.remember_shared_baseline(db, (members[group], state, defaults, None),
+                                                      record_id, None, clean, ignored)
+                        members[group].append(clean)
+                    created[record_id] = None
+                if group is not None and unobserved:
+                    # In file order, the first value in a group with no known values becomes its inferred default.
+                    observed = shared_values(clean)
+                    learned = {field: observed[field] for field in unobserved if observed[field] != EMPTY_SHARED_CONDITIONS[field]}
+                    defaults.update(learned)
+                    unobserved.difference_update(learned)
+                if not commit:
+                    values["experiment_no"] = clean["experiment_no"]
+                    values.update({field: value for field, value in {
+                        "precursors": record_precursors(clean), "temperature": clean["temperature"],
+                        "solvents": json.loads(clean["solvents"]) if clean["solvents"] else [],
+                        "material_amounts": json.loads(clean["material_amounts"]),
+                    }.items() if value is not None and value != []})
+            if commit:
+                batch_id = self.log_history(db, created, "import", source="import", created_at=now)
+                return {"batch_id": batch_id, "created": len(created), "skipped": counts["skip"]}
+        return {"rows": rows, "counts": counts, "token": token}
 
     def delete_condition_option(self, payload):
         field, name = validate_condition_option(payload)
@@ -2464,12 +2700,7 @@ class Store:
                     previous = json.loads(current["material_amounts"]) if current else []
                     clean["material_amounts"] = json.dumps([item for item in previous if item["name"] in materials], ensure_ascii=False)
                 if not current and not shared and group:
-                    inherit = {"precursors": ("precursors", "precursor"), "temperature": ("temperature",),
-                               "materials": ("solvents", "solvent", "ligand", "material_amounts")}
-                    missing = [field for field, keys in inherit.items() if not any(key in payload for key in keys)]
-                    if missing:
-                        defaults = group[2]
-                        clean.update(shared_columns({field: defaults[field] for field in missing if defaults[field] != EMPTY_SHARED_CONDITIONS[field]}))
+                    inherit_shared_conditions(clean, payload, group[2])
                 if record_id:
                     columns = {field: value for field, value in clean.items() if field not in disabled_columns}
                     db.execute("UPDATE experiments SET " + ", ".join(f"{key}=?" for key in columns) +
@@ -2477,15 +2708,7 @@ class Store:
                                (*columns.values(), now, record_id))
                 else:
                     record_id = self.insert_record(db, clean, now)
-                for field in CONDITION_LIST_ERRORS:
-                    if field in disabled_columns:
-                        continue
-                    stored = clean[field + "s"]
-                    values = json.loads(stored) if stored is not None else ([clean[field]] if clean[field] else [])
-                    db.executemany("INSERT OR IGNORE INTO condition_options(field,name) VALUES (?,?)", ((field, value) for value in values))
-                if clean["ligand"]:
-                    db.execute("INSERT OR IGNORE INTO condition_options(field,name) VALUES ('ligand',?)", (clean["ligand"],))
-                db.executemany("INSERT OR IGNORE INTO condition_options(field,name) VALUES (?,?)", ((field, format(clean[field], ".15g")) for field in NUMERIC_CONDITIONS if clean[field] is not None))
+                self.remember_condition_options(db, clean, disabled_columns)
                 if current:
                     moved = self.move_shared_override(db, current, {**current, **columns})
                     if moved is not None and group:
@@ -2501,7 +2724,7 @@ class Store:
                 elif group:
                     self.remember_shared_baseline(db, group, record_id, current, clean)
         except sqlite3.IntegrityError:
-            raise Problem("该项目内样品编号已存在（含已归档记录）。请使用不同编号。", 409)
+            raise Problem(DUPLICATE_SAMPLE, 409)
         return record_id
 
     def update_status(self, payload):
@@ -2734,9 +2957,25 @@ class Store:
                 raise Problem("找不到该实验。", 404)
             if type(payload.get("revision")) is not int or payload["revision"] != row["revision"]:
                 raise Problem("记录已更新，请刷新后重试。", 409)
-            db.execute("UPDATE experiments SET archived=?, updated_at=?, revision=revision+1 WHERE id=?",
-                       (int(payload["archived"]), timestamp(), record_id))
-            self.log_history(db, {record_id: row}, "archive")
+            self.archive_records(db, {record_id: row}, payload["archived"])
+
+    def archive_records(self, db, rows, archived=True):
+        now = timestamp()
+        db.executemany("UPDATE experiments SET archived=?, updated_at=?, revision=revision+1 WHERE id=?",
+                       ((int(archived), now, record_id) for record_id in rows))
+        self.log_history(db, rows, "archive")
+
+    def archive_import_batch(self, batch_id):
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM history_batches WHERE id=? AND action='import' AND source='import'", (batch_id,)).fetchone():
+                raise Problem("找不到这次导入。", 404)
+            records = db.execute("""SELECT experiments.*, history_entries.after_revision AS imported_revision
+                                    FROM history_entries JOIN experiments ON experiments.id=history_entries.record_id
+                                    WHERE batch_id=? ORDER BY history_entries.rowid""", (batch_id,)).fetchall()
+            unchanged = {row["id"]: row for row in records if not row["archived"] and row["revision"] == row["imported_revision"]}
+            self.archive_records(db, unchanged)
+        return {"archived": len(unchanged), "kept": len(records) - len(unchanged)}
 
     def preview_folder(self, payload):
         if (not isinstance(payload, dict) or not isinstance(payload.get("project_id"), str)
@@ -2838,6 +3077,19 @@ class Store:
         db.execute(f"INSERT INTO experiments ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})",
                    (record_id, *clean.values(), now, now))
         return record_id
+
+    @staticmethod
+    def remember_condition_options(db, clean, disabled_columns=()):
+        for field in CONDITION_LIST_ERRORS:
+            if field in disabled_columns:
+                continue
+            stored = clean.get(field + "s")
+            values = json.loads(stored) if stored is not None else ([clean[field]] if clean[field] else [])
+            db.executemany("INSERT OR IGNORE INTO condition_options(field,name) VALUES (?,?)", ((field, value) for value in values))
+        if clean["ligand"]:
+            db.execute("INSERT OR IGNORE INTO condition_options(field,name) VALUES ('ligand',?)", (clean["ligand"],))
+        db.executemany("INSERT OR IGNORE INTO condition_options(field,name) VALUES (?,?)",
+                       ((field, format(clean[field], ".15g")) for field in NUMERIC_CONDITIONS if clean[field] is not None))
 
     @staticmethod
     def check_file_kind(db, kind):
@@ -3809,6 +4061,14 @@ class Handler(BaseHTTPRequestHandler):
                 if len(data) != size:
                     raise Problem(UNREADABLE_IMPORT)
                 return self.send_json(store.parse_record_upload(query.get("name", [""])[0], query.get("sheet", [None])[0], data))
+            if path == "/api/import/records/preview":
+                return self.send_json(store.import_records(self.json_body()))
+            if path == "/api/import/records/commit":
+                return self.send_json(store.import_records(self.json_body(), commit=True), 201)
+            match = re.fullmatch(r"/api/import/batches/([a-f0-9]{32})/archive", path)
+            if match:
+                self.json_body()
+                return self.send_json(store.archive_import_batch(match[1]))
             match = re.fullmatch(r"/api/files/([a-f0-9]{32})/(update|delete)", path)
             if match:
                 return self.send_json(store.change_file(*match.groups(), self.json_body()))
@@ -3854,7 +4114,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "DELETE" and path == "/api/condition-options":
             return self.send_json(store.delete_condition_option(self.json_body()))
         if self.command == "DELETE" and path == "/api/demo":
-            return self.send_json(store.delete_demo(self.json_body()))
+            has_body = self.headers.get("Content-Length", "0") != "0" or self.headers.get("Transfer-Encoding")
+            return self.send_json(store.delete_demo(self.json_body() if has_body else None))
         if self.command == "POST" and path == "/api/experiments":
             return self.save_experiment()
         if self.command == "POST" and path == "/api/shutdown":
